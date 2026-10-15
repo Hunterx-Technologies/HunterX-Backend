@@ -14,6 +14,7 @@ import redis, { isRedisUp, assertScorePackingSafe } from './config/redis.js';
 import { loadLevelsCache } from './services/leaderboardService.js';
 import { REDIS_KEYS }      from './config/leaderboardConfig.js';
 import { rebuildLeaderboard } from '../scripts/rebuildLeaderboard.js';
+import { ensureDefaultAdmin } from './services/adminBootstrapService.js';
 import './cron/midnight.js';           // starts the nightly task-assignment cron
 import './cron/leaderboardNightly.js'; // starts the nightly leaderboard rebuild cron
 import './cron/pushDispatcher.js';     // starts push outbox delivery + receipt checks
@@ -70,6 +71,7 @@ app.listen(PORT, '0.0.0.0', () => {
   info(`Health: http://localhost:${PORT}/api/health`);
   info(`LAN Health: http://192.168.1.9:${PORT}/api/health`);
   initLeaderboard();
+  ensureDefaultAdmin().catch((err) => logError(`Default admin bootstrap failed: ${err.message}`));
 });
 
 export default app;

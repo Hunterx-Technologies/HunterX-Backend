@@ -8,8 +8,10 @@
 // users.is_banned, ACTIVE otherwise (no separate INACTIVE tier — see
 // README note in the PR/handoff for why, and ping if you want one added).
 
+import bcrypt from 'bcryptjs';
 import prisma from '../config/prisma.js';
-import { parseDateOnly, getISTDateOnly } from '../utils/helpers.js';
+import { parseDateOnly, getISTDateOnly, isValidEmail, isStrongPassword, generateHunterId, generateReferralCode } from '../utils/helpers.js';
+import { info } from '../utils/logger.js';
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const MS_PER_DAY     = 24 * 60 * 60 * 1000;
@@ -252,5 +254,66 @@ export async function listUsers(query = {}) {
       total_pages: Math.ceil(total / limit) || 0,
       has_next_page: page * limit < total,
     },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Create an ADMIN-role account. Only reachable via POST /api/admin/admins,
+// which is itself gated by verifyToken + verifyAdmin — so this can only
+// ever be called by someone who is already an admin. There's no public
+// or self-service path to ADMIN: the very first admin is seeded at
+// deploy time (adminBootstrapService.js), and every one after that is
+// created by an existing admin through this endpoint. A compromised
+// non-admin account can't reach this at all; a compromised admin account
+// already has full admin access regardless, so this grants it nothing
+// further an attacker didn't already have.
+// ─────────────────────────────────────────────────────────────
+
+export async function createAdmin(creatorUserId, { name, email, password }) {
+  if (!name || typeof name !== 'string' || !name.trim()) throw new Error('NAME_REQUIRED');
+
+  const normalizedEmail = (email || '').trim().toLowerCase();
+  if (!isValidEmail(normalizedEmail)) throw new Error('INVALID_EMAIL');
+
+  const { valid, errors } = isStrongPassword(password);
+  if (!valid) {
+    const err = new Error('WEAK_PASSWORD');
+    err.errors = errors;
+    throw err;
+  }
+
+  const existing = await prisma.users.findUnique({ where: { email: normalizedEmail } });
+  if (existing) throw new Error('EMAIL_EXISTS');
+
+  const salt         = await bcrypt.genSalt(12);
+  const passwordHash = await bcrypt.hash(password, salt);
+
+  const user = await prisma.users.create({
+    data: {
+      hunter_id:       await generateHunterId(),
+      name:            name.trim(),
+      email:           normalizedEmail,
+      password_hash:   passwordHash,
+      referral_code:   generateReferralCode(),
+      role:            'ADMIN',
+      onboarding_done: true,
+    },
+  });
+
+  await prisma.auth_providers.create({
+    data: { user_id: user.id, provider: 'EMAIL', provider_id: normalizedEmail },
+  });
+
+  await prisma.user_progression.create({ data: { user_id: user.id } });
+
+  info(`Admin ${creatorUserId} created new admin account (id: ${user.id}, email: ${normalizedEmail})`);
+
+  return {
+    id:         user.id.toString(),
+    hunter_id:  user.hunter_id,
+    name:       user.name,
+    email:      user.email,
+    role:       user.role,
+    created_at: user.created_at,
   };
 }

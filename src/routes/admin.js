@@ -178,4 +178,33 @@ router.get('/users', verifyToken, verifyAdmin, async (req, res, next) => {
   }
 });
 
+// ── POST /api/admin/admins ────────────────────────────────
+// Create a new ADMIN-role account. Admin-only — there is no other way
+// to reach ADMIN through the API; the first admin is seeded at deploy
+// time (see adminBootstrapService.js) and every one after that is
+// created by an existing admin here.
+// Header: Authorization: Bearer <access_token>  (role must be ADMIN)
+// Body: { name, email, password } — password must meet the same
+// strength rules as the mobile app's signup (8+ chars, upper, number,
+// special char).
+router.post('/admins', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const { name, email, password } = req.body || {};
+    const admin = await adminUserService.createAdmin(req.user.id, { name, email, password });
+    return success(res, { admin }, 'Admin created', 201);
+  } catch (err) {
+    if (err.message === 'NAME_REQUIRED') return error(res, 'name is required', 400);
+    if (err.message === 'INVALID_EMAIL') return error(res, 'A valid email is required', 400);
+    if (err.message === 'EMAIL_EXISTS') return error(res, 'A user with this email already exists', 409);
+    if (err.message === 'WEAK_PASSWORD') {
+      return res.status(400).json({
+        success: false,
+        message: 'Password does not meet requirements',
+        errors:  err.errors,
+      });
+    }
+    next(err);
+  }
+});
+
 export default router;
