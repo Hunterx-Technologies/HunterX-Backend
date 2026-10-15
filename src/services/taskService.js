@@ -3,7 +3,7 @@
 import prisma from '../config/prisma.js';
 import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
-import { bumpDailyStreak, getStreakRiskStatus } from './streakService.js';
+import { bumpDailyStreak, getStreakRiskStatus, reconcileStreak } from './streakService.js';
 import { checkLevelUp } from './xpService.js';
 
 const DAILY_TYPES     = ['DAILY_FIXED', 'DAILY_ADMIN'];
@@ -460,6 +460,10 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
   const page = Math.max(1, parseInt(pageParam) || 1);
   const limit = Math.max(1, Math.min(100, parseInt(limitParam) || 10));
   const skip = (page - 1) * limit;
+
+  // Collapses an unprotected gap to a broken streak before reading it
+  // below, so current_streak doesn't show a stale pre-gap value.
+  await reconcileStreak(bUserId);
 
   // 1. Fetch user & progression data for summary cards
   const user = await prisma.users.findUnique({

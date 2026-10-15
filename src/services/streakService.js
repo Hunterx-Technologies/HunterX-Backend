@@ -15,16 +15,18 @@
 // first 7-day streak milestone, capped at 2 — there's no further monthly
 // or recurring grant beyond that.
 //
-// A life only ever forgives a single missed day. Missing 2 or more days
-// in a row (missed_days >= 2) always breaks the streak to 0, no matter
-// how many lives are banked — lives are strictly a "missed exactly one
-// day" save, not a multi-day buffer.
+// A life forgives one missed calendar day. A gap of N consecutive missed
+// days is covered as long as the user has at least N lives banked
+// (missed_days <= lives) — each missed day consumes one life. A gap
+// longer than the banked lives always breaks the streak to 0; lives are
+// never partially spent on a gap they can't fully cover.
 //
-// Two ways a single-day gap gets covered:
+// Two ways a covered gap gets resolved:
 //   1. Automatic/silent (bumpDailyStreak): if the user just goes ahead
-//      and completes a task the day after a single missed day, and a
-//      life is banked, the gap is covered transparently and the streak
-//      keeps counting — no confirmation needed.
+//      and completes a task after a gap that's within their banked
+//      lives, the gap is covered transparently (spending one life per
+//      missed day) and the streak keeps counting — no confirmation
+//      needed.
 //   2. Interactive (getStreakRiskStatus / resolveStreakRisk): called
 //      from GET /api/tasks/today and POST /api/tasks/streak/resolve, so
 //      the app can show the user a "your streak is at risk — use a life
@@ -33,11 +35,26 @@
 //      effect as path 1, just proactive); choosing DROP breaks the
 //      streak to 0 immediately instead of waiting for it to lazily
 //      reset to 1 on next completion.
-// A 2+ day gap is never "at risk" (there's no decision to make, no life
-// can save it) — it just breaks on next completion.
+// A gap that exceeds the banked lives is never "at risk" (there's no
+// decision to make, no amount of lives can save it) — it just breaks on
+// next completion.
 //
-// XP is never touched by any of this, in either direction — streak
-// state and XP are fully independent ledgers.
+// A life only ever protects a missed day — it never increments the
+// streak by itself; only an actual active day does that.
+//
+// ── Breaking the moment it happens ──────────────────────────────
+// A gap that exceeds the banked lives breaks the streak to 0 as soon as
+// it's observed — not lazily held at its old value until the user's
+// next completion. Since there's no clock-driven job in this system,
+// "as soon as it's observed" means the first read or write that computes
+// the gap: reconcileStreak(userId) is that check, and every read path
+// that surfaces daily_streak (getStreakRiskStatus, getUserActivity)
+// calls it first so the break is write-through and visible immediately,
+// not just inferred for one response. bumpDailyStreak doesn't need it
+// separately — completing a task after a broken gap already lands on
+// newStreak = 1 directly, the same end state. Lives are zeroed out too
+// when a break is reconciled, since a gap too long to cover means
+// whatever was banked has already been spent trying.
 
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
@@ -52,9 +69,9 @@ function daysBetween(from, to) {
 }
 
 // missed_days > 0 means at least one full day passed with no activity;
-// covered means exactly one day was missed and a life is banked to cover
-// it — 2+ consecutive missed days are never covered, regardless of lives.
-function computeGap(progression, today) {
+// covered means the gap is fully within the banked lives (one life per
+// missed day) — a gap longer than the banked lives is never covered.
+export function computeGap(progression, today) {
   const lastActive = progression?.last_active_date ?? null;
   const daysSince   = lastActive ? daysBetween(lastActive, today) : null;
   const missedDays  = daysSince !== null && daysSince > 1 ? daysSince - 1 : 0;
@@ -63,7 +80,7 @@ function computeGap(progression, today) {
     daysSince,
     missedDays,
     lives,
-    coveredByLives: missedDays === 1 && lives >= 1,
+    coveredByLives: missedDays > 0 && missedDays <= lives,
   };
 }
 
@@ -119,12 +136,41 @@ export async function bumpDailyStreak(tx, userId) {
   }
 }
 
-// Read-only — surfaced in GET /api/tasks/today so the client can decide
-// whether to show the "use a life or let it drop?" prompt before the
-// user has done anything today.
-export async function getStreakRiskStatus(userId) {
+// Collapses an unprotected gap (missed days > banked lives) to a broken
+// streak the moment it's observed, instead of leaving the stale pre-gap
+// value sitting in the DB until the user's next completion. Write-through
+// so every other reader (leaderboards, admin stats, exports) also sees
+// the corrected value from this point on, not just the caller here.
+// A no-op once already broken (daily_streak and streak_lives both 0) so
+// repeated calls during the same unrecovered gap don't issue redundant
+// writes.
+export async function reconcileStreak(userId) {
   const today       = getISTDateOnly();
   const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
+  if (!progression) return progression;
+
+  const { missedDays, coveredByLives } = computeGap(progression, today);
+  const isBroken      = missedDays > 0 && !coveredByLives;
+  const alreadyBroken = progression.daily_streak === 0 && progression.streak_lives === 0;
+  if (!isBroken || alreadyBroken) return progression;
+
+  return prisma.user_progression.update({
+    where: { user_id: userId },
+    data: {
+      daily_streak:          0,
+      streak_lives:          0,
+      consecutive_miss_days: missedDays,
+    },
+  });
+}
+
+// Surfaced in GET /api/tasks/today so the client can decide whether to
+// show the "use a life or let it drop?" prompt before the user has done
+// anything today. Reconciles first so an already-unprotected gap reads
+// as a broken (0) streak rather than the stale pre-gap value.
+export async function getStreakRiskStatus(userId) {
+  const today       = getISTDateOnly();
+  const progression = await reconcileStreak(userId);
   const { missedDays, lives, coveredByLives } = computeGap(progression, today);
 
   return {
