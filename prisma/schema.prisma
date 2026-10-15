@@ -266,11 +266,47 @@ model notifications {
   sent_at    DateTime?         @default(now()) @db.Timestamp(6)
   read_at    DateTime?         @db.Timestamp(6)
   created_at DateTime?         @default(now()) @db.Timestamp(6)
+  // Push delivery (outbox) — rows are written PENDING by createNotification()
+  // and picked up after commit by the push dispatcher cron
+  // (src/services/pushDispatchService.js).
+  push_status     push_status @default(PENDING)
+  push_attempts   Int         @default(0)
+  push_claim      String?     @db.VarChar(36)
+  push_claimed_at DateTime?   @db.Timestamp(6)
+  pushed_at       DateTime?   @db.Timestamp(6)
+  push_error      String?     @db.VarChar(500)
+  deliver_after   DateTime    @default(now()) @db.Timestamp(6) // pushed back past quiet hours
+  dedupe_key      String?     @db.VarChar(100) // makes scheduled jobs idempotent per user
   quotes     quotes?           @relation(fields: [quote_id], references: [id], onUpdate: NoAction)
   users      users?            @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
+  @@unique([user_id, dedupe_key], map: "uq_notifications_user_dedupe")
   @@index([sent_at], map: "idx_notifications_sent")
   @@index([user_id, is_read], map: "idx_notifications_user")
+  @@index([push_status, deliver_after], map: "idx_notifications_push_queue")
+}
+
+// Last ranks seen by the daily leaderboard digest push
+// (scheduledNotificationJobs.js#leaderboardDigest) — diffed against the
+// current ranks to say "you climbed" / "X passed you". null = unranked.
+model leaderboard_rank_snapshots {
+  user_id      BigInt   @id
+  global_rank  Int?
+  friends_rank Int?
+  updated_at   DateTime @db.Timestamp(6)
+  users        users    @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+// Expo push tickets awaiting a receipt check (~15 min after send) — rows are
+// deleted once checked. Not FK'd: a deleted notification/token doesn't matter.
+model push_receipts {
+  id              BigInt    @id @default(autoincrement())
+  ticket_id       String    @unique @db.VarChar(64)
+  token           String    @db.VarChar(500)
+  notification_id BigInt?
+  created_at      DateTime  @db.Timestamp(6)
+
+  @@index([created_at], map: "idx_push_receipts_created")
 }
 
 model quotes {
@@ -471,16 +507,19 @@ model user_dragon_evolutions {
   @@index([user_id], map: "idx_dragon_evolutions_user")
 }
 
-model user_fcm_tokens {
-  id         BigInt       @id @default(autoincrement())
-  user_id    BigInt
-  token      String       @db.VarChar(500)
-  platform   fcm_platform
-  is_active  Boolean      @default(true)
-  created_at DateTime?    @default(now()) @db.Timestamp(6)
-  users      users        @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+// One row per device (Expo push token). A token moving to another account
+// (logout → login as someone else) is re-pointed, never duplicated.
+model user_push_tokens {
+  id           BigInt        @id @default(autoincrement())
+  user_id      BigInt
+  token        String        @unique @db.VarChar(500)
+  platform     push_platform
+  app_version  String?       @db.VarChar(30)
+  created_at   DateTime?     @default(now()) @db.Timestamp(6)
+  last_seen_at DateTime?     @default(now()) @db.Timestamp(6)
+  users        users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
-  @@unique([user_id, platform])
+  @@index([user_id], map: "idx_user_push_tokens_user")
 }
 
 model user_onboarding_answers {
@@ -509,6 +548,8 @@ model user_progression {
   streak_lives          Int       @default(1) // starts at 1 for every new user (row created at signup); earned +1 per 7-day daily_streak, capped at 2; spent 1-for-1 to cover missed days
   updated_at            DateTime? @default(now()) @db.Timestamp(6)
   users                 users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([total_xp(sort: Desc), user_id], map: "idx_user_progression_leaderboard")
 }
 
 model user_rewards {
@@ -601,7 +642,8 @@ model users {
   user_badges                                             user_badges[]
   user_discovery_interests                                user_discovery_interests[]
   user_dragon_evolutions                                  user_dragon_evolutions[]
-  user_fcm_tokens                                         user_fcm_tokens[]
+  user_push_tokens                                        user_push_tokens[]
+  leaderboard_rank_snapshots                              leaderboard_rank_snapshots?
   user_onboarding_answers                                 user_onboarding_answers[]
   user_progression                                        user_progression?
   user_settings                                           user_settings?
@@ -617,6 +659,7 @@ model users {
   @@index([hunter_id], map: "idx_users_hunter_id")
   @@index([last_latitude, last_longitude], map: "idx_users_location", where: raw("(location_visible = true)"))
   @@index([referral_code], map: "idx_users_referral_code")
+  @@index([referred_by], map: "idx_users_referred_by")
 }
 
 model xp_transactions {
@@ -663,9 +706,17 @@ enum completion_status {
   PARTIAL
 }
 
-enum fcm_platform {
+enum push_platform {
   IOS
   ANDROID
+}
+
+enum push_status {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  SKIPPED
 }
 
 enum fitness_level {
@@ -717,6 +768,12 @@ enum notification_type {
   STREAK_BROKEN
   MONTHLY_FREEZE
   BROADCAST
+  NEW_QUEST
+  FRIEND_JOINED
+  LEADERBOARD_UPDATE
+  FEEDBACK_UPDATE
+  HEALTH_SYNC
+  WIN_BACK
 }
 
 enum reward_status {
@@ -792,6 +849,11 @@ model user_settings {
   notify_level_up            Boolean   @default(true)
   notify_reward_ready        Boolean   @default(true)
   notify_announcements       Boolean   @default(true)
+  notify_social              Boolean   @default(true)
+  notify_leaderboard         Boolean   @default(true)
+  leaderboard_visible        Boolean   @default(true)
+  timezone                   String    @default("Asia/Kolkata") @db.VarChar(64) // IANA name, from the device
+  reminder_time              String    @default("19:00") @db.VarChar(5) // HH:MM local, daily quest reminder slot
   created_at                 DateTime? @default(now()) @db.Timestamp(6)
   updated_at                 DateTime? @default(now()) @db.Timestamp(6)
   users                      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)

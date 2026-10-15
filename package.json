@@ -11,7 +11,9 @@
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
     "check:q9-mismatches": "node scripts/check-q9-mismatches.js",
-    "seed": "node prisma/seed.js"
+    "seed": "node prisma/seed.js",
+    "rebuild:leaderboard": "node scripts/rebuildLeaderboard.js",
+    "push:test": "node scripts/send-test-push.js"
   },
   "prisma": {
     "seed": "node prisma/seed.js"
@@ -31,9 +33,9 @@
     "exceljs": "^4.4.0",
     "express": "^4.22.2",
     "express-rate-limit": "^7.5.1",
-    "firebase-admin": "^13.2.0",
     "google-auth-library": "^10.9.1",
     "helmet": "^8.3.0",
+    "ioredis": "^5.11.1",
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.11.0",
     "node-cron": "^3.0.3",

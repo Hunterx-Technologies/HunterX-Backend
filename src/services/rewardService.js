@@ -106,13 +106,25 @@ async function grantCoupon(tx, userId, milestone) {
   const trigger = TRIGGER_BY_STREAK_DAYS[milestone.streak_days];
   if (!trigger) return;
 
-  const code = await tx.reward_pool.findFirst({ where: { is_assigned: false } });
+  const code = await tx.reward_pool.findFirst({
+    where:   { is_assigned: false },
+    include: { reward_partners: { select: { name: true } } },
+  });
   if (!code) return;
 
   await tx.reward_pool.update({ where: { id: code.id }, data: { is_assigned: true } });
-  await tx.user_rewards.create({
+  const reward = await tx.user_rewards.create({
     data: { user_id: userId, pool_id: code.id, trigger_type: trigger, status: 'ACTIVE' },
   });
+
+  const prize   = code.discount_value || 'a reward';
+  const partner = code.reward_partners?.name;
+  await createNotification(
+    tx, userId, 'REWARD_READY',
+    '🎁 Reward unlocked',
+    `Your ${milestone.streak_days}-day streak earned ${prize}${partner ? ` from ${partner}` : ''}. Tap to claim it.`,
+    { event: 'REWARD_READY', user_reward_id: reward.id, trigger, streak_days: milestone.streak_days }
+  );
 }
 
 async function grantBadge(tx, userId, milestone) {

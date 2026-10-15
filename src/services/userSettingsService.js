@@ -1,6 +1,9 @@
 // src/services/userSettingsService.js — User Settings management & notification gating
 
 import prisma from "../config/prisma.js";
+import { syncLeaderboardMember } from "./leaderboardService.js";
+import { getNotificationTypeConfig } from "../config/notificationTypes.js";
+import { isValidTimeZone, isValidTimeOfDay, DEFAULT_TIMEZONE } from "../utils/timezone.js";
 
 function formatSettings(settings) {
   if (!settings) return null;
@@ -17,6 +20,11 @@ function formatSettings(settings) {
     notify_level_up: settings.notify_level_up ?? true,
     notify_reward_ready: settings.notify_reward_ready ?? true,
     notify_announcements: settings.notify_announcements ?? true,
+    notify_social: settings.notify_social ?? true,
+    notify_leaderboard: settings.notify_leaderboard ?? true,
+    leaderboard_visible: settings.leaderboard_visible ?? true,
+    timezone: settings.timezone || DEFAULT_TIMEZONE,
+    reminder_time: settings.reminder_time || "19:00",
     created_at: settings.created_at,
     updated_at: settings.updated_at,
   };
@@ -62,6 +70,28 @@ export async function updateUserSettings(userId, payload) {
     updateData.units = payload.units;
   }
 
+  if (payload.timezone !== undefined) {
+    if (!isValidTimeZone(payload.timezone)) {
+      throw new Error("INVALID_TIMEZONE");
+    }
+    updateData.timezone = payload.timezone;
+  }
+
+  if (payload.reminder_time !== undefined) {
+    if (!isValidTimeOfDay(payload.reminder_time)) {
+      throw new Error("INVALID_REMINDER_TIME");
+    }
+    updateData.reminder_time = payload.reminder_time;
+  }
+
+  // Accept both the camelCase wire name (leaderboardVisible) and the
+  // snake_case column name, same convention as the rest of this payload.
+  if (payload.leaderboardVisible !== undefined) {
+    updateData.leaderboard_visible = Boolean(payload.leaderboardVisible);
+  } else if (payload.leaderboard_visible !== undefined) {
+    updateData.leaderboard_visible = Boolean(payload.leaderboard_visible);
+  }
+
   const boolFields = [
     "notify_all",
     "notify_daily_motivation",
@@ -72,6 +102,8 @@ export async function updateUserSettings(userId, payload) {
     "notify_level_up",
     "notify_reward_ready",
     "notify_announcements",
+    "notify_social",
+    "notify_leaderboard",
   ];
 
   for (const field of boolFields) {
@@ -99,36 +131,25 @@ export async function updateUserSettings(userId, payload) {
     update: updateData,
   });
 
+  if (updateData.leaderboard_visible !== undefined) {
+    await syncLeaderboardMember(bUserId);
+  }
+
   return formatSettings(settings);
+}
+
+// Type → notify_* column lives in config/notificationTypes.js. Types with no
+// setting are transactional and ignore notify_all.
+export function isNotificationEnabled(settings, notificationType) {
+  const { setting } = getNotificationTypeConfig(notificationType);
+  if (!setting) return true;
+  return Boolean(settings.notify_all) && settings[setting] !== false;
 }
 
 export async function shouldSendNotification(userId, notificationType) {
   try {
     const settings = await getUserSettings(userId);
-    if (!settings.notify_all) return false;
-
-    switch (notificationType) {
-      case "DAILY_MOTIVATION":
-        return settings.notify_daily_motivation;
-      case "TASK_REMINDER":
-        return settings.notify_task_reminders;
-      case "STREAK_AT_RISK":
-        return settings.notify_streak_preservation;
-      case "STREAK_MILESTONE":
-        return settings.notify_streak_milestones;
-      case "STREAK_FREEZE_USED":
-      case "STREAK_BROKEN":
-      case "MONTHLY_FREEZE":
-        return settings.notify_streak_freeze;
-      case "LEVEL_UP":
-        return settings.notify_level_up;
-      case "REWARD_READY":
-        return settings.notify_reward_ready;
-      case "BROADCAST":
-        return settings.notify_announcements;
-      default:
-        return true;
-    }
+    return isNotificationEnabled(settings, notificationType);
   } catch (err) {
     return true;
   }

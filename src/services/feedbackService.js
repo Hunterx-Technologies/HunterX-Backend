@@ -6,6 +6,8 @@
 
 import prisma            from '../config/prisma.js';
 import { notifyFeedback } from './discordService.js';
+import { createNotification } from './notificationService.js';
+import { logError }       from '../utils/logger.js';
 
 export const FEEDBACK_CATEGORIES = ['bug_report', 'suggestion', 'other'];
 export const FEEDBACK_STATUSES   = ['received', 'in_review', 'resolved'];
@@ -97,14 +99,47 @@ export async function updateFeedbackStatus(feedbackId, status) {
     throw new Error('INVALID_FEEDBACK_ID');
   }
 
+  const previous = await prisma.feedback.findUnique({
+    where:  { id: bFeedbackId },
+    select: { status: true },
+  });
+
+  let updated;
   try {
-    const updated = await prisma.feedback.update({
+    updated = await prisma.feedback.update({
       where: { id: bFeedbackId },
       data:  { status, updated_at: new Date() },
     });
-    return toPublicFeedback(updated);
   } catch (err) {
     if (err.code === 'P2025') throw new Error('FEEDBACK_NOT_FOUND');
     throw err;
   }
+
+  if (previous && previous.status !== status) {
+    // Best-effort — a push hiccup never fails the admin's status change.
+    await notifyFeedbackStatus(updated).catch((err) =>
+      logError(`Feedback status push failed for #${updated.id}: ${err.message}`)
+    );
+  }
+  return toPublicFeedback(updated);
+}
+
+// Only to users who ticked "allow follow-up" on the report, and only for
+// forward progress (received is the initial state, never announced).
+const STATUS_MESSAGES = {
+  in_review: (id) => ({ title: 'Your report is under review', body: `Report #${id} is with the team now. We'll let you know when it's resolved.` }),
+  resolved:  (id) => ({ title: 'Report resolved', body: `Report #${id} has been resolved. Thanks for helping the System get stronger, Hunter.` }),
+};
+
+async function notifyFeedbackStatus(feedback) {
+  const message = STATUS_MESSAGES[feedback.status];
+  if (!message || !feedback.user_id || !feedback.allow_followup) return;
+
+  const id = feedback.id.toString();
+  const { title, body } = message(id);
+  await createNotification(
+    prisma, feedback.user_id, 'FEEDBACK_UPDATE', title, body,
+    { event: 'FEEDBACK_UPDATE', feedback_id: id, status: feedback.status },
+    { dedupeKey: `feedback:${id}:${feedback.status}` }
+  );
 }

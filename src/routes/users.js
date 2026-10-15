@@ -8,6 +8,7 @@ import * as taskService   from '../services/taskService.js';
 import * as userSettingsService from '../services/userSettingsService.js';
 import * as dataExportService from '../services/dataExportService.js';
 import * as healthMetricsService from '../services/healthMetricsService.js';
+import * as pushService from '../services/pushService.js';
 
 const router = Router();
 
@@ -131,6 +132,41 @@ router.patch('/me/settings', verifyToken, async (req, res, next) => {
       return error(res, 'User not found', 404);
     if (err.message === 'INVALID_UNITS')
       return error(res, 'Units must be metric or imperial', 400);
+    if (err.message === 'INVALID_TIMEZONE')
+      return error(res, 'Timezone must be a valid IANA name (e.g. Asia/Kolkata)', 400);
+    if (err.message === 'INVALID_REMINDER_TIME')
+      return error(res, 'Reminder time must be HH:MM (24h)', 400);
+    next(err);
+  }
+});
+
+// ── POST & DELETE /api/users/me/devices ──────────────────
+// Push token registration. The app calls POST after login and on every
+// foreground / token rotation (upsert on token — re-points a device that
+// switched accounts), and DELETE on logout so the device stops receiving
+// this user's pushes.
+router.post('/me/devices', verifyToken, async (req, res, next) => {
+  try {
+    const { token, platform, app_version, timezone } = req.body || {};
+    await pushService.registerDevice(req.user.id, { token, platform, appVersion: app_version, timezone });
+    return success(res, { registered: true }, 'Device registered');
+  } catch (err) {
+    if (err.message === 'INVALID_PUSH_TOKEN')
+      return error(res, 'token must be an Expo push token', 400);
+    if (err.message === 'INVALID_PLATFORM')
+      return error(res, 'platform must be IOS or ANDROID', 400);
+    next(err);
+  }
+});
+
+router.delete('/me/devices', verifyToken, async (req, res, next) => {
+  try {
+    const { token } = req.body || {};
+    if (!token || typeof token !== 'string')
+      return error(res, 'token is required', 400);
+    await pushService.unregisterDevice(req.user.id, token);
+    return success(res, { registered: false }, 'Device unregistered');
+  } catch (err) {
     next(err);
   }
 });

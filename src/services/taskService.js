@@ -5,6 +5,7 @@ import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { bumpDailyStreak, getStreakRiskStatus, reconcileStreak } from './streakService.js';
 import { checkLevelUp } from './xpService.js';
+import { syncLeaderboardMember } from './leaderboardService.js';
 
 const DAILY_TYPES     = ['DAILY_FIXED', 'DAILY_ADMIN'];
 const VALID_STATUSES  = ['COMPLETED', 'PARTIAL', 'SKIPPED'];
@@ -368,6 +369,11 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
   });
 
   const progression = await prisma.user_progression.findUnique({ where: { user_id: bUserId } });
+
+  // Outside the transaction (it already committed) — total_xp may have
+  // changed, which can move this user in/out of the leaderboard or shift
+  // their rank. Never let a leaderboard hiccup fail a task completion.
+  await syncLeaderboardMember(bUserId);
 
   return {
     task_id:        task.id,

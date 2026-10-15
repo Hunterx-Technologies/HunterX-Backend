@@ -7,8 +7,48 @@ import { success, error }    from '../utils/response.js';
 import * as adminTaskService from '../services/adminTaskService.js';
 import * as feedbackService  from '../services/feedbackService.js';
 import * as adminUserService from '../services/adminUserService.js';
+import * as broadcastService from '../services/broadcastService.js';
 
 const router = Router();
+
+// ── POST /api/admin/notifications/broadcast ───────────────
+// Send an announcement (push + inbox) to an audience. See broadcastService.js.
+// Body: { title (≤65), body (≤240), url?: '/rewards',
+//         audience: 'all' | 'inactive' | 'users',
+//         inactive_days?: 1–365 (audience=inactive), user_ids?: [...] (audience=users),
+//         dry_run?: true → recipient counts only, nothing sent }
+// Returns { dry_run, broadcast_id?, recipients, reachable_by_push }.
+router.post('/notifications/broadcast', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const result = await broadcastService.createBroadcast(req.user.id, req.body);
+    return success(res, result, result.dry_run ? 'Broadcast preview' : 'Broadcast queued', result.dry_run ? 200 : 201);
+  } catch (err) {
+    const badRequest = {
+      TITLE_REQUIRED:        'title is required',
+      TITLE_TOO_LONG:        'title cannot exceed 65 characters',
+      BODY_REQUIRED:         'body is required',
+      BODY_TOO_LONG:         'body cannot exceed 240 characters',
+      INVALID_URL:           "url must be an app route like '/rewards'",
+      INVALID_AUDIENCE:      `audience must be one of: ${broadcastService.BROADCAST_AUDIENCES.join(', ')}`,
+      INVALID_INACTIVE_DAYS: 'inactive_days must be a whole number from 1 to 365',
+      INVALID_USER_IDS:      'user_ids must be a non-empty array of up to 5000 user ids',
+    };
+    if (badRequest[err.message]) return error(res, badRequest[err.message], 400);
+    next(err);
+  }
+});
+
+// ── GET /api/admin/notifications/broadcasts?limit=20 ──────
+// Past broadcasts, newest first, with recipients / pushed / pending /
+// not_pushed / read counts.
+router.get('/notifications/broadcasts', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const broadcasts = await broadcastService.listBroadcasts({ limit: req.query.limit });
+    return success(res, { broadcasts }, 'Broadcasts fetched successfully');
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ── POST /api/admin/tasks ─────────────────────────────────
 // Create a DAILY_ADMIN or WEEKLY task, one-time or recurring, on any

@@ -9,6 +9,8 @@ import { mailTransporter } from '../utils/mailer.js';
 import { logError }      from '../utils/logger.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { getWeekStatus }    from './taskService.js';
+import { syncLeaderboardMember } from './leaderboardService.js';
+import { createNotification } from './notificationService.js';
 import { getISTDateOnly }   from '../utils/helpers.js';
 import {
   generateHunterId,
@@ -289,14 +291,14 @@ async function awardReferralXpIfEligible(referredUserId) {
   });
   if (!referral) return;
 
-  await prisma.$transaction(async (tx) => {
+  const paid = await prisma.$transaction(async (tx) => {
     // Re-check inside the transaction so two concurrent onboarding
     // completions for the same user can't double-pay the referrer.
     const { count } = await tx.referrals.updateMany({
       where: { id: referral.id, xp_awarded: false },
       data:  { xp_awarded: true },
     });
-    if (count === 0) return;
+    if (count === 0) return false;
 
     await tx.xp_transactions.create({
       data: {
@@ -311,7 +313,23 @@ async function awardReferralXpIfEligible(referredUserId) {
       create: { user_id: referral.referrer_id, total_xp: REFERRAL_XP_REWARD },
       update: { total_xp: { increment: REFERRAL_XP_REWARD } },
     });
+
+    // One push covers both "friend joined" and "referral reward earned" —
+    // the XP is paid at exactly the moment the friend becomes a hunter.
+    const friend = await tx.users.findUnique({ where: { id: referredUserId }, select: { name: true } });
+    await createNotification(
+      tx, referral.referrer_id, 'FRIEND_JOINED',
+      `⚔️ ${friend?.name || 'Your recruit'} answered your call`,
+      `Your Guest Pass recruit just became a hunter. +${REFERRAL_XP_REWARD} XP earned.`,
+      { event: 'FRIEND_JOINED', friend_id: referredUserId, xp: REFERRAL_XP_REWARD }
+    );
+
+    return true;
   });
+
+  // Outside the transaction (it already committed) — the referrer's
+  // total_xp just moved, which can change their leaderboard standing.
+  if (paid) await syncLeaderboardMember(referral.referrer_id);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1302,6 +1320,12 @@ export async function updateUserProfile(userId, payload = {}) {
       where: { id: bUserId },
       data: userUpdates,
     });
+
+    // name / date_of_birth / avatar_id all feed leaderboard display or
+    // genz eligibility — resync whenever any of them moved.
+    if (userUpdates.name !== undefined || userUpdates.date_of_birth !== undefined || userUpdates.avatar_id !== undefined) {
+      await syncLeaderboardMember(bUserId);
+    }
   }
 
   return await getCurrentUser(bUserId);
@@ -1353,6 +1377,8 @@ export async function updateUserAvatar(userId, avatarId) {
       updated_at: new Date(),
     },
   });
+
+  await syncLeaderboardMember(bUserId);
 
   return await getCurrentUser(bUserId);
 }

@@ -25,3 +25,19 @@ export const authLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders:   false,
 });
+
+// Leaderboard — 60/min per user (not per IP; relies on verifyToken
+// running first so req.user is populated). Infinite-scroll + background
+// revalidation on 3 tabs can be chatty, but 60/min comfortably covers
+// normal use without opening it up to a scraping risk.
+export const leaderboardLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator: (req) => req.user?.id?.toString() || req.ip,
+  message: {
+    success: false,
+    message: 'Too many leaderboard requests. Try again in a moment.',
+  },
+});

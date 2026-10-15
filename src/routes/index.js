@@ -9,6 +9,8 @@ import adminRouter from './admin.js';
 import mediaRouter from './media.js';
 import ratingsRouter from './ratings.js';
 import feedbackRouter from './feedback.js';
+import leaderboardRouter from './leaderboard.js';
+import notificationsRouter from './notifications.js';
 
 const router = Router();
 
@@ -45,6 +47,12 @@ router.use('/ratings', ratingsRouter);
 
 // Send Feedback screen
 router.use('/feedback', feedbackRouter);
+
+// Leaderboard (global / friends / genz)
+router.use('/leaderboard', leaderboardRouter);
+
+// Notification inbox (Home bell)
+router.use('/notifications', notificationsRouter);
 
 export default router;
 
