@@ -59,6 +59,7 @@
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { grantStreakMilestoneReward, checkAndAwardStreakMilestoneBadge } from './rewardService.js';
+import { createNotification } from './notificationService.js';
 
 const MS_PER_DAY   = 24 * 60 * 60 * 1000;
 const MAX_LIVES     = 2;
@@ -125,14 +126,26 @@ export async function bumpDailyStreak(tx, userId) {
   // Milestone rewards & permanent streak badges (Ember Vow, Iron Resolve, Shadow Oath,
   // Phantom Discipline, Sovereign Will, Void Ascendant, Eternal Hunter).
   // Idempotent: earned badges are inserted into user_badges once and preserved permanently.
+  // A life earned on a milestone day rides along in the milestone push
+  // instead of sending a second one at the same moment.
   const STREAK_MILESTONES_LIST = [7, 14, 30, 60, 90, 200, 365];
+  let milestone = { granted: false };
   if (STREAK_MILESTONES_LIST.includes(newStreak)) {
-    await checkAndAwardStreakMilestoneBadge(tx, userId, newStreak);
+    milestone = await checkAndAwardStreakMilestoneBadge(tx, userId, newStreak, { lifeEarned: earnedLife });
   } else {
-    const milestone = await tx.streak_milestones.findUnique({ where: { streak_days: newStreak } });
-    if (milestone) {
-      await grantStreakMilestoneReward(tx, userId, milestone);
+    const row = await tx.streak_milestones.findUnique({ where: { streak_days: newStreak } });
+    if (row) {
+      milestone = await grantStreakMilestoneReward(tx, userId, row, { lifeEarned: earnedLife });
     }
+  }
+
+  if (earnedLife && !milestone.granted) {
+    await createNotification(
+      tx, userId, 'STREAK_MILESTONE',
+      '🛡️ Streak life earned',
+      `${newStreak}-day streak! You now have ${newLives} streak ${newLives === 1 ? 'life' : 'lives'} — a missed day won't break your streak.`,
+      { event: 'STREAK_LIFE_EARNED', daily_streak: newStreak, streak_lives: newLives }
+    );
   }
 }
 
@@ -201,22 +214,29 @@ export async function resolveStreakRisk(userId, action) {
 
   const yesterday = new Date(today.getTime() - MS_PER_DAY);
 
-  const updated = action === 'USE_LIVES'
-    ? await prisma.user_progression.update({
-        where: { user_id: userId },
-        data: {
+  // Conditional on the state just read (same last_active_date, enough
+  // lives), so a double-submitted USE_LIVES can't spend lives twice or
+  // drive streak_lives negative — the loser matches nothing.
+  const { count } = await prisma.user_progression.updateMany({
+    where: {
+      user_id:          userId,
+      last_active_date: progression.last_active_date,
+      ...(action === 'USE_LIVES' ? { streak_lives: { gte: missedDays } } : {}),
+    },
+    data: action === 'USE_LIVES'
+      ? {
           streak_lives:     { decrement: missedDays },
           last_active_date: yesterday, // erases the gap; next completion continues normally
-        },
-      })
-    : await prisma.user_progression.update({
-        where: { user_id: userId },
-        data: {
+        }
+      : {
           daily_streak:          0,
           consecutive_miss_days: 0,
           last_active_date:      null,
         },
-      });
+  });
+  if (count === 0) throw new Error('NOTHING_TO_RESOLVE');
+
+  const updated = await prisma.user_progression.findUnique({ where: { user_id: userId } });
 
   return {
     daily_streak:   updated.daily_streak,

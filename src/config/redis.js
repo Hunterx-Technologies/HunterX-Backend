@@ -21,9 +21,15 @@ if (REDIS_URL) {
     maxRetriesPerRequest: 1,
     retryStrategy: (times) => Math.min(times * 500, 10_000),
     lazyConnect: false,
+    // While disconnected, fail commands immediately instead of queueing
+    // them — a queued command would hold an API request (e.g. a task
+    // completion's leaderboard sync) until Redis came back.
+    enableOfflineQueue: false,
   });
 
-  redis.on('connect', () => {
+  // 'ready', not 'connect': commands are only accepted once the
+  // connection has finished its handshake.
+  redis.on('ready', () => {
     up = true;
     info('Redis connected (leaderboard cache)');
   });
@@ -42,6 +48,25 @@ if (REDIS_URL) {
 
 export function isRedisUp() {
   return up && !!redis;
+}
+
+// Resolves once Redis is ready (true) or after timeoutMs (false). For
+// startup / one-off scripts that run before the first 'ready' event —
+// isRedisUp() is always false that early.
+export function waitForRedis(timeoutMs = 5000) {
+  if (!redis) return Promise.resolve(false);
+  if (isRedisUp()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      redis.off('ready', onReady);
+      resolve(false);
+    }, timeoutMs);
+    function onReady() {
+      clearTimeout(timer);
+      resolve(true);
+    }
+    redis.once('ready', onReady);
+  });
 }
 
 export default redis;

@@ -47,6 +47,11 @@ export async function submitFeedback(user, { category, message, attachmentUrl, a
     throw new Error('MESSAGE_TOO_LONG');
   }
 
+  if (attachmentUrl &&
+      (typeof attachmentUrl !== 'string' || attachmentUrl.length > 500 || !/^https:\/\//.test(attachmentUrl))) {
+    throw new Error('INVALID_ATTACHMENT_URL');
+  }
+
   const bUserId = typeof user.id === 'bigint' ? user.id : BigInt(user.id);
 
   const progression = await prisma.user_progression.findUnique({

@@ -187,3 +187,27 @@ export async function markNotificationsRead(userId, { ids, all } = {}) {
   await prisma.notifications.updateMany({ where, data: { is_read: true, read_at: now } });
   return { unread_count: await getUnreadCount(bUserId, now) };
 }
+
+// ── Retention ─────────────────────────────────────────────
+// Nightly (src/cron/midnight.js): notifications older than RETENTION_DAYS
+// are deleted — inbox history, push outbox state and broadcast stats
+// alike. Safe for dedupe: every scheduled job keys on a specific day or
+// one-time event (≤14 days out), so a deleted row can't make its job fire
+// again. Deleted in batches so the table is never locked for long.
+// sent_at is the insert time (never updated) and is indexed.
+
+export const NOTIFICATION_RETENTION_DAYS = 60;
+const RETENTION_BATCH = 5000;
+
+export async function deleteOldNotifications(now = new Date()) {
+  const cutoff = new Date(now.getTime() - NOTIFICATION_RETENTION_DAYS * DAY_MS);
+  let total = 0;
+  for (;;) {
+    const deleted = await prisma.$executeRaw`
+      DELETE FROM notifications WHERE id IN (
+        SELECT id FROM notifications WHERE sent_at < ${cutoff} LIMIT ${RETENTION_BATCH}
+      )`;
+    total += deleted;
+    if (deleted < RETENTION_BATCH) return total;
+  }
+}

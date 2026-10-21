@@ -159,12 +159,20 @@ export async function syncLeaderboardMember(userId, knownValues = {}) {
     const member = bUserId.toString();
     const thumbUrl = buildAvatarThumbUrl(avatarImageUrl) ?? '';
 
-    const pipeline = redis.pipeline();
-    if (eligibility.global) pipeline.zadd(REDIS_KEYS.global, score, member);
-    else pipeline.zrem(REDIS_KEYS.global, member);
+    // A rebuild in progress (scripts/rebuildLeaderboard.js) is filling
+    // `<key>:rebuilding` from a Postgres snapshot and will RENAME it over
+    // the live key — mirror this write into it too, or the swap would
+    // roll this user back to their pre-rebuild score.
+    const keys = [[REDIS_KEYS.global, eligibility.global], [REDIS_KEYS.genz, eligibility.genz]];
+    if (await redis.exists(REDIS_KEYS.rebuildLock)) {
+      keys.push([`${REDIS_KEYS.global}:rebuilding`, eligibility.global], [`${REDIS_KEYS.genz}:rebuilding`, eligibility.genz]);
+    }
 
-    if (eligibility.genz) pipeline.zadd(REDIS_KEYS.genz, score, member);
-    else pipeline.zrem(REDIS_KEYS.genz, member);
+    const pipeline = redis.pipeline();
+    for (const [key, eligible] of keys) {
+      if (eligible) pipeline.zadd(key, score, member);
+      else pipeline.zrem(key, member);
+    }
 
     pipeline.hset(REDIS_KEYS.userHash(member), { name: name ?? '', avatarThumbUrl: thumbUrl });
     pipeline.expire(REDIS_KEYS.userHash(member), DISPLAY_HASH_TTL_SECONDS);

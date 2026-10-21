@@ -16,14 +16,18 @@ import { createNotification } from './notificationService.js';
 import { computeGap, reconcileStreak } from './streakService.js';
 import { eligibilityWhere, VISIBLE_FILTER } from './leaderboardService.js';
 import { FRIENDS_REFERRAL_CAP } from '../config/leaderboardConfig.js';
-import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
+import { getISTDateOnly } from '../utils/helpers.js';
+import { getTaskPeriod } from './taskService.js';
 import { getLocalTime } from '../utils/timezone.js';
+import { getActivePurchase } from './taskPurchaseService.js';
+import {
+  QUEST_LABELS, newQuestKey, paidLaunchKey, paidLaunchMessage, formatDay, isOnSale,
+} from './questNotificationService.js';
 
 const IST            = 'Asia/Kolkata';
 const DAY_MS         = 24 * 60 * 60 * 1000;
 const IST_OFFSET_MS  = 5.5 * 60 * 60 * 1000;
 const DAILY_TYPES    = ['DAILY_FIXED', 'DAILY_ADMIN'];
-const SATURDAY       = 6;
 
 function dateKey(date) {
   return date.toISOString().slice(0, 10);
@@ -85,29 +89,29 @@ const taskReminder = {
 };
 
 // ── 2.2 Streak at risk ─────────────────────────────────────
-// 20:00 IST = 4h before the IST day closes. Missing today turns today
-// into a missed day: covered by lives → costs lives, otherwise breaks.
+// 07:00 IST, the morning the streak needs today's quest: for users who
+// were active yesterday (a gap is streak_status's job, same 07:00 slot).
+// Missing today turns today into a missed day: covered by lives → costs
+// a life, otherwise breaks.
 
 const streakAtRisk = {
   name:     'streak_at_risk',
   type:     'STREAK_AT_RISK',
   timezone: IST,
-  slot:     () => '20:00',
+  slot:     () => '07:00',
   run: async ({ userId }) => {
     const today       = getISTDateOnly();
     const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
     const streak      = progression?.daily_streak ?? 0;
     if (streak <= 0) return null;
 
-    const { daysSince, missedDays, coveredByLives, lives } = computeGap(progression, today);
-    if (daysSince === null || daysSince === 0) return null; // active today
-    if (missedDays > 0 && !coveredByLives) return null;     // already broken — streak_status handles it
+    const { daysSince, lives } = computeGap(progression, today);
+    if (daysSince !== 1) return null; // active today, or a gap — streak_status handles gaps
 
-    const missedIfIdle = daysSince; // today joins the gap
-    const costsLife    = missedIfIdle <= lives;
+    const costsLife = lives >= 1;
     const body = costsLife
-      ? `Clear one quest in the next 4 hours or it costs you ${plural(missedIfIdle, 'streak life')}.`
-      : 'Clear one quest in the next 4 hours or your streak resets to zero.';
+      ? 'Clear one quest today or it costs you 1 streak life.'
+      : 'Clear one quest today or your streak resets to zero.';
 
     return createNotification(
       prisma, userId, 'STREAK_AT_RISK',
@@ -128,7 +132,7 @@ const streakAtRisk = {
 const streakStatus = {
   name: 'streak_status',
   type: 'STREAK_FREEZE_USED', // gate: notify_streak_freeze covers both outcomes
-  slot: () => '09:00',
+  slot: () => '07:00',
   run: async ({ userId }) => {
     const today       = getISTDateOnly();
     const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
@@ -166,27 +170,102 @@ const streakStatus = {
   },
 };
 
+// A paid task's last period ends on the buyer's access_end — that
+// deadline belongs to paid_task_expiring, not the period-deadline jobs.
+async function endsWithPaidAccess(userId, task, period) {
+  if (!task.is_paid) return false;
+  const purchase = await getActivePurchase(userId, task.id);
+  return Boolean(purchase && purchase.access_end.getTime() === period.end.getTime());
+}
+
 // ── 2.4 Weekly quest deadline ──────────────────────────────
-// Saturday 18:00 IST — the week (Mon–Sun IST) closes Sunday midnight.
+// Daily 18:00 IST — each weekly quest runs in its own 7-day periods
+// (taskService.getTaskPeriod), so remind about the ones whose current
+// period ends tomorrow and that are still open.
 
 const weeklyDeadline = {
   name:     'weekly_deadline',
   type:     'TASK_REMINDER',
   timezone: IST,
-  slot:     (_settings, clock) => (clock.weekday === SATURDAY ? '18:00' : null),
+  slot:     () => '18:00',
   run: async ({ userId }) => {
-    const weekStart = getISTWeekStart();
-    const weekEnd   = new Date(weekStart.getTime() + 6 * DAY_MS);
-    const open = await countOpenTasks(userId, { types: ['WEEKLY'], from: weekStart, to: weekEnd, periodDate: weekStart });
+    const today    = getISTDateOnly();
+    const tomorrow = new Date(today.getTime() + DAY_MS);
+
+    const scheduled = await prisma.task_schedule.findMany({
+      where:   { user_id: userId, active_date: today, tasks: { is_active: true, task_type: 'WEEKLY' } },
+      include: { tasks: true },
+    });
+
+    let open = 0;
+    for (const { tasks: task } of scheduled) {
+      const period = await getTaskPeriod(userId, task, today);
+      if (period.end.getTime() !== tomorrow.getTime()) continue;
+      if (await endsWithPaidAccess(userId, task, period)) continue;
+      const handled = await prisma.task_completions.count({
+        where: { user_id: userId, task_id: task.id, schedule_date: period.start },
+      });
+      if (!handled) open += 1;
+    }
     if (open === 0) return null;
 
     return createNotification(
       prisma, userId, 'TASK_REMINDER',
       'Weekly quests close tomorrow',
-      `${plural(open, 'weekly quest')} still open. The week resets at midnight Sunday.`,
+      `${plural(open, 'weekly quest')} still open. Finish before tomorrow ends.`,
       { event: 'WEEKLY_DEADLINE', open_tasks: open },
-      { dedupeKey: `weekly_deadline:${dateKey(weekStart)}`, expiresAt: istDayEnd(weekEnd) }
+      { dedupeKey: `weekly_deadline:${dateKey(tomorrow)}`, expiresAt: istDayEnd(tomorrow) }
     );
+  },
+};
+
+// ── 2.4b Monthly quest deadline ────────────────────────────
+// Daily 18:00 IST — monthly quests run in 30-day periods, so warn 3 days
+// and 1 day before the current period ends while it's still open. One
+// push per countdown day (tasks ending 3 and 1 days out don't merge).
+
+const MONTHLY_NUDGE_DAYS = [3, 1];
+
+const monthlyDeadline = {
+  name:     'monthly_deadline',
+  type:     'TASK_REMINDER',
+  timezone: IST,
+  slot:     () => '18:00',
+  run: async ({ userId }) => {
+    const today = getISTDateOnly();
+
+    const scheduled = await prisma.task_schedule.findMany({
+      where:   { user_id: userId, active_date: today, tasks: { is_active: true, task_type: 'MONTHLY' } },
+      include: { tasks: true },
+    });
+
+    const openByDays = new Map(); // days left → { count, end }
+    for (const { tasks: task } of scheduled) {
+      const period   = await getTaskPeriod(userId, task, today);
+      const daysLeft = Math.round((period.end.getTime() - today.getTime()) / DAY_MS);
+      if (!MONTHLY_NUDGE_DAYS.includes(daysLeft)) continue;
+      if (await endsWithPaidAccess(userId, task, period)) continue;
+      const handled = await prisma.task_completions.count({
+        where: { user_id: userId, task_id: task.id, schedule_date: period.start },
+      });
+      if (handled) continue;
+      const entry = openByDays.get(daysLeft) ?? { count: 0, end: period.end };
+      entry.count += 1;
+      openByDays.set(daysLeft, entry);
+    }
+
+    let created = null;
+    for (const [daysLeft, { count, end }] of openByDays) {
+      const n = await createNotification(
+        prisma, userId, 'TASK_REMINDER',
+        daysLeft === 1 ? 'Monthly quests close tomorrow' : `Monthly quests close in ${daysLeft} days`,
+        `${plural(count, 'monthly quest')} still open. Finish before ${formatDay(end)} ends.`,
+        { event: 'MONTHLY_DEADLINE', open_tasks: count, days_left: daysLeft },
+        { dedupeKey: `monthly_deadline:${dateKey(end)}:${daysLeft}`, expiresAt: istDayEnd(end) }
+      );
+      created = created ?? n;
+    }
+    return created;
   },
 };
 
@@ -223,7 +302,7 @@ async function pickDailyQuote(dayIndex) {
 const dailyMotivation = {
   name: 'daily_motivation',
   type: 'DAILY_MOTIVATION',
-  slot: () => '07:00',
+  slot: () => '06:00', // before quiet hours end — the type is exempt (notificationTypes.js)
   run: async ({ userId, local }) => {
     const dayIndex = Math.floor(Date.parse(`${local.dateStr}T00:00:00Z`) / DAY_MS);
     const { body, quoteId, imageUrl } = await pickDailyQuote(dayIndex);
@@ -239,10 +318,13 @@ const dailyMotivation = {
 };
 
 // ── 3.4 Reward expiring ────────────────────────────────────
-// User-local 10:00, once per reward, for ACTIVE rewards whose expiry
-// (user_rewards.expires_at, else the pool code's) lands in the next 48h.
+// User-local 10:00 for ACTIVE rewards whose expiry (user_rewards.expires_at,
+// else the pool code's) lands in the next 48h: a heads-up while more than
+// 24h are left, then a last-day reminder inside the final 24h. A reward
+// first seen inside the last 24h only gets the last-day one.
 
 const REWARD_EXPIRY_WINDOW_MS = 2 * DAY_MS;
+const REWARD_FINAL_WINDOW_H   = 24;
 
 const rewardExpiring = {
   name: 'reward_expiring',
@@ -271,12 +353,17 @@ const rewardExpiring = {
       const prize     = reward.reward_pool.discount_value || 'Your reward';
       const partner   = reward.reward_pool.reward_partners?.name;
 
+      const from  = `${prize}${partner ? ` from ${partner}` : ''}`;
+      const final = hoursLeft <= REWARD_FINAL_WINDOW_H;
+
       const n = await createNotification(
         prisma, userId, 'REWARD_READY',
-        '⏳ Reward expiring soon',
-        `${prize}${partner ? ` from ${partner}` : ''} expires in ${hoursLeft}h. Claim it before it's gone.`,
-        { event: 'REWARD_EXPIRING', user_reward_id: reward.id, expires_at: expiresAt.toISOString() },
-        { dedupeKey: `reward_expiring:${reward.id}`, expiresAt }
+        final ? `⏳ Last day to claim ${prize}` : '⏳ Reward expiring soon',
+        final
+          ? `${from} expires in ${hoursLeft}h. Claim it now.`
+          : `${from} expires in ${hoursLeft}h. Claim it before it's gone.`,
+        { event: final ? 'REWARD_EXPIRING_FINAL' : 'REWARD_EXPIRING', user_reward_id: reward.id, expires_at: expiresAt.toISOString() },
+        { dedupeKey: `${final ? 'reward_expiring_final' : 'reward_expiring'}:${reward.id}`, expiresAt }
       );
       created = created ?? n;
     }
@@ -285,24 +372,27 @@ const rewardExpiring = {
 };
 
 // ── 3.5 New admin quest ────────────────────────────────────
-// 08:00 IST, after the 00:30 IST assignment cron. "New" = an admin-created
-// task (DAILY_ADMIN / WEEKLY) assigned to this user today that was never
-// assigned to them before — so a recurring quest announces once, not daily.
+// 07:00 IST, after the 00:30 IST assignment cron. "New" = a free
+// admin-created task (DAILY_ADMIN / WEEKLY / MONTHLY) assigned to this user
+// today that was never assigned to them before — so a recurring quest
+// announces once, not daily. Paid tasks have their own pushes (launch,
+// purchase confirmed), and tasks created after 07:00 that were already
+// announced on the spot (questNotificationService) are skipped.
 
-const ADMIN_TYPES = ['DAILY_ADMIN', 'WEEKLY'];
+const ADMIN_TYPES = ['DAILY_ADMIN', 'WEEKLY', 'MONTHLY'];
 
 const newQuest = {
   name:     'new_quest',
   type:     'NEW_QUEST',
   timezone: IST,
-  slot:     () => '08:00',
+  slot:     () => '07:00',
   run: async ({ userId }) => {
     const today = getISTDateOnly();
     const todays = await prisma.task_schedule.findMany({
       where: {
         user_id:     userId,
         active_date: today,
-        tasks:       { is_active: true, task_type: { in: ADMIN_TYPES } },
+        tasks:       { is_active: true, is_paid: false, task_type: { in: ADMIN_TYPES } },
       },
       select: { task_id: true, tasks: { select: { title: true, task_type: true, xp_reward: true } } },
     });
@@ -317,8 +407,15 @@ const newQuest = {
       select:   { task_id: true },
       distinct: ['task_id'],
     });
-    const seen  = new Set(seenBefore.map((s) => String(s.task_id)));
-    const fresh = todays.filter((s) => !seen.has(String(s.task_id)));
+    const announced = await prisma.notifications.findMany({
+      where:  { user_id: userId, dedupe_key: { in: todays.map((s) => newQuestKey(s.task_id)) } },
+      select: { dedupe_key: true },
+    });
+    const seen = new Set([
+      ...seenBefore.map((s) => newQuestKey(s.task_id)),
+      ...announced.map((n) => n.dedupe_key),
+    ]);
+    const fresh = todays.filter((s) => !seen.has(newQuestKey(s.task_id)));
     if (fresh.length === 0) return null;
 
     const [first] = fresh;
@@ -326,7 +423,7 @@ const newQuest = {
       ? `New quest: ${first.tasks.title}`
       : `${fresh.length} new quests from the System`;
     const body = fresh.length === 1
-      ? `${first.tasks.task_type === 'WEEKLY' ? 'Weekly quest' : "Today's quest"} · +${first.tasks.xp_reward} XP. Accept the challenge.`
+      ? `${QUEST_LABELS[first.tasks.task_type] ?? 'Quest'} · +${first.tasks.xp_reward} XP. Accept the challenge.`
       : fresh.map((s) => s.tasks.title).join(' · ').slice(0, 180);
 
     return createNotification(
@@ -334,6 +431,126 @@ const newQuest = {
       { event: 'NEW_QUEST', task_ids: fresh.map((s) => String(s.task_id)) },
       { dedupeKey: `new_quest:${dateKey(today)}`, expiresAt: istDayEnd(today) }
     );
+  },
+};
+
+// ── 3.6 Paid quest launch ──────────────────────────────────
+// 08:00 IST on a paid task's start_date. Locked offers are never in
+// task_schedule, so new_quest can't see them — this pitches each one to
+// every user who hasn't bought it. Same dedupe key as the on-the-spot
+// launch for tasks created after 08:00 (questNotificationService).
+
+const paidQuestLaunch = {
+  name:     'paid_quest_launch',
+  type:     'NEW_QUEST',
+  timezone: IST,
+  slot:     () => '08:00',
+  run: async ({ userId }) => {
+    const today = getISTDateOnly();
+    const tasks = await prisma.tasks.findMany({
+      where: {
+        is_paid:        true,
+        is_active:      true,
+        start_date:     today,
+        task_purchases: { none: { user_id: userId, status: 'PAID' } },
+      },
+      orderBy: { id: 'asc' },
+    });
+
+    let created = null;
+    for (const task of tasks) {
+      if (!isOnSale(task, today)) continue;
+      const { title, body } = paidLaunchMessage(task);
+      const n = await createNotification(
+        prisma, userId, 'NEW_QUEST', title, body,
+        { event: 'PAID_QUEST_LAUNCH', task_ids: [String(task.id)] },
+        { dedupeKey: paidLaunchKey(task), expiresAt: istDayEnd(task.end_date) }
+      );
+      created = created ?? n;
+    }
+    return created;
+  },
+};
+
+// ── 3.7 Paid task access ending ────────────────────────────
+// User-local 10:00, 3 days and 1 day before a buyer's access_end and on
+// the last day itself, while the paid task is still not completed —
+// they paid for it, so they must not lose it unawares.
+
+const PAID_EXPIRY_NUDGE_DAYS = [3, 1, 0];
+
+const paidTaskExpiring = {
+  name: 'paid_task_expiring',
+  type: 'PAID_TASK_EXPIRING',
+  slot: () => '10:00',
+  run: async ({ userId }) => {
+    const today = getISTDateOnly();
+    const purchases = await prisma.task_purchases.findMany({
+      where: {
+        user_id:      userId,
+        status:       'PAID',
+        completed_at: null,
+        access_start: { lte: today },
+        access_end:   { in: PAID_EXPIRY_NUDGE_DAYS.map((d) => new Date(today.getTime() + d * DAY_MS)) },
+        tasks:        { is_active: true },
+      },
+      include: { tasks: { select: { title: true } } },
+      orderBy: { id: 'asc' },
+    });
+
+    let created = null;
+    for (const purchase of purchases) {
+      const daysLeft = Math.round((purchase.access_end.getTime() - today.getTime()) / DAY_MS);
+      const title    = purchase.tasks.title;
+      const n = await createNotification(
+        prisma, userId, 'PAID_TASK_EXPIRING',
+        daysLeft === 0 ? `⏳ Last day: ${title}` : `⏳ ${title} closes in ${plural(daysLeft, 'day')}`,
+        daysLeft === 0
+          ? 'Your premium quest ends tonight. Complete it now or you lose access.'
+          : `You unlocked this quest — complete it before ${formatDay(purchase.access_end)} or you lose access.`,
+        { event: 'PAID_TASK_EXPIRING', purchase_id: String(purchase.id), task_id: String(purchase.task_id), days_left: daysLeft },
+        { dedupeKey: `paid_task_expiring:${purchase.id}:${daysLeft}`, expiresAt: istDayEnd(purchase.access_end) }
+      );
+      created = created ?? n;
+    }
+    return created;
+  },
+};
+
+// ── 3.8 Paid offer ending ──────────────────────────────────
+// User-local 17:00 the day before a paid offer's end_date: one "last
+// chance" to users who haven't bought it.
+
+const paidOfferEnding = {
+  name: 'paid_offer_ending',
+  type: 'NEW_QUEST',
+  slot: () => '17:00',
+  run: async ({ userId }) => {
+    const today    = getISTDateOnly();
+    const tomorrow = new Date(today.getTime() + DAY_MS);
+    const tasks = await prisma.tasks.findMany({
+      where: {
+        is_paid:        true,
+        is_active:      true,
+        start_date:     { lte: today },
+        end_date:       tomorrow,
+        task_purchases: { none: { user_id: userId, status: 'PAID' } },
+      },
+      orderBy: { id: 'asc' },
+    });
+
+    let created = null;
+    for (const task of tasks) {
+      const n = await createNotification(
+        prisma, userId, 'NEW_QUEST',
+        `Last chance: ${task.title}`,
+        `This premium quest is only available until tomorrow (${formatDay(task.end_date)}). +${task.xp_reward} XP · ₹${Number(task.price)}.`,
+        { event: 'PAID_OFFER_ENDING', task_ids: [String(task.id)] },
+        { dedupeKey: `paid_offer_ending:${task.id}:${dateKey(task.end_date)}`, expiresAt: istDayEnd(task.end_date) }
+      );
+      created = created ?? n;
+    }
+    return created;
   },
 };
 
@@ -534,15 +751,50 @@ const winBack = {
   },
 };
 
+// ── 6.5 Onboarding nudge ───────────────────────────────────
+// User-local 18:00, 1 and 3 local days after signup, for users who
+// registered a device but never finished onboarding. `audience:
+// 'onboarding'` makes the scheduler run it for exactly those users (every
+// other job only runs for onboarded users).
+
+const ONBOARDING_MESSAGES = {
+  1: { title: 'Your Hunter profile is almost ready', body: 'Finish setup to unlock your first daily quests.' },
+  3: { title: 'The System is still waiting',         body: 'A few questions stand between you and your first quest. Finish setup now.' },
+};
+
+const onboardingNudge = {
+  name:     'onboarding_nudge',
+  type:     'WIN_BACK',
+  audience: 'onboarding',
+  slot:     () => '18:00',
+  run: async ({ userId, user, settings, local }) => {
+    if (!user.created_at) return null;
+    const daysSince = Math.floor(Date.parse(`${local.dateStr}T00:00:00Z`) / DAY_MS) - localDayNumber(settings.timezone, user.created_at);
+    const message   = ONBOARDING_MESSAGES[daysSince];
+    if (!message) return null;
+
+    return createNotification(
+      prisma, userId, 'WIN_BACK', message.title, message.body,
+      { event: 'ONBOARDING_NUDGE', days_since_signup: daysSince },
+      { dedupeKey: `onboarding_nudge:${daysSince}` }
+    );
+  },
+};
+
 export const SCHEDULED_NOTIFICATION_JOBS = [
   taskReminder,
   streakAtRisk,
   streakStatus,
   weeklyDeadline,
+  monthlyDeadline,
   dailyMotivation,
   rewardExpiring,
   newQuest,
+  paidQuestLaunch,
+  paidTaskExpiring,
+  paidOfferEnding,
   leaderboardDigest,
   healthSync,
   winBack,
+  onboardingNudge,
 ];

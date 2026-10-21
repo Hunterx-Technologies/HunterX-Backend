@@ -15,7 +15,7 @@
 import 'dotenv/config';
 import crypto from 'crypto';
 import prisma from '../src/config/prisma.js';
-import redis, { isRedisUp } from '../src/config/redis.js';
+import redis, { isRedisUp, waitForRedis } from '../src/config/redis.js';
 import { info, logError } from '../src/utils/logger.js';
 import {
   REDIS_KEYS,
@@ -46,6 +46,7 @@ async function releaseLock(token) {
 }
 
 export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
+  await waitForRedis();
   if (!isRedisUp()) {
     logError('rebuildLeaderboard: Redis is unreachable, skipping rebuild');
     return { skipped: true, reason: 'REDIS_DOWN' };
@@ -151,5 +152,8 @@ if (isMainModule) {
       logError(`rebuildLeaderboard script crashed: ${err.message}`);
       process.exitCode = 1;
     })
-    .finally(() => prisma.$disconnect());
+    .finally(async () => {
+      await prisma.$disconnect();
+      redis?.disconnect();
+    });
 }

@@ -11,7 +11,19 @@
 import bcrypt from 'bcryptjs';
 import prisma from '../config/prisma.js';
 import { parseDateOnly, getISTDateOnly, isValidEmail, isStrongPassword, generateHunterId, generateReferralCode } from '../utils/helpers.js';
-import { info } from '../utils/logger.js';
+import { info, logError } from '../utils/logger.js';
+import { syncLeaderboardMember } from './leaderboardService.js';
+import { createNotification } from './notificationService.js';
+
+// Tells the user about an admin action on their account. The action is
+// already committed, so a push failure is only logged.
+async function notifyAccountUpdate(userId, event, title, body, extra = {}) {
+  try {
+    await createNotification(prisma, userId, 'ACCOUNT_UPDATE', title, body, { event, ...extra });
+  } catch (err) {
+    logError(`Account update push (${event}) failed for user ${userId}: ${err.message}`);
+  }
+}
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const MS_PER_DAY     = 24 * 60 * 60 * 1000;
@@ -255,6 +267,357 @@ export async function listUsers(query = {}) {
       has_next_page: page * limit < total,
     },
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// GET /api/admin/users/:id — everything the admin User Detail screen
+// renders: the list-row fields plus XP, dragon stage, body stats, and the
+// Activity / Badges / Rewards / Feedback tabs.
+//
+// activity_log is one newest-first feed (capped — a glance view, not an
+// audit export) merging task_completions with admin_user_actions (ban /
+// unban / streak reset). Every entry has a `type` discriminator plus
+// `title` + `occurred_at`; the remaining fields depend on the type. feedback merges the user's feedback
+// tickets with their single app_ratings row (if any), newest first.
+// ─────────────────────────────────────────────────────────────
+
+const ACTIVITY_LOG_LIMIT = 50;
+
+const ADMIN_ACTION_TITLES = {
+  BAN:          'Banned by admin',
+  UNBAN:        'Unbanned by admin',
+  STREAK_RESET: 'Streak reset by admin',
+};
+
+const FEEDBACK_SUBJECTS = {
+  bug_report: 'Bug report',
+  suggestion: 'Suggestion',
+  other:      'Other',
+};
+
+export async function getUserDetail(id) {
+  const userId = parseUserId(id);
+
+  const user = await prisma.users.findUnique({
+    where: { id: userId },
+    select: {
+      id:           true,
+      hunter_id:    true,
+      name:         true,
+      email:        true,
+      role:         true,
+      is_banned:    true,
+      ban_reason:   true,
+      banned_at:    true,
+      height_cm:    true,
+      weight_kg:    true,
+      bmi:          true,
+      dragon_stage: true,
+      created_at:   true,
+      avatars:        { select: { image_url: true } },
+      auth_providers: { select: { provider: true } },
+      user_progression: {
+        select: { total_xp: true, current_level: true, daily_streak: true, longest_streak: true },
+      },
+      task_completions: {
+        orderBy: { completed_at: 'desc' },
+        take:    ACTIVITY_LOG_LIMIT,
+        select: {
+          id: true, status: true, xp_earned: true, completed_at: true, schedule_date: true,
+          tasks: { select: { title: true } },
+        },
+      },
+      user_badges: {
+        orderBy: { earned_at: 'desc' },
+        select: {
+          id: true, earned_at: true,
+          badges: { select: { name: true, description: true, image_url: true, badge_type: true } },
+        },
+      },
+      user_rewards: {
+        orderBy: { assigned_at: 'desc' },
+        select: {
+          id: true, status: true, trigger_type: true, assigned_at: true, claimed_at: true, expires_at: true,
+          reward_pool: {
+            select: {
+              discount_value: true, description: true,
+              reward_partners: { select: { name: true } },
+            },
+          },
+        },
+      },
+      feedback: {
+        orderBy: { created_at: 'desc' },
+        select: { id: true, category: true, message: true, status: true, created_at: true },
+      },
+      app_ratings: {
+        select: { id: true, stars: true, category: true, comment: true, created_at: true, updated_at: true },
+      },
+      admin_actions_received: {
+        orderBy: { created_at: 'desc' },
+        take:    ACTIVITY_LOG_LIMIT,
+        select: {
+          id: true, action: true, reason: true, details: true, created_at: true,
+          admin: { select: { id: true, name: true } },
+        },
+      },
+    },
+  });
+
+  if (!user) throw new Error('USER_NOT_FOUND');
+
+  const level = user.user_progression?.current_level ?? 1;
+  const levelRow = await prisma.levels.findUnique({
+    where:  { level_number: level },
+    select: { rank_name: true },
+  });
+
+  const feedback = user.feedback.map((f) => ({
+    id:         `feedback-${f.id}`,
+    subject:    FEEDBACK_SUBJECTS[f.category] ?? f.category,
+    message:    f.message,
+    rating:     null,
+    status:     f.status,
+    created_at: f.created_at,
+  }));
+
+  const taskEntries = user.task_completions.map((c) => ({
+    id:            `task-${c.id}`,
+    type:          'TASK_COMPLETION',
+    title:         c.tasks?.title ?? 'Task',
+    occurred_at:   c.completed_at,
+    task_title:    c.tasks?.title ?? 'Task',
+    status:        c.status, // COMPLETED | PARTIAL | SKIPPED
+    xp_earned:     c.xp_earned,
+    schedule_date: c.schedule_date,
+    completed_at:  c.completed_at,
+  }));
+
+  const adminEntries = user.admin_actions_received.map((a) => ({
+    id:           `admin-${a.id}`,
+    type:         a.action, // BAN | UNBAN | STREAK_RESET
+    title:        ADMIN_ACTION_TITLES[a.action] ?? a.action,
+    occurred_at:  a.created_at,
+    reason:       a.reason,
+    details:      a.details ?? null,
+    performed_by: a.admin ? { id: a.admin.id.toString(), name: a.admin.name } : null,
+  }));
+
+  const activityLog = [...taskEntries, ...adminEntries]
+    .sort((x, y) => new Date(y.occurred_at ?? 0) - new Date(x.occurred_at ?? 0))
+    .slice(0, ACTIVITY_LOG_LIMIT);
+
+  if (user.app_ratings) {
+    const r = user.app_ratings;
+    feedback.push({
+      id:         `rating-${r.id}`,
+      subject:    r.category ? `App rating · ${r.category}` : 'App rating',
+      message:    r.comment ?? '',
+      rating:     r.stars,
+      status:     'resolved',
+      created_at: r.updated_at ?? r.created_at,
+    });
+    feedback.sort((a, b) => new Date(b.created_at ?? 0) - new Date(a.created_at ?? 0));
+  }
+
+  return {
+    id:             user.id.toString(),
+    hunter_id:      user.hunter_id,
+    name:           user.name,
+    email:          user.email,
+    role:           user.role,
+    avatar_url:     user.avatars?.image_url ?? null,
+    level,
+    rank:           levelRow?.rank_name ?? null,
+    xp:             user.user_progression?.total_xp ?? 0,
+    streak:         user.user_progression?.daily_streak ?? 0,
+    longest_streak: user.user_progression?.longest_streak ?? 0,
+    dragon_stage:   user.dragon_stage,
+    height_cm:      user.height_cm ?? 0,
+    weight_kg:      user.weight_kg ?? 0,
+    bmi:            user.bmi ?? 0,
+    status:         user.is_banned ? 'BANNED' : 'ACTIVE',
+    ban_reason:     user.ban_reason,
+    banned_at:      user.banned_at,
+    signup_date:    user.created_at,
+    auth_providers: user.auth_providers.map((p) => p.provider),
+
+    activity_log: activityLog,
+
+    badges: user.user_badges.map((ub) => ({
+      id:          ub.id.toString(),
+      name:        ub.badges.name,
+      description: ub.badges.description ?? '',
+      image_url:   ub.badges.image_url ?? null,
+      badge_type:  ub.badges.badge_type,
+      earned_at:   ub.earned_at,
+    })),
+
+    reward_claims: user.user_rewards.map((r) => {
+      const partner = r.reward_pool?.reward_partners?.name;
+      const value   = r.reward_pool?.discount_value;
+      return {
+        id:           r.id.toString(),
+        reward_name:  [partner, value].filter(Boolean).join(' · ') || r.reward_pool?.description || 'Reward',
+        type:         'coupon',
+        status:       r.status, // ACTIVE | CLAIMED | EXPIRED
+        trigger_type: r.trigger_type,
+        assigned_at:  r.assigned_at,
+        claimed_at:   r.claimed_at,
+        expires_at:   r.expires_at,
+      };
+    }),
+
+    feedback_tickets: feedback,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// PATCH /api/admin/users/:id/ban and /unban.
+//
+// Banning only flips users.is_banned — every enforcement point already
+// keys off that flag: verifyToken rejects every authenticated request with
+// 403 (it re-reads the user from the DB per request, so existing access
+// tokens die immediately, not at expiry), email/Google/Apple login and
+// token refresh all throw ACCOUNT_BANNED, and leaderboards, broadcasts and
+// the notification crons all filter is_banned users out. The Redis
+// leaderboard is the one cached copy, so it's re-synced right after.
+//
+// No data is deleted: progression, history and rewards are kept intact,
+// so an unban restores the account exactly as it was. Each ban/unban also
+// appends an admin_user_actions row (the history shown in Activity).
+// ─────────────────────────────────────────────────────────────
+
+const BAN_REASON_MAX = 500;
+
+function parseUserId(id) {
+  if (!/^\d+$/.test(String(id))) throw new Error('INVALID_USER_ID');
+  return BigInt(id);
+}
+
+export async function banUser(adminUserId, id, reason) {
+  const userId = parseUserId(id);
+  if (userId === BigInt(adminUserId)) throw new Error('CANNOT_BAN_SELF');
+
+  const trimmedReason = typeof reason === 'string' ? reason.trim() : '';
+  if (trimmedReason.length > BAN_REASON_MAX) throw new Error('BAN_REASON_TOO_LONG');
+
+  const user = await prisma.users.findUnique({
+    where:  { id: userId },
+    select: { role: true, is_banned: true },
+  });
+  if (!user) throw new Error('USER_NOT_FOUND');
+  if (user.role === 'ADMIN') throw new Error('CANNOT_BAN_ADMIN');
+  if (user.is_banned) throw new Error('ALREADY_BANNED');
+
+  await prisma.$transaction([
+    prisma.users.update({
+      where: { id: userId },
+      data: {
+        is_banned:  true,
+        ban_reason: trimmedReason || null,
+        banned_at:  new Date(),
+        banned_by:  BigInt(adminUserId),
+      },
+    }),
+    prisma.admin_user_actions.create({
+      data: { user_id: userId, admin_id: BigInt(adminUserId), action: 'BAN', reason: trimmedReason || null },
+    }),
+  ]);
+
+  await syncLeaderboardMember(userId); // drops them from global/genz
+  await notifyAccountUpdate(
+    userId, 'ACCOUNT_BANNED',
+    'Your account has been suspended',
+    `${trimmedReason ? `Reason: ${trimmedReason}. ` : ''}Contact support if you think this is a mistake.`
+  );
+  info(`Admin ${adminUserId} banned user ${userId}${trimmedReason ? ` (reason: ${trimmedReason})` : ''}`);
+
+  return getUserDetail(userId.toString());
+}
+
+export async function unbanUser(adminUserId, id) {
+  const userId = parseUserId(id);
+
+  const user = await prisma.users.findUnique({
+    where:  { id: userId },
+    select: { is_banned: true },
+  });
+  if (!user) throw new Error('USER_NOT_FOUND');
+  if (!user.is_banned) throw new Error('NOT_BANNED');
+
+  await prisma.$transaction([
+    prisma.users.update({
+      where: { id: userId },
+      data:  { is_banned: false, ban_reason: null, banned_at: null, banned_by: null },
+    }),
+    prisma.admin_user_actions.create({
+      data: { user_id: userId, admin_id: BigInt(adminUserId), action: 'UNBAN' },
+    }),
+  ]);
+
+  await syncLeaderboardMember(userId); // re-adds them if otherwise eligible
+  await notifyAccountUpdate(
+    userId, 'ACCOUNT_UNBANNED',
+    'Your account is active again',
+    'Welcome back, Hunter. Your quests and progress are right where you left them.'
+  );
+  info(`Admin ${adminUserId} unbanned user ${userId}`);
+
+  return getUserDetail(userId.toString());
+}
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/admin/users/:id/reset-streak — sets the current daily streak
+// to 0, the same end state as the user choosing 'DROP' on the streak-at-
+// risk prompt (streakService.resolveStreakRisk): last_active_date is
+// cleared so their next completion starts a fresh streak at 1.
+// longest_streak and banked streak_lives are left untouched. Leaderboard
+// score is XP-only, so no re-sync is needed.
+// ─────────────────────────────────────────────────────────────
+
+export async function resetUserStreak(adminUserId, id) {
+  const userId = parseUserId(id);
+
+  const progression = await prisma.user_progression.findUnique({
+    where:  { user_id: userId },
+    select: { daily_streak: true },
+  });
+  if (!progression) {
+    const exists = await prisma.users.findUnique({ where: { id: userId }, select: { id: true } });
+    throw new Error(exists ? 'NO_PROGRESSION' : 'USER_NOT_FOUND');
+  }
+
+  await prisma.$transaction([
+    prisma.user_progression.update({
+      where: { user_id: userId },
+      data: {
+        daily_streak:          0,
+        consecutive_miss_days: 0,
+        last_active_date:      null,
+      },
+    }),
+    prisma.admin_user_actions.create({
+      data: {
+        user_id:  userId,
+        admin_id: BigInt(adminUserId),
+        action:   'STREAK_RESET',
+        details:  { previous_streak: progression.daily_streak },
+      },
+    }),
+  ]);
+
+  info(`Admin ${adminUserId} reset streak for user ${userId} (was ${progression.daily_streak})`);
+  if (progression.daily_streak > 0) {
+    await notifyAccountUpdate(
+      userId, 'STREAK_RESET',
+      'Your streak was reset',
+      `Your ${progression.daily_streak}-day streak was reset by the team. Clear a quest today to start a new one.`,
+      { previous_streak: progression.daily_streak }
+    );
+  }
+
+  return getUserDetail(userId.toString());
 }
 
 // ─────────────────────────────────────────────────────────────

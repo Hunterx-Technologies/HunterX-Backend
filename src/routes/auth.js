@@ -231,6 +231,8 @@ router.post('/apple', authLimiter, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'ACCOUNT_BANNED')
       return error(res, 'Your account has been suspended', 403);
+    if (err.message === 'INVALID_APPLE_TOKEN')
+      return error(res, 'Invalid or expired Apple token', 401);
     next(err);
   }
 });
@@ -258,12 +260,19 @@ router.post('/refresh', async (req, res, next) => {
       return error(res, 'User not found', 404);
     if (err.name === 'TokenExpiredError')
       return error(res, 'Refresh token expired — please login again', 401);
+    if (err.name === 'JsonWebTokenError' || err.message === 'TOKEN_REVOKED')
+      return error(res, 'Invalid refresh token — please login again', 401);
+    if (err.message === 'ACCOUNT_BANNED')
+      return error(res, 'Your account has been suspended', 403);
     next(err);
   }
 });
 
 // ── POST /api/auth/forgot-password ───────────────────────
-// Send reset email — checks if email exists first
+// Sends a reset link if the email belongs to a password account (or a
+// "sign in with Google/Apple" note for social accounts). The response is
+// the same whether or not the account exists, so this can't be used to
+// check which emails are registered.
 // Body: { email }
 
 router.post('/forgot-password', authLimiter, async (req, res, next) => {
@@ -278,15 +287,9 @@ router.post('/forgot-password', authLimiter, async (req, res, next) => {
     await authService.forgotPassword(email);
 
     return success(res, null,
-      'Recovery link sent. Check your spam folder if you do not receive it within 2 minutes.');
+      'If an account exists for this email, we have sent instructions to reset your Secret Key. Check your spam folder if it does not arrive within 2 minutes.');
 
   } catch (err) {
-    if (err.message === 'EMAIL_NOT_FOUND')
-      return error(res, 'No account found with this email address', 404);
-    if (err.message === 'SOCIAL_ACCOUNT')
-      return error(res, 'This account uses Google or Apple sign-in. Password reset is not available.', 400);
-    if (err.message === 'RESET_COOLDOWN')
-      return error(res, `A reset email was already sent. Please wait ${err.remainingMinutes} minutes before requesting another reset email.`, 429);
     next(err);
   }
 });

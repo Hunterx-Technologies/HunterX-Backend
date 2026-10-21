@@ -1,4 +1,4 @@
-// src/services/taskService.js — Daily & weekly task fetching + completion logic
+// src/services/taskService.js — Daily, weekly & monthly task fetching + completion logic
 
 import prisma from '../config/prisma.js';
 import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
@@ -6,14 +6,44 @@ import { assignDailyTasks } from './taskAssignmentService.js';
 import { bumpDailyStreak, getStreakRiskStatus, reconcileStreak } from './streakService.js';
 import { checkLevelUp } from './xpService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
+import {
+  getLockedTasks, getActivePurchase, markPurchaseCompleted, getCompletedPaidTaskIds,
+} from './taskPurchaseService.js';
+import { createNotification } from './notificationService.js';
+import { istDayEnd } from './questNotificationService.js';
+import { logError } from '../utils/logger.js';
 
 const DAILY_TYPES     = ['DAILY_FIXED', 'DAILY_ADMIN'];
 const VALID_STATUSES  = ['COMPLETED', 'PARTIAL', 'SKIPPED'];
 
-// The "period key" a task's completion is tracked against —
-// one row per day for daily tasks, one row per week for weekly quests.
-function periodDateFor(taskType) {
-  return taskType === 'WEEKLY' ? getISTWeekStart() : getISTDateOnly();
+const MS_PER_DAY  = 24 * 60 * 60 * 1000;
+const PERIOD_DAYS = { WEEKLY: 7, MONTHLY: 30 };
+
+// The period a task's completion is tracked against — { start, end }.
+// Daily tasks: today. WEEKLY / MONTHLY: rolling 7 / 30-day blocks counted
+// from when the task started for this user (tasks.start_date for free
+// tasks, the purchase day for paid ones), so a 7-day window running Wed ->
+// Tue is one period (one completion), not two calendar weeks. `end` is
+// capped at the last day the user has the task (end_date / access_end).
+// period.start is the task_completions.schedule_date key.
+export async function getTaskPeriod(bUserId, task, today = getISTDateOnly()) {
+  const length = PERIOD_DAYS[task.task_type];
+  if (!length) return { start: today, end: today };
+
+  let anchor = task.start_date ?? today;
+  let lastDay = task.end_date;
+  if (task.is_paid) {
+    const purchase = await getActivePurchase(bUserId, task.id, today);
+    if (purchase) {
+      anchor  = purchase.access_start;
+      lastDay = purchase.access_end;
+    }
+  }
+  const elapsedDays = Math.max(0, Math.floor((today.getTime() - anchor.getTime()) / MS_PER_DAY));
+  const start = new Date(anchor.getTime() + Math.floor(elapsedDays / length) * length * MS_PER_DAY);
+  let end = new Date(start.getTime() + (length - 1) * MS_PER_DAY);
+  if (lastDay && lastDay.getTime() < end.getTime()) end = lastDay;
+  return { start, end };
 }
 
 function dateKey(date) {
@@ -53,8 +83,6 @@ export async function getTodayTasks(userId, overrideGender = null) {
 
   const todayDate     = getISTDateOnly();
   const weekStartDate = getISTWeekStart();
-  const weekEndDate   = new Date(weekStartDate);
-  weekEndDate.setUTCDate(weekEndDate.getUTCDate() + 6); // Sunday of the current ISO week
 
   // Trigger C — request-time fallback. If this user has no task_schedule
   // rows for today yet (cron didn't run, server was down, timezone edge
@@ -78,28 +106,33 @@ export async function getTodayTasks(userId, overrideGender = null) {
     include: { tasks: true },
   });
 
-  // Weekly: assigned any day this ISO week (Mon–Sun) — once a weekly
-  // task is assigned on its recurrence day it stays visible/completable
-  // for the rest of the week, matching the week-keyed completion
-  // tracking below. `distinct` guards against a task recurring on more
-  // than one day this week producing duplicate rows.
-  const weeklySchedule = await prisma.task_schedule.findMany({
+  // Weekly + monthly: assigned every day of the task's window (or the
+  // user's access window, if paid), so today's row is enough.
+  const periodSchedule = await prisma.task_schedule.findMany({
     where: {
       user_id:     bUserId,
-      active_date: { gte: weekStartDate, lte: weekEndDate },
-      tasks:       { is_active: true, task_type: 'WEEKLY' },
+      active_date: todayDate,
+      tasks:       { is_active: true, task_type: { in: ['WEEKLY', 'MONTHLY'] } },
     },
-    include:  { tasks: true },
-    distinct: ['task_id'],
+    include: { tasks: true },
   });
 
-  const eligible = [...dailySchedule, ...weeklySchedule].map(s => s.tasks);
+  // A paid task the user has COMPLETED is closed for them — hidden even
+  // though today's task_schedule row still exists.
+  const completedPaid = await getCompletedPaidTaskIds(bUserId);
+  const eligible = [...dailySchedule, ...periodSchedule]
+    .map(s => s.tasks)
+    .filter(t => !completedPaid.has(t.id));
 
+  const periodByTask = new Map();
+  for (const task of eligible) periodByTask.set(task.id, await getTaskPeriod(bUserId, task, todayDate));
+
+  const periodKeys = [...new Set([...periodByTask.values()].map(p => p.start.getTime()))];
   const completions = await prisma.task_completions.findMany({
     where: {
       user_id:       bUserId,
       task_id:       { in: eligible.map(t => t.id) },
-      schedule_date: { in: [todayDate, weekStartDate] },
+      schedule_date: { in: periodKeys.map(t => new Date(t)) },
     },
   });
   const completionMap = new Map(
@@ -107,8 +140,8 @@ export async function getTodayTasks(userId, overrideGender = null) {
   );
 
   function serialize(task) {
-    const periodDate = periodDateFor(task.task_type);
-    const completion = completionMap.get(`${task.id}_${dateKey(periodDate)}`) || null;
+    const period = periodByTask.get(task.id);
+    const completion = period ? completionMap.get(`${task.id}_${dateKey(period.start)}`) || null : null;
     const isFemale = effectiveGender === 'FEMALE';
     const resolvedImageUrl = isFemale
       ? (task.image_url_female ?? task.image_url_male ?? task.image_url)
@@ -129,10 +162,11 @@ export async function getTodayTasks(userId, overrideGender = null) {
       target_value:     resolveTarget(task, user),
       target_unit:      task.target_unit,
       is_recurring:     task.is_recurring,
-      // null for DAILY_FIXED (no admin-set window); for DAILY_ADMIN/WEEKLY
-      // this is the task's validity window — see adminTaskService.js
+      // null for DAILY_FIXED (no admin-set window); otherwise the task's
+      // window — for paid tasks, when the offer runs (see adminTaskService.js)
       start_date:       task.start_date ? dateKey(task.start_date) : null,
       end_date:         task.end_date ? dateKey(task.end_date) : null,
+      is_paid:          task.is_paid,
       // Not a DB value — PENDING just means "no completion row yet"
       status:           completion?.status ?? 'PENDING',
       progress_value:   completion?.progress_value ?? null,
@@ -142,7 +176,25 @@ export async function getTodayTasks(userId, overrideGender = null) {
   }
 
   const daily  = eligible.filter(t => DAILY_TYPES.includes(t.task_type)).map(serialize);
-  const weekly = eligible.filter(t => t.task_type === 'WEEKLY').map(serialize);
+  // period_start..period_end: the current 7 / 30-day block the task can be
+  // completed once in.
+  const withPeriod = task => ({
+    ...serialize(task),
+    period_start: dateKey(periodByTask.get(task.id).start),
+    period_end:   dateKey(periodByTask.get(task.id).end),
+  });
+  const weekly  = eligible.filter(t => t.task_type === 'WEEKLY').map(withPeriod);
+  const monthly = eligible.filter(t => t.task_type === 'MONTHLY').map(withPeriod);
+
+  // Paid tasks (any type) on sale that this user hasn't bought — shown with
+  // a buy button until end_date, not completable (no task_schedule row)
+  // and not in XP totals. Buying unlocks access from that day to end_date.
+  const locked = (await getLockedTasks(bUserId, todayDate)).map(task => ({
+    ...serialize(task),
+    status:        'LOCKED',
+    price:         Number(task.price),
+    currency:      task.currency,
+  }));
 
   const streak = await getStreakRiskStatus(bUserId);
 
@@ -151,10 +203,14 @@ export async function getTodayTasks(userId, overrideGender = null) {
     week_start:         dateKey(weekStartDate),
     daily,
     weekly,
+    monthly,
+    locked,
     daily_xp_earned:    daily.reduce((s, t) => s + t.xp_earned, 0),
     daily_xp_possible:  daily.reduce((s, t) => s + t.xp_reward, 0),
     weekly_xp_earned:   weekly.reduce((s, t) => s + t.xp_earned, 0),
     weekly_xp_possible: weekly.reduce((s, t) => s + t.xp_reward, 0),
+    monthly_xp_earned:   monthly.reduce((s, t) => s + t.xp_earned, 0),
+    monthly_xp_possible: monthly.reduce((s, t) => s + t.xp_reward, 0),
     // streak.at_risk true = show the "use a life or let it drop?" prompt;
     // see POST /api/tasks/streak/resolve
     streak,
@@ -226,34 +282,20 @@ export async function getWeekStatus(userId) {
 // completions on a task never assigned to them — another user's targeted
 // DAILY_ADMIN task, or one whose date window hasn't opened/has already
 // closed.
+// Every task type is assigned for each day it's available, so today's row
+// is the check.
 async function assertAssignedToUser(bUserId, task) {
-  if (task.task_type === 'WEEKLY') {
-    const weekStart = getISTWeekStart();
-    const weekEnd = new Date(weekStart);
-    weekEnd.setUTCDate(weekEnd.getUTCDate() + 6);
-
-    const row = await prisma.task_schedule.findFirst({
-      where: {
+  const row = await prisma.task_schedule.findUnique({
+    where: {
+      user_id_task_id_active_date: {
         user_id:     bUserId,
         task_id:     task.id,
-        active_date: { gte: weekStart, lte: weekEnd },
+        active_date: getISTDateOnly(),
       },
-      select: { id: true },
-    });
-    if (!row) throw new Error('TASK_NOT_ASSIGNED');
-  } else {
-    const row = await prisma.task_schedule.findUnique({
-      where: {
-        user_id_task_id_active_date: {
-          user_id:     bUserId,
-          task_id:     task.id,
-          active_date: getISTDateOnly(),
-        },
-      },
-      select: { id: true },
-    });
-    if (!row) throw new Error('TASK_NOT_ASSIGNED');
-  }
+    },
+    select: { id: true },
+  });
+  if (!row) throw new Error('TASK_NOT_ASSIGNED');
 }
 
 export async function setTaskCompletion(userId, taskId, { status, progressValue }) {
@@ -276,7 +318,7 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
 
   await assertAssignedToUser(bUserId, task);
 
-  const periodDate = periodDateFor(task.task_type);
+  const periodDate = (await getTaskPeriod(bUserId, task)).start;
 
   // Flat XP per status — the schema tracks one xp_partial amount per task,
   // not a sliding scale off progress_value.
@@ -285,6 +327,12 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
                   : /* SKIPPED */           0;
 
   const completion = await prisma.$transaction(async (tx) => {
+    // Serialize this user's completions on their progression row. Without
+    // the lock, two concurrent requests (a double-tap) both read "no
+    // completion yet" below and both pay out the full XP delta. (The row
+    // is created at signup; the upserts below still cover it if missing.)
+    await tx.$queryRaw`SELECT 1 FROM user_progression WHERE user_id = ${bUserId} FOR UPDATE`;
+
     const existing = await tx.task_completions.findUnique({
       where: {
         user_id_task_id_schedule_date: {
@@ -365,6 +413,20 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
       await bumpDailyStreak(tx, bUserId);
     }
 
+    // Completing a paid task closes the purchase: the reward is claimed,
+    // and the task is no longer assigned, listed, or offered to this user.
+    if (task.is_paid && status === 'COMPLETED') {
+      const closed = await markPurchaseCompleted(tx, bUserId, task.id);
+      if (closed) {
+        await createNotification(
+          tx, bUserId, 'QUEST_COMPLETED',
+          `🏆 Premium quest cleared: ${task.title}`,
+          `+${task.xp_reward} XP earned. Well hunted, Hunter.`,
+          { event: 'PAID_QUEST_COMPLETED', task_id: String(task.id), xp: task.xp_reward }
+        );
+      }
+    }
+
     return upserted;
   });
 
@@ -374,6 +436,12 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
   // changed, which can move this user in/out of the leaderboard or shift
   // their rank. Never let a leaderboard hiccup fail a task completion.
   await syncLeaderboardMember(bUserId);
+
+  if (DAILY_TYPES.includes(task.task_type) && status !== 'SKIPPED') {
+    await notifyIfDayCleared(bUserId, progression?.daily_streak ?? 0).catch((err) =>
+      logError(`Day-complete push failed for user ${bUserId}: ${err.message}`)
+    );
+  }
 
   return {
     task_id:        task.id,
@@ -391,6 +459,37 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
     daily_streak:   progression?.daily_streak ?? 0,
     longest_streak: progression?.longest_streak ?? 0,
   };
+}
+
+// "Day secured" push once every daily task scheduled for today is
+// COMPLETED or PARTIAL (a SKIPPED one means the day wasn't fully cleared).
+// Outside the completion transaction: the dedupe key makes it once a day.
+async function notifyIfDayCleared(bUserId, streak) {
+  const today = getISTDateOnly();
+  const scheduled = await prisma.task_schedule.findMany({
+    where:    { user_id: bUserId, active_date: today, tasks: { is_active: true, task_type: { in: DAILY_TYPES } } },
+    select:   { task_id: true },
+    distinct: ['task_id'],
+  });
+  if (scheduled.length === 0) return;
+
+  const cleared = await prisma.task_completions.count({
+    where: {
+      user_id:       bUserId,
+      task_id:       { in: scheduled.map(s => s.task_id) },
+      schedule_date: today,
+      status:        { in: ['COMPLETED', 'PARTIAL'] },
+    },
+  });
+  if (cleared < scheduled.length) return;
+
+  await createNotification(
+    prisma, bUserId, 'DAY_COMPLETE',
+    streak > 0 ? `🔥 Day ${streak} secured` : '🔥 Day secured',
+    'All daily quests cleared. See you tomorrow, Hunter.',
+    { event: 'DAY_COMPLETE', daily_streak: streak },
+    { dedupeKey: `day_complete:${dateKey(today)}`, expiresAt: istDayEnd(today) }
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -413,7 +512,7 @@ export async function reopenTask(userId, taskId) {
 
   await assertAssignedToUser(bUserId, task);
 
-  const periodDate = periodDateFor(task.task_type);
+  const periodDate = (await getTaskPeriod(bUserId, task)).start;
   const where = {
     user_id_task_id_schedule_date: {
       user_id:       bUserId,

@@ -14,14 +14,13 @@ export const QUIET_HOURS_END   = 7;  // 07:00 local
 export const DAILY_PUSH_CAP    = 3;  // capped types, rolling 24h
 
 export const NOTIFICATION_TYPES = {
-  DAILY_MOTIVATION:   { setting: 'notify_daily_motivation',    channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: true },
+  DAILY_MOTIVATION:   { setting: 'notify_daily_motivation',    channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: false }, // sent 06:00 local, before quiet hours end
   TASK_REMINDER:      { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: true },
   NEW_QUEST:          { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_AT_RISK:     { setting: 'notify_streak_preservation', channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_MILESTONE:   { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)/profile', capped: false, quietHours: true },
   STREAK_FREEZE_USED: { setting: 'notify_streak_freeze',       channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_BROKEN:      { setting: 'notify_streak_freeze',       channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
-  MONTHLY_FREEZE:     { setting: 'notify_streak_freeze',       channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   LEVEL_UP:           { setting: 'notify_level_up',            channel: 'rewards',   url: '/(tabs)',         capped: false, quietHours: true },
   REWARD_READY:       { setting: 'notify_reward_ready',        channel: 'rewards',   url: '/rewards',        capped: false, quietHours: true },
   BROADCAST:          { setting: 'notify_announcements',       channel: 'system',    url: '/(tabs)',         capped: false, quietHours: true },
@@ -30,6 +29,11 @@ export const NOTIFICATION_TYPES = {
   FEEDBACK_UPDATE:    { setting: null,                         channel: 'system',    url: '/feedback',       capped: false, quietHours: true },
   HEALTH_SYNC:        { setting: 'notify_task_reminders',      channel: 'system',    url: '/(tabs)/metrics', capped: true,  quietHours: true },
   WIN_BACK:           { setting: 'notify_daily_motivation',    channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: true },
+  PURCHASE_CONFIRMED: { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: false },
+  PAID_TASK_EXPIRING: { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: false, quietHours: true },
+  QUEST_COMPLETED:    { setting: 'notify_level_up',            channel: 'rewards',   url: '/(tabs)',         capped: false, quietHours: true },
+  DAY_COMPLETE:       { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
+  ACCOUNT_UPDATE:     { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: false },
 };
 
 const FALLBACK = { setting: null, channel: 'system', url: '/(tabs)', capped: false, quietHours: true };

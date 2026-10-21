@@ -8,10 +8,13 @@ BigInt.prototype.toJSON = function () {
   return this.toString();
 };
 
-// Generate unique Hunter ID e.g. HUN00001
-export async function generateHunterId() {
-  const count  = await prisma.users.count();
-  const number = String(count + 1).padStart(5, '0');
+// Generate unique Hunter ID e.g. HUN00001 — numbered off hunter_id_seq
+// (see the launch_hardening migration), never COUNT(*), which would hand
+// out a duplicate after any user deletion or two signups racing.
+// `client` may be a transaction client.
+export async function generateHunterId(client = prisma) {
+  const [{ n }] = await client.$queryRaw`SELECT nextval('hunter_id_seq')::bigint AS n`;
+  const number = String(n).padStart(5, '0');
   const prefix = process.env.HUNTER_ID_PREFIX || 'HUN';
   return `${prefix}${number}`;
 }
@@ -19,14 +22,28 @@ export async function generateHunterId() {
 // Generate random 8 character referral code e.g. AX7KPQ2M
 export function generateReferralCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  return Array.from({ length: 8 }, () =>
-    chars[Math.floor(Math.random() * chars.length)]
-  ).join('');
+  return Array.from({ length: 8 }, () => chars[crypto.randomInt(chars.length)]).join('');
+}
+
+// 6-digit email verification code
+export function generateOtp() {
+  return String(crypto.randomInt(100000, 1000000));
+}
+
+// Emails are matched case-insensitively everywhere — stored lowercased.
+export function normalizeEmail(email) {
+  return typeof email === 'string' ? email.trim().toLowerCase() : email;
 }
 
 // Generate secure random reset token
 export function generateResetToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+// Only this hash is stored (users.reset_token) — a DB leak doesn't hand
+// out working reset links.
+export function hashResetToken(token) {
+  return crypto.createHash('sha256').update(String(token)).digest('hex');
 }
 
 // Calculate BMI — weight in kg, height in cm
@@ -149,8 +166,9 @@ export function isStrongPassword(password) {
   };
 }
 
-// Generate access + refresh token pair
-export function generateTokens(userId, role, gender) {
+// Generate access + refresh token pair. tokenVersion (users.token_version)
+// rides in the refresh token so a password reset can revoke older ones.
+export function generateTokens(userId, role, gender, tokenVersion = 0) {
   const payload = { userId, role };
   if (gender) payload.gender = gender;
   const accessToken = jwt.sign(
@@ -159,7 +177,7 @@ export function generateTokens(userId, role, gender) {
     { expiresIn: process.env.JWT_ACCESS_EXPIRES || '15m' }
   );
   const refreshToken = jwt.sign(
-    { userId },
+    { userId, tv: tokenVersion },
     process.env.JWT_REFRESH_SECRET,
     { expiresIn: process.env.JWT_REFRESH_EXPIRES || '30d' }
   );

@@ -9,6 +9,7 @@ import * as userSettingsService from '../services/userSettingsService.js';
 import * as dataExportService from '../services/dataExportService.js';
 import * as healthMetricsService from '../services/healthMetricsService.js';
 import * as pushService from '../services/pushService.js';
+import { deleteUserAccount } from '../services/accountDeletionService.js';
 
 const router = Router();
 
@@ -167,6 +168,23 @@ router.delete('/me/devices', verifyToken, async (req, res, next) => {
     await pushService.unregisterDevice(req.user.id, token);
     return success(res, { registered: false }, 'Device unregistered');
   } catch (err) {
+    next(err);
+  }
+});
+
+// ── DELETE /api/users/me ──────────────────────────────────
+// Permanently deletes the caller's account and all of its data (App Store
+// Guideline 5.1.1(v)). Irreversible — the app must confirm first. Existing
+// tokens stop working immediately (verifyToken finds no user).
+router.delete('/me', verifyToken, async (req, res, next) => {
+  try {
+    await deleteUserAccount(req.user.id);
+    return success(res, null, 'Your account has been deleted.');
+  } catch (err) {
+    if (err.message === 'USER_NOT_FOUND')
+      return error(res, 'User not found', 404);
+    if (err.message === 'CANNOT_DELETE_ADMIN')
+      return error(res, 'Admin accounts cannot be deleted from the app', 403);
     next(err);
   }
 });

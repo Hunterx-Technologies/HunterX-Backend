@@ -81,6 +81,11 @@ export async function upsertDailyMetrics(userId, payload = {}) {
     if (INTEGER_FIELDS.has(field) && !Number.isInteger(value)) {
       throw new Error('INVALID_NUMERIC_FIELD');
     }
+    // Column limits: INT4 for the integer fields, NUMERIC(6,2) for distance —
+    // anything past them would fail the write as a 500.
+    if (value > (field === 'distanceKm' ? 9999.99 : 2147483647)) {
+      throw new Error('INVALID_NUMERIC_FIELD');
+    }
     data[column] = value;
   }
   if (source !== undefined) data.source = source;

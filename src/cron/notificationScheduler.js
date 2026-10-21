@@ -12,8 +12,10 @@
 //     name:      'task_reminder',
 //     type:      'TASK_REMINDER',          // users with it switched off are skipped up front
 //     timezone?: 'Asia/Kolkata',           // fixed clock; omitted = the user's own timezone
+//     audience?: 'onboarding',             // only users who haven't finished onboarding;
+//                                          // omitted = only onboarded users
 //     slot:      (settings, clock) => 'HH:MM' | null,   // null = not today
-//     run:       async ({ userId, settings, local, clock }) => notification | null,
+//     run:       async ({ userId, user, settings, local, clock }) => notification | null,
 //   }
 // `local` = getLocalTime(user timezone), `clock` = the job's clock (same as
 // `local` unless the job sets `timezone`) → { dateStr, weekday, hour, minute, minutesOfDay }.
@@ -38,11 +40,10 @@ export async function runNotificationScheduler(now = new Date()) {
 
   const users = await prisma.users.findMany({
     where: {
-      onboarding_done:  true,
       is_banned:        false,
       user_push_tokens: { some: {} },
     },
-    select: { id: true, user_settings: true },
+    select: { id: true, onboarding_done: true, created_at: true, user_settings: true },
   });
 
   const fixedClocks = new Map(); // job timezone → clock, computed once per tick
@@ -55,6 +56,7 @@ export async function runNotificationScheduler(now = new Date()) {
 
     for (const job of SCHEDULED_NOTIFICATION_JOBS) {
       try {
+        if ((job.audience === 'onboarding') === user.onboarding_done) continue;
         if (stored && !isNotificationEnabled(stored, job.type)) continue;
 
         let clock = local;
@@ -66,7 +68,7 @@ export async function runNotificationScheduler(now = new Date()) {
         const slot = job.slot(settings, clock);
         if (!slot || !isInTick(clock, slot)) continue;
 
-        const result = await job.run({ userId: user.id, settings, local, clock });
+        const result = await job.run({ userId: user.id, user, settings, local, clock });
         if (result) created += 1;
       } catch (err) {
         logError(`Scheduled notification job ${job.name} failed for user ${user.id}: ${err.message}`);

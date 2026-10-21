@@ -16,6 +16,9 @@ import {
   generateHunterId,
   generateReferralCode,
   generateResetToken,
+  hashResetToken,
+  generateOtp,
+  normalizeEmail,
   generateTokens,
   calculateBMI,
   calculateProtein,
@@ -36,6 +39,14 @@ const GOOGLE_AUDIENCES = [
 
 const googleClient = new OAuth2Client();
 
+const MAX_OTP_ATTEMPTS = 5;
+
+// Case-insensitive so accounts created before emails were normalized
+// (stored with capitals) still match.
+function findUserByEmail(email) {
+  return prisma.users.findFirst({ where: { email: { equals: email, mode: 'insensitive' } } });
+}
+
 // Removes sensitive fields before sending user to client
 // Never expose password_hash, reset_token, or reset_token_expiry
 function sanitizeUser(user) {
@@ -44,6 +55,7 @@ function sanitizeUser(user) {
     password_hash,
     reset_token,
     reset_token_expiry,
+    token_version,
     ...safeUser
   } = user;
   return safeUser;
@@ -274,6 +286,19 @@ async function processOnboarding(userId, answers) {
   } catch (err) {
     logError(`Referral XP payout failed for referred user ${bUserId}: ${err.message}`);
   }
+  // Welcome push. Once per user (dedupe), however many times onboarding
+  // is re-submitted. Shows in the inbox even before a device is registered.
+  try {
+    await createNotification(
+      prisma, bUserId, 'NEW_QUEST',
+      'Welcome, Hunter',
+      'Your first daily quests are ready. Clear one today to start your streak.',
+      { event: 'WELCOME' },
+      { dedupeKey: 'welcome' }
+    );
+  } catch (err) {
+    logError(`Welcome push failed for user ${bUserId}: ${err.message}`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -343,63 +368,69 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
   // missing/invalid/unknown code is never fatal to signup — it just
   // means this account isn't attributed to anyone.
   let referrer = null;
-  if (referralCode) {
+  if (typeof referralCode === 'string' && referralCode.trim()) {
     referrer = await prisma.users.findUnique({
       where: { referral_code: referralCode.trim().toUpperCase() },
     });
   }
 
-  const user = await prisma.users.create({
-    data: {
-      hunter_id:     await generateHunterId(),
-      name:          name?.trim() || 'Hunter',
-      email:         email || null,
-      password_hash: passwordHash || null,
-      referral_code: generateReferralCode(),
-      referred_by:   referrer?.id || null,
-      role:          'USER',
-    },
-  });
-
-  await prisma.auth_providers.create({
-    data: {
-      user_id:     user.id,
-      provider,
-      provider_id: providerId,
-    },
-  });
-
-  await prisma.user_progression.create({
-    data: { user_id: user.id },
-  });
-
-  // Record the referral. XP for the referrer is paid out later, once
-  // this new user actually completes onboarding (see processOnboarding)
-  // — not here — so a code can't be farmed for XP with throwaway
-  // accounts that never activate.
-  if (referrer) {
-    await prisma.referrals.create({
+  // One transaction: a failure part-way can't leave a user without its
+  // auth_providers / user_progression rows.
+  return prisma.$transaction(async (tx) => {
+    const user = await tx.users.create({
       data: {
-        referrer_id: referrer.id,
-        referred_id: user.id,
+        hunter_id:     await generateHunterId(tx),
+        name:          name?.trim() || 'Hunter',
+        email:         normalizeEmail(email) || null,
+        password_hash: passwordHash || null,
+        referral_code: generateReferralCode(),
+        referred_by:   referrer?.id || null,
+        role:          'USER',
       },
     });
-  }
 
-  return user;
+    await tx.auth_providers.create({
+      data: {
+        user_id:     user.id,
+        provider,
+        provider_id: providerId,
+      },
+    });
+
+    await tx.user_progression.create({
+      data: { user_id: user.id },
+    });
+
+    // Record the referral. XP for the referrer is paid out later, once
+    // this new user actually completes onboarding (see processOnboarding)
+    // — not here — so a code can't be farmed for XP with throwaway
+    // accounts that never activate.
+    if (referrer) {
+      await tx.referrals.create({
+        data: {
+          referrer_id: referrer.id,
+          referred_id: user.id,
+        },
+      });
+    }
+
+    return user;
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
 // SEND OTP FOR EMAIL VERIFICATION
 // ─────────────────────────────────────────────────────────────
 
-export async function sendOtp(email) {
+export async function sendOtp(rawEmail) {
+  const email = normalizeEmail(rawEmail);
+
   // Step 1 — Check email not already registered
-  const existing = await prisma.users.findUnique({ where: { email } });
+  const existing = await findUserByEmail(email);
   if (existing) throw new Error('email is already exist');
 
   // Step 2 — Generate 6 digit OTP
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = generateOtp();
 
   // Step 3 — Delete any existing unused OTPs for this email
   await prisma.email_otps.deleteMany({
@@ -558,7 +589,9 @@ export async function sendOtp(email) {
 // VERIFY OTP
 // ─────────────────────────────────────────────────────────────
 
-export async function verifyOtp(email, otp) {
+export async function verifyOtp(rawEmail, otp) {
+  const email = normalizeEmail(rawEmail);
+
   // Step 1 — Find the latest unverified unexpired OTP for this email
   const record = await prisma.email_otps.findFirst({
     where: {
@@ -570,10 +603,17 @@ export async function verifyOtp(email, otp) {
   });
 
   // Step 2 — If no record found, OTP is invalid or expired
-  if (!record) throw new Error('INVALID_OTP');
+  if (!record || record.attempts >= MAX_OTP_ATTEMPTS) throw new Error('INVALID_OTP');
 
-  // Step 3 — Check OTP matches exactly
-  if (record.otp !== otp.trim()) throw new Error('INVALID_OTP');
+  // Step 3 — Check OTP matches exactly. Every wrong guess counts; after
+  // MAX_OTP_ATTEMPTS the code is dead and a new one must be requested.
+  if (record.otp !== otp.trim()) {
+    await prisma.email_otps.update({
+      where: { id: record.id },
+      data:  { attempts: { increment: 1 } },
+    });
+    throw new Error('INVALID_OTP');
+  }
 
   // Step 4 — Mark as verified
   await prisma.email_otps.update({
@@ -589,7 +629,9 @@ export async function verifyOtp(email, otp) {
 // REGISTER WITH EMAIL AND PASSWORD
 // ─────────────────────────────────────────────────────────────
 
-export async function registerWithEmail(name, email, password, onboarding = [], referralCode = null) {
+export async function registerWithEmail(name, rawEmail, password, onboarding = [], referralCode = null) {
+  const email = normalizeEmail(rawEmail);
+
   // Check OTP was verified for this email before allowing registration
   const otpRecord = await prisma.email_otps.findFirst({
     where: {
@@ -603,7 +645,7 @@ export async function registerWithEmail(name, email, password, onboarding = [], 
   if (!otpRecord) throw new Error('EMAIL_NOT_VERIFIED');
 
   // Check email not already taken
-  const existing = await prisma.users.findUnique({ where: { email } });
+  const existing = await findUserByEmail(email);
   if (existing) throw new Error('EMAIL_EXISTS');
 
   // Hash password
@@ -628,7 +670,7 @@ export async function registerWithEmail(name, email, password, onboarding = [], 
     where: { id: user.id },
   });
 
-  const tokens = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender);
+  const tokens = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
 
   // Clean up OTP record — no longer needed after registration
   await prisma.email_otps.deleteMany({ where: { email } });
@@ -646,7 +688,7 @@ export async function registerWithEmail(name, email, password, onboarding = [], 
 // ─────────────────────────────────────────────────────────────
 
 export async function loginWithEmail(email, password) {
-  const user = await prisma.users.findUnique({ where: { email } });
+  const user = await findUserByEmail(normalizeEmail(email));
 
   if (!user || !user.password_hash) throw new Error('INVALID_CREDENTIALS');
   if (user.is_banned) throw new Error('ACCOUNT_BANNED');
@@ -654,7 +696,7 @@ export async function loginWithEmail(email, password) {
   const valid = await bcrypt.compare(password, user.password_hash);
   if (!valid) throw new Error('INVALID_CREDENTIALS');
 
-  const tokens = generateTokens(user.id.toString(), user.role, user.gender);
+  const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
 
   return {
     user:  sanitizeUser(user),
@@ -685,7 +727,9 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
 
   const payload  = ticket.getPayload();
   const googleId = payload.sub;
-  const email    = payload.email;
+  // Only a Google-verified address may be used to match (and link into) an
+  // existing account — an unverified one could be anybody's.
+  const email    = payload.email_verified ? normalizeEmail(payload.email) : null;
   const name     = payload.name || 'Hunter';
 
   // Check by Google provider ID
@@ -699,14 +743,15 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
       where: { id: existingProvider.user_id },
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
-    const tokens = generateTokens(user.id.toString(), user.role, user.gender);
+    const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
 
   // Check if email already registered (e.g. with email+password)
   if (email) {
-    const existingByEmail = await prisma.users.findUnique({ where: { email } });
+    const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
+      if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
       // Link Google to existing account
       await prisma.auth_providers.create({
         data: {
@@ -719,7 +764,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
       if (onboarding.length > 0 && !existingByEmail.onboarding_done) {
         await processOnboarding(existingByEmail.id, onboarding);
       }
-      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender);
+      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender, existingByEmail.token_version);
       return { user: sanitizeUser(existingByEmail), ...tokens, isNew: false, linked: true };
     }
   }
@@ -736,7 +781,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
   await processOnboarding(user.id, onboarding);
 
   const updatedUser = await prisma.users.findUnique({ where: { id: user.id } });
-  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender);
+  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
 
   return { user: sanitizeUser(updatedUser), ...tokens, isNew: true };
 }
@@ -748,15 +793,22 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
 // ─────────────────────────────────────────────────────────────
 
 export async function loginWithApple(idToken, nonce, onboarding = [], referralCode = null) {
-  // Verify Apple token
-  const appleUser = await appleSignin.verifyIdToken(idToken, {
-    audience:         process.env.APPLE_CLIENT_ID,
-    ignoreExpiration: false,
-    ...(nonce && { nonce }),
-  });
+  // Verify Apple token — throws for expired/malformed/wrong-audience tokens
+  let appleUser;
+  try {
+    appleUser = await appleSignin.verifyIdToken(idToken, {
+      audience:         process.env.APPLE_CLIENT_ID,
+      ignoreExpiration: false,
+      ...(nonce && { nonce }),
+    });
+  } catch {
+    throw new Error('INVALID_APPLE_TOKEN');
+  }
 
   const appleId = appleUser.sub;
-  const email   = appleUser.email || null;
+  // Apple sends email_verified as a boolean or the string "true".
+  const emailVerified = appleUser.email_verified === true || appleUser.email_verified === 'true';
+  const email   = appleUser.email && emailVerified ? normalizeEmail(appleUser.email) : null;
 
   // Check by Apple provider ID
   const existingProvider = await prisma.auth_providers.findFirst({
@@ -768,14 +820,15 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
       where: { id: existingProvider.user_id },
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
-    const tokens = generateTokens(user.id.toString(), user.role, user.gender);
+    const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
 
   // Check by email
   if (email) {
-    const existingByEmail = await prisma.users.findUnique({ where: { email } });
+    const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
+      if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
       await prisma.auth_providers.create({
         data: {
           user_id:     existingByEmail.id,
@@ -786,7 +839,7 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
       if (onboarding.length > 0 && !existingByEmail.onboarding_done) {
         await processOnboarding(existingByEmail.id, onboarding);
       }
-      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender);
+      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender, existingByEmail.token_version);
       return { user: sanitizeUser(existingByEmail), ...tokens, isNew: false, linked: true };
     }
   }
@@ -807,7 +860,7 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
   await processOnboarding(user.id, onboarding);
 
   const updatedUser = await prisma.users.findUnique({ where: { id: user.id } });
-  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender);
+  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
 
   return { user: sanitizeUser(updatedUser), ...tokens, isNew: true };
 }
@@ -824,50 +877,67 @@ export async function refreshAccessToken(refreshToken) {
   const user = await prisma.users.findUnique({ where: { id: userId } });
   if (!user)           throw new Error('USER_NOT_FOUND');
   if (user.is_banned)  throw new Error('ACCOUNT_BANNED');
+  // Issued before the last password reset — revoked. Tokens minted before
+  // token_version existed carry no `tv` and count as version 0.
+  if ((decoded.tv ?? 0) !== user.token_version) throw new Error('TOKEN_REVOKED');
 
-  const tokens = generateTokens(user.id.toString(), user.role, user.gender);
+  const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
   return { user: sanitizeUser(user), ...tokens };
 }
 
 // ─────────────────────────────────────────────────────────────
 // FORGOT PASSWORD
-// Always returns true — prevents user enumeration
+// Same response for every email — prevents user enumeration
 // ─────────────────────────────────────────────────────────────
 
-export async function forgotPassword(email) {
-  // Check email exists in DB before sending reset email
-  const user = await prisma.users.findUnique({ where: { email } });
-  if (!user) throw new Error('EMAIL_NOT_FOUND');
+export async function forgotPassword(rawEmail) {
+  const email = normalizeEmail(rawEmail);
 
-  // Only works for email+password accounts (not Google/Apple)
-  const emailProvider = await prisma.auth_providers.findFirst({
-    where: { user_id: user.id, provider: 'EMAIL' },
+  // Every outcome below looks identical to the caller (the route always
+  // answers "if an account exists..."), so this endpoint can't be used to
+  // probe which emails have accounts. Emails are sent in the background so
+  // response time doesn't give it away either.
+  const user = await findUserByEmail(email);
+  if (!user) return;
+
+  // One email per 10-minute window, whatever kind of email it is —
+  // reset_token_expiry doubles as the cooldown clock. Silently dropped:
+  // the earlier email is still valid.
+  if (user.reset_token_expiry && user.reset_token_expiry > new Date()) return;
+
+  const resetExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+  // Google/Apple-only accounts have no password to reset — tell them how
+  // they sign in instead. reset_token stays null, so no reset link can
+  // ever match; only the cooldown clock is set.
+  const providers = await prisma.auth_providers.findMany({
+    where:  { user_id: user.id },
+    select: { provider: true },
   });
-  if (!emailProvider) throw new Error('SOCIAL_ACCOUNT');
-
-  // If there is already an active (unexpired) reset token, enforce cooldown
-  if (user.reset_token && user.reset_token_expiry && user.reset_token_expiry > new Date()) {
-    const remainingMs = user.reset_token_expiry.getTime() - Date.now();
-    const remainingMins = Math.ceil(remainingMs / (60 * 1000));
-    const err = new Error('RESET_COOLDOWN');
-    err.remainingMinutes = remainingMins;
-    throw err;
+  if (!providers.some(p => p.provider === 'EMAIL')) {
+    await prisma.users.update({
+      where: { id: user.id },
+      data:  { reset_token: null, reset_token_expiry: resetExpiry },
+    });
+    const via = providers.some(p => p.provider === 'APPLE') ? 'Apple' : 'Google';
+    sendSocialAccountEmail(email, via).catch((err) =>
+      logError(`Social-account reset notice to ${email} failed: ${err.message || err}`)
+    );
+    return;
   }
 
   const resetToken  = generateResetToken();
-  const resetExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
   await prisma.users.update({
     where: { id: user.id },
     data: {
-      reset_token:        resetToken,
+      reset_token:        hashResetToken(resetToken), // the link carries the raw token
       reset_token_expiry: resetExpiry,
     },
   });
 
   const resetLink = `${process.env.APP_URL}/reset-password?token=${resetToken}`;
 
-  await mailTransporter.sendMail({
+  mailTransporter.sendMail({
     from:    process.env.EMAIL_FROM || process.env.GMAIL_USER,
     to:      email,
     subject: 'Reset your HunterX Secret Key',
@@ -933,9 +1003,53 @@ export async function forgotPassword(email) {
       </body>
       </html>
     `,
-  });
+  }).catch((err) => logError(`Password reset email to ${email} failed: ${err.message || err}`));
+}
 
-  return true;
+// Sent instead of a reset link when the account signs in with Google or
+// Apple — there's no password to reset.
+function sendSocialAccountEmail(email, via) {
+  return mailTransporter.sendMail({
+    from:    process.env.EMAIL_FROM || process.env.GMAIL_USER,
+    to:      email,
+    subject: 'Signing in to HunterX',
+    html: `
+      <!DOCTYPE html>
+      <html>
+      <body style="margin:0;padding:0;background-color:#0a0a0a;font-family:Arial,sans-serif;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td align="center" style="padding:40px 20px;">
+              <table width="480" cellpadding="0" cellspacing="0" style="background-color:#111111;border-radius:8px;border:1px solid #222222;">
+                <tr>
+                  <td style="background-color:#000000;padding:32px;text-align:center;border-bottom:1px solid #222222;">
+                    <h1 style="margin:0;color:#ffffff;font-size:24px;font-style:italic;letter-spacing:4px;">HUNTERX</h1>
+                    <p style="margin:8px 0 0;color:#555555;font-size:12px;letter-spacing:2px;text-transform:uppercase;">The system awaits</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:40px 32px;text-align:center;">
+                    <h2 style="margin:0 0 16px;color:#ffffff;font-size:24px;font-weight:bold;">No password to reset</h2>
+                    <p style="margin:0 0 16px;color:#888888;font-size:14px;line-height:1.6;">
+                      Your HunterX account signs in with <strong style="color:#ffffff;">${via}</strong>, so it doesn't have a password.<br>
+                      Open the app and tap <strong style="color:#ffffff;">Continue with ${via}</strong> to get back in.
+                    </p>
+                    <p style="margin:0;color:#333333;font-size:12px;">If you did not request this, ignore this email.</p>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:20px 32px;text-align:center;border-top:1px solid #222222;">
+                    <p style="margin:0;color:#333333;font-size:11px;">HunterX by Gymgasm · Do not reply to this email</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
+    `,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -947,7 +1061,7 @@ export async function resetPassword(resetToken, newPassword) {
   // Find user with valid unexpired reset token
   const user = await prisma.users.findFirst({
     where: {
-      reset_token:        resetToken,
+      reset_token:        hashResetToken(resetToken),
       reset_token_expiry: { gt: new Date() },
     },
   });
@@ -958,13 +1072,15 @@ export async function resetPassword(resetToken, newPassword) {
   const salt    = await bcrypt.genSalt(12);
   const newHash = await bcrypt.hash(newPassword, salt);
 
-  // Update password and clear reset token
+  // Update password, clear reset token, and revoke every refresh token
+  // issued before now (signs out other devices — e.g. whoever had access).
   await prisma.users.update({
     where: { id: user.id },
     data: {
       password_hash:      newHash,
       reset_token:        null,
       reset_token_expiry: null,
+      token_version:      { increment: 1 },
     },
   });
 

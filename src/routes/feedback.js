@@ -33,6 +33,7 @@ router.post('/', verifyToken, async (req, res, next) => {
       INVALID_CATEGORY: `category must be one of: ${feedbackService.FEEDBACK_CATEGORIES.join(', ')}`,
       MESSAGE_REQUIRED: 'message is required',
       MESSAGE_TOO_LONG: 'message cannot exceed 1000 characters',
+      INVALID_ATTACHMENT_URL: 'attachmentUrl must be an https URL of at most 500 characters',
     };
     if (badRequest[err.message]) return error(res, badRequest[err.message], 400);
     next(err);

@@ -1,6 +1,7 @@
 // src/routes/index.js — Mount all API routes
 
 import { Router } from 'express';
+import prisma from '../config/prisma.js';
 import authRouter from './auth.js';
 import usersRouter from './users.js';
 import avatarsRouter from './avatars.js';
@@ -14,13 +15,21 @@ import notificationsRouter from './notifications.js';
 
 const router = Router();
 
-// Health check
-router.get('/health', (req, res) => {
-  res.json({
-    success:   true,
-    message:   'HunterX API is running',
+// Health check — 503 when the database is unreachable, so an uptime
+// monitor / Railway healthcheck sees a real outage.
+router.get('/health', async (req, res) => {
+  let database = 'ok';
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+  } catch {
+    database = 'down';
+  }
+  res.status(database === 'ok' ? 200 : 503).json({
+    success:   database === 'ok',
+    message:   database === 'ok' ? 'HunterX API is running' : 'Database unreachable',
     timestamp: new Date().toISOString(),
     env:       process.env.NODE_ENV,
+    database,
   });
 });
 

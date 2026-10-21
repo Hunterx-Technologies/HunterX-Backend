@@ -1,5 +1,5 @@
 // src/cron/midnight.js — Nightly task-assignment cron, scheduled for
-// 00:30 IST (19:00 UTC), ahead of the 7 AM DAILY_MOTIVATION push.
+// 00:30 IST (19:00 UTC), ahead of the 6 AM DAILY_MOTIVATION push.
 //
 // Trigger A of the automatic task-assignment system (see
 // src/services/taskAssignmentService.js): for every active user, assigns
@@ -12,7 +12,10 @@
 
 import cron from 'node-cron';
 import prisma from '../config/prisma.js';
-import { assignDailyTasks } from '../services/taskAssignmentService.js';
+import { assignDailyTasks, loadSharedTasks } from '../services/taskAssignmentService.js';
+import { deactivateExpiredPaidTasks } from '../services/taskPurchaseService.js';
+import { expireRewards } from '../services/rewardService.js';
+import { deleteOldNotifications, NOTIFICATION_RETENTION_DAYS } from '../services/notificationService.js';
 import { getISTDateOnly, calculateStepsGoal } from '../utils/helpers.js';
 import { info, logError } from '../utils/logger.js';
 
@@ -70,8 +73,45 @@ export async function syncUserAgesForBirthdays(today) {
 export async function runNightlyTaskAssignment() {
   const today = getISTDateOnly();
 
-  // Run daily birthday sync first
-  await syncUserAgesForBirthdays(today);
+  // Run daily birthday sync first — its failure must not cost every user
+  // today's task assignment.
+  try {
+    await syncUserAgesForBirthdays(today);
+  } catch (err) {
+    logError(`Birthday age sync failed: ${err.message}`);
+  }
+
+  // Paid tasks whose end_date has passed stop being offered/assigned.
+  try {
+    const deactivated = await deactivateExpiredPaidTasks(today);
+    if (deactivated > 0) info(`Deactivated ${deactivated} expired paid task(s)`);
+  } catch (err) {
+    logError(`Expired paid task deactivation failed: ${err.message}`);
+  }
+
+  // Spent/expired email verification codes are never read again.
+  try {
+    const { count } = await prisma.email_otps.deleteMany({ where: { expires_at: { lt: new Date() } } });
+    if (count > 0) info(`Deleted ${count} expired email OTP(s)`);
+  } catch (err) {
+    logError(`Expired OTP cleanup failed: ${err.message}`);
+  }
+
+  // Notification retention — see notificationService.js#deleteOldNotifications.
+  try {
+    const deleted = await deleteOldNotifications();
+    if (deleted > 0) info(`Deleted ${deleted} notification(s) older than ${NOTIFICATION_RETENTION_DAYS} days`);
+  } catch (err) {
+    logError(`Notification retention cleanup failed: ${err.message}`);
+  }
+
+  // Rewards past their expiry become EXPIRED (with a push for recent ones).
+  try {
+    const expired = await expireRewards();
+    if (expired > 0) info(`Expired ${expired} reward(s)`);
+  } catch (err) {
+    logError(`Reward expiry failed: ${err.message}`);
+  }
 
   const users = await prisma.users.findMany({
     where:  { onboarding_done: true, is_banned: false },
@@ -80,10 +120,11 @@ export async function runNightlyTaskAssignment() {
 
   let assignedTotal = 0;
   let failedCount   = 0;
+  const shared      = await loadSharedTasks(today);
 
   for (const user of users) {
     try {
-      const { assigned } = await assignDailyTasks(user.id, today);
+      const { assigned } = await assignDailyTasks(user.id, today, shared);
       assignedTotal += assigned;
     } catch (err) {
       failedCount += 1;

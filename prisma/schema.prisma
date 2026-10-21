@@ -281,6 +281,7 @@ model notifications {
   users      users?            @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, dedupe_key], map: "uq_notifications_user_dedupe")
+  @@index([user_id, id(sort: Desc)], map: "idx_notifications_user_id_desc")
   @@index([sent_at], map: "idx_notifications_sent")
   @@index([user_id, is_read], map: "idx_notifications_user")
   @@index([push_status, deliver_after], map: "idx_notifications_push_queue")
@@ -331,6 +332,7 @@ model referrals {
   users_referrals_referrer_idTousers users     @relation("referrals_referrer_idTousers", fields: [referrer_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@unique([referrer_id, referred_id])
+  @@index([referred_id], map: "idx_referrals_referred")
 }
 
 model reward_partners {
@@ -427,6 +429,33 @@ model task_schedule {
   @@index([user_id, active_date], map: "idx_task_schedule_user_date")
 }
 
+// One row per purchase attempt of a paid task. Only status = PAID rows
+// with access_start <= date <= access_end unlock the task for that user
+// (see taskAssignmentService.js). The access window runs from the day the
+// user paid to tasks.end_date as it was then — extending the task later
+// only extends the offer for users who haven't bought it.
+model task_purchases {
+  id               BigInt               @id @default(autoincrement())
+  user_id          BigInt
+  task_id          BigInt
+  amount           Decimal              @db.Decimal(10, 2)
+  currency         String               @default("INR") @db.VarChar(3)
+  status           task_purchase_status @default(PENDING)
+  payment_provider String?              @db.VarChar(50)
+  payment_ref      String?              @unique @db.VarChar(255)
+  access_start     DateTime?            @db.Date
+  access_end       DateTime?            @db.Date
+  paid_at          DateTime?            @db.Timestamp(6)
+  completed_at     DateTime?            @db.Timestamp(6) // buyer COMPLETED the task — it's closed for them: no longer assigned, listed or offered
+  created_at       DateTime?            @default(now()) @db.Timestamp(6)
+  updated_at       DateTime?            @default(now()) @db.Timestamp(6)
+  tasks            tasks                @relation(fields: [task_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  users            users                @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id, status, access_start, access_end], map: "idx_task_purchases_user_access")
+  @@index([task_id], map: "idx_task_purchases_task")
+}
+
 model task_admin_targets {
   id         BigInt    @id @default(autoincrement())
   task_id    BigInt
@@ -458,13 +487,17 @@ model tasks {
   is_default_daily   Boolean              @default(false)
   recurrence_days    Int[]                @default([])
   start_date         DateTime?            @db.Date // admin-created DAILY_ADMIN/WEEKLY tasks: first date this task is assignable (can be future-dated)
-  end_date           DateTime?            @db.Date // last date this task is assignable — is_recurring=false: same as start_date (DAILY_ADMIN) or start_date+6 (WEEKLY, a single 7-day window); is_recurring=true: admin-set
+  end_date           DateTime?            @db.Date // last date this task is assignable — is_recurring=false: same as start_date (DAILY_ADMIN), start_date+6 (WEEKLY) or start_date+29 (MONTHLY) unless admin-set; is_recurring=true: admin-set or null (no end). For paid tasks start..end is when the locked offer is shown; a buyer's access runs from their purchase day to end_date, and the nightly cron deactivates the task once end_date has passed
+  is_paid            Boolean              @default(false)
+  price              Decimal?             @db.Decimal(10, 2) // required when is_paid
+  currency           String               @default("INR") @db.VarChar(3)
   is_active          Boolean              @default(true)
   created_by         BigInt?
   created_at         DateTime?            @default(now()) @db.Timestamp(6)
   updated_at         DateTime?            @default(now()) @db.Timestamp(6)
   task_admin_targets task_admin_targets[]
   task_completions   task_completions[]
+  task_purchases     task_purchases[]
   task_schedule      task_schedule[]
   users              users?               @relation(fields: [created_by], references: [id], onDelete: NoAction, onUpdate: NoAction)
   xp_transactions    xp_transactions[]
@@ -592,6 +625,9 @@ model users {
   onboarding_done                                         Boolean                    @default(false)
   onboarding_step                                         Int                        @default(0)
   is_banned                                               Boolean                    @default(false)
+  ban_reason                                              String?                    @db.VarChar(500)
+  banned_at                                               DateTime?                  @db.Timestamp(6)
+  banned_by                                               BigInt?
   referral_code                                           String                     @unique @db.VarChar(8)
   referred_by                                             BigInt?
   gender                                                  user_gender?
@@ -614,7 +650,8 @@ model users {
   password_hash                                           String?                    @db.VarChar(255)
   reset_token                                             String?                    @db.VarChar(255)
   reset_token_expiry                                      DateTime?                  @db.Timestamp(6)
-  oath_accepted                                           Boolean                    @default(false)
+  token_version                                           Int                        @default(0) // bumped on password reset — invalidates older refresh tokens
+  oath_accepted                                          Boolean                    @default(false)
   oath_accepted_at                                        DateTime?                  @db.Timestamp(6)
   created_at                                              DateTime?                  @default(now()) @db.Timestamp(6)
   updated_at                                              DateTime?                  @default(now()) @db.Timestamp(6)
@@ -637,6 +674,7 @@ model users {
   subscriptions                                           subscriptions[]
   task_admin_targets                                      task_admin_targets[]
   task_completions                                        task_completions[]
+  task_purchases                                          task_purchases[]
   task_schedule                                           task_schedule[]
   tasks                                                   tasks[]
   user_badges                                             user_badges[]
@@ -654,12 +692,32 @@ model users {
   users                                                   users?                     @relation("usersTousers", fields: [referred_by], references: [id], onDelete: NoAction, onUpdate: NoAction)
   other_users                                             users[]                    @relation("usersTousers")
   xp_transactions                                         xp_transactions[]
+  admin_actions_received                                  admin_user_actions[]       @relation("admin_user_actions_user")
+  admin_actions_performed                                 admin_user_actions[]       @relation("admin_user_actions_admin")
 
   @@index([email], map: "idx_users_email")
   @@index([hunter_id], map: "idx_users_hunter_id")
   @@index([last_latitude, last_longitude], map: "idx_users_location", where: raw("(location_visible = true)"))
   @@index([referral_code], map: "idx_users_referral_code")
   @@index([referred_by], map: "idx_users_referred_by")
+}
+
+// Audit trail of admin moderation actions on a user (ban / unban / streak
+// reset). Append-only — surfaced in the admin User Detail "Activity
+// History" tab alongside task completions. users.is_banned / ban_reason
+// hold the *current* state; this table holds the history.
+model admin_user_actions {
+  id         BigInt                 @id @default(autoincrement())
+  user_id    BigInt
+  admin_id   BigInt?
+  action     admin_user_action_type
+  reason     String?                @db.VarChar(500)
+  details    Json?                  // e.g. { "previous_streak": 12 } for STREAK_RESET
+  created_at DateTime               @default(now()) @db.Timestamp(6)
+  user       users                  @relation("admin_user_actions_user", fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  admin      users?                 @relation("admin_user_actions_admin", fields: [admin_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@index([user_id, created_at(sort: Desc)], map: "idx_admin_user_actions_user_created")
 }
 
 model xp_transactions {
@@ -681,10 +739,17 @@ model email_otps {
   email      String    @db.VarChar(255)
   otp        String    @db.VarChar(6)
   verified   Boolean   @default(false)
+  attempts   Int       @default(0) // wrong guesses — burned at MAX_OTP_ATTEMPTS
   expires_at DateTime  @db.Timestamp(6)
   created_at DateTime? @default(now()) @db.Timestamp(6)
 
   @@index([email], map: "idx_email_otps_email")
+}
+
+enum admin_user_action_type {
+  BAN
+  UNBAN
+  STREAK_RESET
 }
 
 enum auth_provider_type {
@@ -774,6 +839,11 @@ enum notification_type {
   FEEDBACK_UPDATE
   HEALTH_SYNC
   WIN_BACK
+  PURCHASE_CONFIRMED
+  PAID_TASK_EXPIRING
+  QUEST_COMPLETED
+  DAY_COMPLETE
+  ACCOUNT_UPDATE
 }
 
 enum reward_status {
@@ -818,10 +888,18 @@ enum task_schedule_status {
   EXPIRED
 }
 
+enum task_purchase_status {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
 enum task_type {
   DAILY_FIXED
   DAILY_ADMIN
   WEEKLY
+  MONTHLY
 }
 
 enum user_gender {

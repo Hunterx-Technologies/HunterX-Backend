@@ -1,28 +1,42 @@
 // scripts/create-admin.js
-// Creates (or promotes) an ADMIN user with a known email + password.
-// Usage: node scripts/create-admin.js [email] [password] [name]
+// Creates (or promotes) an ADMIN user, or rotates an admin's password.
+// Usage: node scripts/create-admin.js <email> <password> [name]
+// No defaults on purpose — a default password is a public admin login.
 
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
 import prisma from '../src/config/prisma.js';
-import { generateHunterId, generateReferralCode } from '../src/utils/helpers.js';
+import { generateHunterId, generateReferralCode, isStrongPassword, normalizeEmail } from '../src/utils/helpers.js';
 
-const email    = process.argv[2] || 'admin@yopmail.com';
-const password = process.argv[3] || 'admin123';
-const name     = process.argv[4] || 'Admin';
+const email = normalizeEmail(process.argv[2]);
+const password = process.argv[3];
+const name = process.argv[4] || 'Admin';
 
 async function main() {
-  const salt         = await bcrypt.genSalt(12);
+  if (!email || !password) {
+    console.error('Usage: node scripts/create-admin.js <email> <password> [name]');
+    process.exitCode = 1;
+    return;
+  }
+  const { valid, errors } = isStrongPassword(password);
+  if (!valid || password.length < 12) {
+    console.error(`Password too weak — need 12+ chars, an uppercase letter, a number and a special character (${errors.join(', ')})`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const salt = await bcrypt.genSalt(12);
   const passwordHash = await bcrypt.hash(password, salt);
 
-  const existing = await prisma.users.findUnique({ where: { email } });
+  const existing = await prisma.users.findFirst({ where: { email: { equals: email, mode: 'insensitive' } } });
 
   if (existing) {
     const updated = await prisma.users.update({
       where: { id: existing.id },
       data: {
         password_hash: passwordHash,
-        role:          'ADMIN',
+        role: 'ADMIN',
+        token_version: { increment: 1 }, // signs out sessions made with the old password
       },
     });
     console.log(`Updated existing user to ADMIN — id: ${updated.id}, hunter_id: ${updated.hunter_id}, email: ${updated.email}`);
@@ -31,20 +45,20 @@ async function main() {
 
   const user = await prisma.users.create({
     data: {
-      hunter_id:       await generateHunterId(),
+      hunter_id: await generateHunterId(),
       name,
       email,
-      password_hash:   passwordHash,
-      referral_code:   generateReferralCode(),
-      role:            'ADMIN',
+      password_hash: passwordHash,
+      referral_code: generateReferralCode(),
+      role: 'ADMIN',
       onboarding_done: true,
     },
   });
 
   await prisma.auth_providers.create({
     data: {
-      user_id:     user.id,
-      provider:    'EMAIL',
+      user_id: user.id,
+      provider: 'EMAIL',
       provider_id: email,
     },
   });
