@@ -12,21 +12,27 @@
 // any streak field, and streakService.js never imports this file.
 
 import { createNotification } from './notificationService.js';
+import { grantTriggerCard } from './rewardService.js';
+
+import prisma from '../config/prisma.js';
 
 // Called from inside the same transaction that just incremented
 // user_progression.total_xp — `tx` is a Prisma transaction client,
-// `userId` is already a BigInt.
-export async function checkLevelUp(tx, userId) {
+// `userId` is already a BigInt. `xpEarned` is the award that did it.
+// Every level-up is recorded in level_up_events, so the app shows its
+// screen once whatever paid the XP (a quest, an approved proof, a
+// referral) — straight from a completion response, or on next open.
+export async function checkLevelUp(tx, userId, { xpEarned = 0 } = {}) {
   const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
-  if (!progression) return { leveledUp: false };
+  if (!progression) return { leveledUp: false, rewards: [], levelUp: null };
 
   const levels = await tx.levels.findMany({ orderBy: { level_number: 'asc' } });
   const eligible = levels.filter(l => l.xp_required <= progression.total_xp);
-  if (eligible.length === 0) return { leveledUp: false };
+  if (eligible.length === 0) return { leveledUp: false, rewards: [], levelUp: null };
 
   const newLevel = eligible[eligible.length - 1].level_number;
   const oldLevel = progression.current_level;
-  if (newLevel <= oldLevel) return { leveledUp: false };
+  if (newLevel <= oldLevel) return { leveledUp: false, rewards: [], levelUp: null };
 
   await tx.user_progression.update({
     where: { user_id: userId },
@@ -34,6 +40,9 @@ export async function checkLevelUp(tx, userId) {
   });
 
   const levelByNumber = new Map(levels.map(l => [l.level_number, l]));
+  // Scratch cards for levels an admin set one up for (see rewardService.js)
+  // — one per such level crossed, even in a multi-level jump.
+  const rewards = [];
 
   // Walk every level crossed, not just the final one — a multi-level
   // jump in one award must still trigger every rank-up / dragon
@@ -51,9 +60,104 @@ export async function checkLevelUp(tx, userId) {
 
     await checkRankUp(tx, userId, levelRow, levelByNumber.get(lvl - 1) ?? null);
     await checkDragonEvolution(tx, userId, lvl);
+
+    const card = await grantTriggerCard(tx, userId, 'LEVEL_UP', lvl);
+    if (card) rewards.push(card);
   }
 
-  return { leveledUp: true, oldLevel, newLevel };
+  const event = await tx.level_up_events.create({
+    data: { user_id: userId, from_level: oldLevel, to_level: newLevel, xp_earned: xpEarned },
+  });
+  const levelUp = await buildLevelUp(tx, levelByNumber, {
+    fromLevel: oldLevel, toLevel: newLevel, totalXp: progression.total_xp, xpEarned, eventIds: [String(event.id)],
+  });
+  return { leveledUp: true, oldLevel, newLevel, rewards, levelUp };
+}
+
+const formatXp = (n) => n.toLocaleString('en-IN');
+
+// The level-up screen's content (the app shows it as-is, no text of its
+// own): the final level reached, even when one award crosses several.
+// Rank up = the rank changed between the old and new level, so a jump
+// that crosses a rank boundary still shows the new dragon stage.
+// event_ids: the level_up_events it covers, for POST .../level-up/seen.
+async function buildLevelUp(tx, levelByNumber, { fromLevel, toLevel, totalXp, xpEarned, eventIds }) {
+  const row  = levelByNumber.get(toLevel);
+  const from = levelByNumber.get(fromLevel);
+  const next = levelByNumber.get(toLevel + 1) ?? null;
+  const isRankUp = !!row.is_rank_up || (!!from && !!row.rank_name && from.rank_name !== row.rank_name);
+
+  const stage = isRankUp
+    ? await tx.dragon_stages.findFirst({
+        where:  { level_range_start: { lte: toLevel }, level_range_end: { gte: toLevel } },
+        select: { stage_number: true, name: true, unlock_message: true, thumbnail_url: true },
+      })
+    : null;
+
+  const xpToNext = next ? Math.max(0, next.xp_required - totalXp) : null;
+  return {
+    from_level:       fromLevel,
+    to_level:         toLevel,
+    rank_name:        row.rank_name,
+    title:            row.title,
+    level_up_label:   row.level_up_label,
+    level_up_title:   row.level_up_title,
+    level_up_message: row.level_up_message,
+    is_rank_up:       isRankUp,
+    xp_earned:        xpEarned,
+    xp_earned_text:   `+${formatXp(xpEarned)} XP`,
+    xp_to_next:       xpToNext,
+    next_level_title: next?.title ?? null,
+    next_level_text:  next ? `${formatXp(xpToNext)} XP to ${next.title}` : 'Max level reached',
+    button_label:     'Continue',
+    // Only for a rank up, and only once a stage with art is seeded.
+    dragon_stage: stage
+      ? { stage_number: stage.stage_number, name: stage.name, message: stage.unlock_message, image_url: stage.thumbnail_url }
+      : null,
+    event_ids:        eventIds,
+  };
+}
+
+// ── Level-ups the app hasn't shown (GET /api/users/me/level-up) ──
+// Several unseen ones (e.g. a proof approved, then a referral) become one
+// screen: from the first one's old level to the highest level reached,
+// with their XP added up. Null when there's nothing to show.
+export async function getPendingLevelUp(userId) {
+  const bUserId = BigInt(userId);
+  const events = await prisma.level_up_events.findMany({
+    where:   { user_id: bUserId, seen_at: null },
+    orderBy: { id: 'asc' },
+    take:    50,
+  });
+  if (events.length === 0) return { level_up: null };
+
+  const [levels, progression] = await Promise.all([
+    prisma.levels.findMany({ orderBy: { level_number: 'asc' } }),
+    prisma.user_progression.findUnique({ where: { user_id: bUserId }, select: { total_xp: true } }),
+  ]);
+  const levelByNumber = new Map(levels.map((l) => [l.level_number, l]));
+  const toLevel = Math.max(...events.map((e) => e.to_level));
+  if (!levelByNumber.has(toLevel)) return { level_up: null };
+
+  const levelUp = await buildLevelUp(prisma, levelByNumber, {
+    fromLevel: events[0].from_level,
+    toLevel,
+    totalXp:   progression?.total_xp ?? 0,
+    xpEarned:  events.reduce((sum, e) => sum + e.xp_earned, 0),
+    eventIds:  events.map((e) => String(e.id)),
+  });
+  return { level_up: levelUp };
+}
+
+export async function markLevelUpsSeen(userId, ids) {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 50 || !ids.every((id) => /^\d+$/.test(String(id)))) {
+    throw new Error('INVALID_IDS');
+  }
+  const { count } = await prisma.level_up_events.updateMany({
+    where: { user_id: BigInt(userId), id: { in: ids.map((id) => BigInt(id)) }, seen_at: null },
+    data:  { seen_at: new Date() },
+  });
+  return { marked: count };
 }
 
 // Rank boundary = wherever levels.rank_name changes between two

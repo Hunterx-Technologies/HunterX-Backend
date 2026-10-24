@@ -9,6 +9,7 @@ import { mailTransporter } from '../utils/mailer.js';
 import { logError }      from '../utils/logger.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { getWeekStatus }    from './taskService.js';
+import { checkLevelUp }     from './xpService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import { createNotification } from './notificationService.js';
 import { getISTDateOnly }   from '../utils/helpers.js';
@@ -338,6 +339,9 @@ async function awardReferralXpIfEligible(referredUserId) {
       create: { user_id: referral.referrer_id, total_xp: REFERRAL_XP_REWARD },
       update: { total_xp: { increment: REFERRAL_XP_REWARD } },
     });
+    // The bonus can cross a level: same level-up (push, cards, the app's
+    // level-up screen on next open) as XP from a quest.
+    await checkLevelUp(tx, referral.referrer_id, { xpEarned: REFERRAL_XP_REWARD });
 
     // One push covers both "friend joined" and "referral reward earned" —
     // the XP is paid at exactly the moment the friend becomes a hunter.
@@ -1342,6 +1346,12 @@ export async function updateUserProfile(userId, payload = {}) {
 
     userUpdates.date_of_birth = dob;
     userUpdates.age = age;
+    // Only an actual change restarts the birthday-reward hold
+    // (rewardService.js#BIRTHDAY_DOB_HOLD_DAYS) — re-saving the profile
+    // with the same date mustn't.
+    if (currentUser.date_of_birth?.getTime() !== dob.getTime()) {
+      userUpdates.dob_updated_at = new Date();
+    }
   }
 
   // 4. Height (cm)
@@ -1437,9 +1447,8 @@ export async function updateUserProfile(userId, payload = {}) {
       data: userUpdates,
     });
 
-    // name / date_of_birth / avatar_id all feed leaderboard display or
-    // genz eligibility — resync whenever any of them moved.
-    if (userUpdates.name !== undefined || userUpdates.date_of_birth !== undefined || userUpdates.avatar_id !== undefined) {
+    // name / avatar_id feed the leaderboard display — resync when either moved.
+    if (userUpdates.name !== undefined || userUpdates.avatar_id !== undefined) {
       await syncLeaderboardMember(bUserId);
     }
   }

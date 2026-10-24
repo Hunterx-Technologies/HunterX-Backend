@@ -5,7 +5,7 @@
 // Two jobs in one pass:
 //   1. Drain lb:dirty — users whose Redis sync failed at write time (see
 //      leaderboardService.js#syncLeaderboardMember) get resynced here.
-//   2. Full rebuild of lb:global/lb:genz from Postgres (same
+//   2. Full rebuild of lb:global from Postgres (same
 //      RENAME-swap script as scripts/rebuildLeaderboard.js, with its
 //      own lock so this never races a manual or post-deploy run).
 //

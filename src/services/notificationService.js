@@ -196,7 +196,7 @@ export async function markNotificationsRead(userId, { ids, all } = {}) {
 // again. Deleted in batches so the table is never locked for long.
 // sent_at is the insert time (never updated) and is indexed.
 
-export const NOTIFICATION_RETENTION_DAYS = 60;
+export const NOTIFICATION_RETENTION_DAYS = 45;
 const RETENTION_BATCH = 5000;
 
 export async function deleteOldNotifications(now = new Date()) {

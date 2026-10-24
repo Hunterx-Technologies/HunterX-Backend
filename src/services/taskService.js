@@ -5,16 +5,22 @@ import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { bumpDailyStreak, getStreakRiskStatus, reconcileStreak } from './streakService.js';
 import { checkLevelUp } from './xpService.js';
+import { toApiReward, grantTaskSpecialCard } from './rewardService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import {
   getLockedTasks, getActivePurchase, markPurchaseCompleted, getCompletedPaidTaskIds,
 } from './taskPurchaseService.js';
 import { createNotification } from './notificationService.js';
+import { deleteImages, ownPublicIdFromUrl } from './imageUploadService.js';
 import { istDayEnd } from './questNotificationService.js';
 import { logError } from '../utils/logger.js';
 
 const DAILY_TYPES     = ['DAILY_FIXED', 'DAILY_ADMIN'];
 const VALID_STATUSES  = ['COMPLETED', 'PARTIAL', 'SKIPPED'];
+// Statuses that make a day "active" for the streak, the week strip and the
+// day-cleared push. Submitted proof counts: the hunter did the work that
+// day, even though its XP waits for an admin (taskProofService.js).
+export const ACTIVE_DAY_STATUSES = ['COMPLETED', 'PARTIAL', 'IN_REVIEW'];
 
 const MS_PER_DAY  = 24 * 60 * 60 * 1000;
 const PERIOD_DAYS = { WEEKLY: 7, MONTHLY: 30 };
@@ -167,8 +173,14 @@ export async function getTodayTasks(userId, overrideGender = null) {
       start_date:       task.start_date ? dateKey(task.start_date) : null,
       end_date:         task.end_date ? dateKey(task.end_date) : null,
       is_paid:          task.is_paid,
-      // Not a DB value — PENDING just means "no completion row yet"
+      // Not a DB value — PENDING just means "no completion row yet".
+      // Proof tasks add IN_REVIEW / RESUBMIT / REJECTED (see taskProofService.js).
       status:           completion?.status ?? 'PENDING',
+      // Photos required to complete it (0 = a normal task).
+      proof_count:      task.proof_count,
+      proof_urls:       completion?.proof_urls ?? [],
+      // The admin's reason, on RESUBMIT / REJECTED.
+      review_note:      completion?.review_note ?? null,
       progress_value:   completion?.progress_value ?? null,
       xp_earned:        completion?.xp_earned ?? 0,
       completed_at:     completion?.completed_at ?? null,
@@ -244,7 +256,7 @@ export async function getWeekStatus(userId) {
     where: {
       user_id:       bUserId,
       schedule_date: { gte: weekStart, lte: weekEnd },
-      status:        { in: ['COMPLETED', 'PARTIAL'] },
+      status:        { in: ACTIVE_DAY_STATUSES },
       tasks:         { task_type: { in: DAILY_TYPES } },
     },
     select: { schedule_date: true },
@@ -298,6 +310,68 @@ async function assertAssignedToUser(bUserId, task) {
   if (!row) throw new Error('TASK_NOT_ASSIGNED');
 }
 
+// Everything a completion pays out, inside the caller's transaction (which
+// must hold the user's user_progression row lock): the XP delta, any
+// level-ups (and their scratch cards), the task's special-reward card on
+// COMPLETED, and closing a paid task's purchase. Shared by
+// setTaskCompletion and proof approval (taskProofService.js), so an
+// approved proof pays exactly what a direct completion would.
+export async function payCompletion(tx, bUserId, task, { status, delta }) {
+  let levelRewards = [];
+  let levelUp = null;
+  let specialReward = null;
+
+  if (delta !== 0) {
+    await tx.xp_transactions.create({
+      data: {
+        user_id: bUserId,
+        task_id: task.id,
+        amount:  delta,
+        reason:  `TASK_${status}: ${task.title}`,
+      },
+    });
+
+    await tx.user_progression.upsert({
+      where:  { user_id: bUserId },
+      create: { user_id: bUserId, total_xp: Math.max(delta, 0) },
+      update: { total_xp: { increment: delta } },
+    });
+
+    // Level-ups only ever move forward — a status flip that lowers XP
+    // (COMPLETED -> PARTIAL) never un-levels a user, so this only runs
+    // on a net gain. Leveling and streaks are independent systems:
+    // this never touches any streak field, same as bumpDailyStreak
+    // never touches XP/level.
+    if (delta > 0) {
+      const result = await checkLevelUp(tx, bUserId, { xpEarned: delta });
+      levelRewards = result.rewards;
+      levelUp = result.levelUp;
+    }
+  }
+
+  // A special reward linked to this task: one card per user, on full
+  // completion only (PARTIAL doesn't count).
+  if (status === 'COMPLETED') {
+    specialReward = await grantTaskSpecialCard(tx, bUserId, task);
+  }
+
+  // Completing a paid task closes the purchase: the reward is claimed,
+  // and the task is no longer assigned, listed, or offered to this user.
+  if (task.is_paid && status === 'COMPLETED') {
+    const closed = await markPurchaseCompleted(tx, bUserId, task.id);
+    if (closed) {
+      await createNotification(
+        tx, bUserId, 'QUEST_COMPLETED',
+        `🏆 Premium quest cleared: ${task.title}`,
+        `+${task.xp_reward} XP earned. Well hunted, Hunter.`,
+        { event: 'PAID_QUEST_COMPLETED', task_id: String(task.id), xp: task.xp_reward }
+      );
+    }
+  }
+
+  return { levelRewards, levelUp, specialReward };
+}
+
 export async function setTaskCompletion(userId, taskId, { status, progressValue }) {
   if (!VALID_STATUSES.includes(status)) throw new Error('INVALID_STATUS');
 
@@ -315,6 +389,9 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
   if (!task || !task.is_active) throw new Error('TASK_NOT_FOUND');
 
   if (status === 'PARTIAL' && !task.allows_partial) throw new Error('PARTIAL_NOT_ALLOWED');
+  // Proof tasks are completed by uploading proof (POST /tasks/:id/proof),
+  // which an admin reviews — they can only be skipped from here.
+  if (task.proof_count > 0 && status !== 'SKIPPED') throw new Error('PROOF_REQUIRED');
 
   await assertAssignedToUser(bUserId, task);
 
@@ -326,6 +403,10 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
                   : status === 'PARTIAL'  ? task.xp_partial
                   : /* SKIPPED */           0;
 
+  let unlocked = { streak_milestone: null, rewards: [] };
+  let levelRewards = [];
+  let levelUp = null;
+  let specialReward = null;
   const completion = await prisma.$transaction(async (tx) => {
     // Serialize this user's completions on their progression row. Without
     // the lock, two concurrent requests (a double-tap) both read "no
@@ -349,6 +430,9 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
     if (existing?.status === 'COMPLETED' && status !== 'COMPLETED') {
       throw new Error('TASK_ALREADY_COMPLETED');
     }
+    // A submitted proof is the admin's to decide; a rejected one is final.
+    if (existing?.status === 'IN_REVIEW') throw new Error('TASK_IN_REVIEW');
+    if (existing?.status === 'REJECTED') throw new Error('TASK_PROOF_REJECTED');
 
     const upserted = await tx.task_completions.upsert({
       where: {
@@ -376,32 +460,7 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
     });
 
     const delta = xpEarned - (existing?.xp_earned ?? 0);
-
-    if (delta !== 0) {
-      await tx.xp_transactions.create({
-        data: {
-          user_id: bUserId,
-          task_id: bTaskId,
-          amount:  delta,
-          reason:  `TASK_${status}: ${task.title}`,
-        },
-      });
-
-      await tx.user_progression.upsert({
-        where:  { user_id: bUserId },
-        create: { user_id: bUserId, total_xp: Math.max(delta, 0) },
-        update: { total_xp: { increment: delta } },
-      });
-
-      // Level-ups only ever move forward — a status flip that lowers XP
-      // (COMPLETED -> PARTIAL) never un-levels a user, so this only runs
-      // on a net gain. Leveling and streaks are independent systems:
-      // this never touches any streak field, same as bumpDailyStreak
-      // below never touches XP/level.
-      if (delta > 0) {
-        await checkLevelUp(tx, bUserId);
-      }
-    }
+    ({ levelRewards, levelUp, specialReward } = await payCompletion(tx, bUserId, task, { status, delta }));
 
     // Streak is a daily-tasks concept only, and only COMPLETED/PARTIAL
     // count as "active today" — marking a task SKIPPED must not extend
@@ -410,21 +469,7 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
     // the user genuinely was active that day, this just isn't the call
     // that should be granting it.)
     if (DAILY_TYPES.includes(task.task_type) && status !== 'SKIPPED') {
-      await bumpDailyStreak(tx, bUserId);
-    }
-
-    // Completing a paid task closes the purchase: the reward is claimed,
-    // and the task is no longer assigned, listed, or offered to this user.
-    if (task.is_paid && status === 'COMPLETED') {
-      const closed = await markPurchaseCompleted(tx, bUserId, task.id);
-      if (closed) {
-        await createNotification(
-          tx, bUserId, 'QUEST_COMPLETED',
-          `🏆 Premium quest cleared: ${task.title}`,
-          `+${task.xp_reward} XP earned. Well hunted, Hunter.`,
-          { event: 'PAID_QUEST_COMPLETED', task_id: String(task.id), xp: task.xp_reward }
-        );
-      }
+      unlocked = await bumpDailyStreak(tx, bUserId);
     }
 
     return upserted;
@@ -458,6 +503,109 @@ export async function setTaskCompletion(userId, taskId, { status, progressValue 
     total_xp:       progression?.total_xp ?? 0,
     daily_streak:   progression?.daily_streak ?? 0,
     longest_streak: progression?.longest_streak ?? 0,
+    // Scratch cards this completion unlocked (level-ups, streak, special reward) — card only, never the prize
+    // (that's revealed by POST /api/rewards/:id/scratch).
+    rewards_earned:   [...levelRewards, ...unlocked.rewards, ...(specialReward ? [specialReward] : [])].map((r) => toApiReward(r)),
+    streak_milestone: unlocked.streak_milestone,
+    // The level-up screen's content when this completion raised the level
+    // (only the final level if several were gained), else null.
+    level_up:         levelUp,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────
+// POST — submit proof for a proof task (tasks.proof_count > 0)
+// The photos are uploaded straight to Cloudinary by the app (signed
+// upload, folder task-proof → hunterx/task-proof/<userId>/...), then their
+// URLs are sent here. Exactly proof_count photos, all from this user's own
+// proof folder. The task goes IN_REVIEW with no XP yet: an admin approves
+// (XP + rewards), asks for new proof (RESUBMIT) or rejects it
+// (taskProofService.js). It counts as an active day for the streak right
+// away. Allowed while nothing is pending: never submitted, SKIPPED, or
+// RESUBMIT (replacing the earlier photos, which are deleted).
+// ─────────────────────────────────────────────────────────────
+
+const MAX_PROOF_PHOTOS = 5;
+
+export async function submitTaskProof(userId, taskId, proofUrls) {
+  const bUserId = BigInt(userId);
+  const bTaskId = BigInt(taskId);
+
+  const task = await prisma.tasks.findUnique({ where: { id: bTaskId } });
+  if (!task || !task.is_active) throw new Error('TASK_NOT_FOUND');
+  if (task.proof_count === 0) throw new Error('PROOF_NOT_REQUIRED');
+
+  const ownFolder = `hunterx/task-proof/${bUserId}`;
+  const urls = Array.isArray(proofUrls) ? [...new Set(proofUrls)] : [];
+  if (
+    urls.length !== task.proof_count || urls.length > MAX_PROOF_PHOTOS ||
+    !urls.every((u) => typeof u === 'string' && ownPublicIdFromUrl(u, ownFolder))
+  ) {
+    const err = new Error('INVALID_PROOF');
+    err.expected = task.proof_count;
+    throw err;
+  }
+
+  await assertAssignedToUser(bUserId, task);
+  const periodDate = (await getTaskPeriod(bUserId, task)).start;
+  const key = { user_id_task_id_schedule_date: { user_id: bUserId, task_id: bTaskId, schedule_date: periodDate } };
+
+  let unlocked = { streak_milestone: null, rewards: [] };
+  let replaced = [];
+  const completion = await prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT 1 FROM user_progression WHERE user_id = ${bUserId} FOR UPDATE`;
+
+    const existing = await tx.task_completions.findUnique({ where: key });
+    if (existing?.status === 'IN_REVIEW') throw new Error('TASK_IN_REVIEW');
+    if (existing?.status === 'REJECTED') throw new Error('TASK_PROOF_REJECTED');
+    if (existing && !['SKIPPED', 'RESUBMIT'].includes(existing.status)) throw new Error('TASK_ALREADY_COMPLETED');
+    replaced = (existing?.proof_urls ?? []).filter((u) => !urls.includes(u));
+
+    const now = new Date();
+    const fields = {
+      status:             'IN_REVIEW',
+      xp_earned:          0,
+      completed_at:       now,
+      proof_urls:         urls,
+      proof_submitted_at: now,
+      reviewed_at:        null,
+      reviewed_by:        null,
+      review_note:        null,
+    };
+    const saved = await tx.task_completions.upsert({
+      where:  key,
+      create: { user_id: bUserId, task_id: bTaskId, schedule_date: periodDate, ...fields },
+      update: fields,
+    });
+
+    if (DAILY_TYPES.includes(task.task_type)) {
+      unlocked = await bumpDailyStreak(tx, bUserId);
+    }
+    return saved;
+  });
+
+  const oldIds = replaced.map((u) => ownPublicIdFromUrl(u, ownFolder)).filter(Boolean);
+  if (oldIds.length) await deleteImages(oldIds);
+
+  const progression = await prisma.user_progression.findUnique({ where: { user_id: bUserId } });
+  if (DAILY_TYPES.includes(task.task_type)) {
+    await notifyIfDayCleared(bUserId, progression?.daily_streak ?? 0).catch((err) =>
+      logError(`Day-complete push failed for user ${bUserId}: ${err.message}`)
+    );
+  }
+
+  return {
+    task_id:          task.id,
+    title:            task.title,
+    status:           completion.status,
+    proof_urls:       completion.proof_urls,
+    xp_earned:        0,
+    daily_streak:     progression?.daily_streak ?? 0,
+    longest_streak:   progression?.longest_streak ?? 0,
+    // Only streak cards can come now; XP, level-up and special-reward
+    // cards follow on approval.
+    rewards_earned:   unlocked.rewards.map((r) => toApiReward(r)),
+    streak_milestone: unlocked.streak_milestone,
   };
 }
 
@@ -478,7 +626,7 @@ async function notifyIfDayCleared(bUserId, streak) {
       user_id:       bUserId,
       task_id:       { in: scheduled.map(s => s.task_id) },
       schedule_date: today,
-      status:        { in: ['COMPLETED', 'PARTIAL'] },
+      status:        { in: ACTIVE_DAY_STATUSES },
     },
   });
   if (cleared < scheduled.length) return;

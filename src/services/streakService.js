@@ -21,26 +21,21 @@
 // longer than the banked lives always breaks the streak to 0; lives are
 // never partially spent on a gap they can't fully cover.
 //
-// Two ways a covered gap gets resolved:
-//   1. Automatic/silent (bumpDailyStreak): if the user just goes ahead
-//      and completes a task after a gap that's within their banked
-//      lives, the gap is covered transparently (spending one life per
-//      missed day) and the streak keeps counting — no confirmation
-//      needed.
-//   2. Interactive (getStreakRiskStatus / resolveStreakRisk): called
-//      from GET /api/tasks/today and POST /api/tasks/streak/resolve, so
-//      the app can show the user a "your streak is at risk — use a life
-//      or let it drop?" prompt BEFORE they've done anything that day.
-//      Choosing USE_LIVES pre-emptively covers the same gap (same
-//      effect as path 1, just proactive); choosing DROP breaks the
-//      streak to 0 immediately instead of waiting for it to lazily
-//      reset to 1 on next completion.
-// A gap that exceeds the banked lives is never "at risk" (there's no
-// decision to make, no amount of lives can save it) — it just breaks on
-// next completion.
+// Lives are spent the moment a covered gap is first observed —
+// reconcileStreak, run by every read path (GET /api/tasks/today, the
+// activity feed, GET /api/tasks/streak/events) and the 07:00 streak
+// status push — not when the user next completes a quest. Each spend
+// (and each break, below) is recorded in streak_events so the app can
+// show the "streak life lost" card exactly once, on any device.
+// bumpDailyStreak still covers a gap nothing has reconciled yet, and
+// records the same event.
 //
 // A life only ever protects a missed day — it never increments the
 // streak by itself; only an actual active day does that.
+//
+// The "use a life or let it drop?" prompt (getStreakRiskStatus /
+// resolveStreakRisk) predates this: with lives spent on first sight,
+// at_risk is false by the time anyone reads it.
 //
 // ── Breaking the moment it happens ──────────────────────────────
 // A gap that exceeds the banked lives breaks the streak to 0 as soon as
@@ -58,7 +53,7 @@
 
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
-import { grantStreakMilestoneReward, checkAndAwardStreakMilestoneBadge } from './rewardService.js';
+import { grantStreakMilestoneReward, checkAndAwardStreakMilestoneBadge, grantTriggerCard } from './rewardService.js';
 import { createNotification } from './notificationService.js';
 
 const MS_PER_DAY   = 24 * 60 * 60 * 1000;
@@ -87,14 +82,18 @@ export function computeGap(progression, today) {
 
 // Must run inside the caller's transaction so a rollback can't leave XP
 // recorded without the streak (or vice versa). `tx` is a Prisma
-// transaction client; `userId` is already a BigInt.
+// transaction client; `userId` is already a BigInt. Returns what the
+// bump unlocked, for the completion response: streak_milestone when a
+// streak badge was just earned, and the user_rewards rows (scratch cards)
+// it granted.
 export async function bumpDailyStreak(tx, userId) {
   const today = getISTDateOnly();
+  const unlocked = { streak_milestone: null, rewards: [] };
 
   const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
   const { daysSince, missedDays, lives, coveredByLives } = computeGap(progression, today);
 
-  if (daysSince === 0) return; // already counted today — no-op
+  if (daysSince === 0) return unlocked; // already counted today — no-op
 
   const continuing    = daysSince === 1 || coveredByLives;
   const currentStreak = progression?.daily_streak ?? 0;
@@ -139,6 +138,14 @@ export async function bumpDailyStreak(tx, userId) {
     }
   }
 
+  // Lives spent here means nothing reconciled the gap first (normally the
+  // app's GET /tasks/today does): record it so the card still shows.
+  if (livesSpent > 0 && currentStreak > 0) {
+    await tx.streak_events.create({
+      data: { user_id: userId, type: 'LIFE_USED', lives_lost: livesSpent, lives_left: livesAfterSpend, streak_days: currentStreak },
+    });
+  }
+
   if (earnedLife && !milestone.granted) {
     await createNotification(
       tx, userId, 'STREAK_MILESTONE',
@@ -147,34 +154,118 @@ export async function bumpDailyStreak(tx, userId) {
       { event: 'STREAK_LIFE_EARNED', daily_streak: newStreak, streak_lives: newLives }
     );
   }
+
+  if (milestone.granted && milestone.badge) {
+    unlocked.streak_milestone = { days: newStreak, badge_id: Number(milestone.badge.id) };
+  }
+
+  // A scratch card, if an admin set one up for a streak this long.
+  const card = await grantTriggerCard(tx, userId, 'STREAK', newStreak);
+  if (card) unlocked.rewards.push(card);
+  return unlocked;
 }
 
-// Collapses an unprotected gap (missed days > banked lives) to a broken
-// streak the moment it's observed, instead of leaving the stale pre-gap
-// value sitting in the DB until the user's next completion. Write-through
-// so every other reader (leaderboards, admin stats, exports) also sees
-// the corrected value from this point on, not just the caller here.
-// A no-op once already broken (daily_streak and streak_lives both 0) so
-// repeated calls during the same unrecovered gap don't issue redundant
-// writes.
-export async function reconcileStreak(userId) {
+// Applies a missed-day gap the moment it's observed, write-through so
+// every other reader (leaderboards, admin stats, exports) sees it too:
+//   - covered by lives → spends one life per missed day now and erases
+//     the gap (last_active_date = yesterday), so the next completion
+//     simply continues the streak;
+//   - not covered → breaks the streak (and lives) to 0.
+// Either outcome is recorded in streak_events for the app's card. Both
+// updates are conditional on the state just read, so concurrent reads
+// apply (and record) a gap once. Returns { progression, event }.
+async function applyGap(userId) {
   const today       = getISTDateOnly();
   const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
-  if (!progression) return progression;
+  if (!progression) return { progression, event: null };
 
-  const { missedDays, coveredByLives } = computeGap(progression, today);
-  const isBroken      = missedDays > 0 && !coveredByLives;
-  const alreadyBroken = progression.daily_streak === 0 && progression.streak_lives === 0;
-  if (!isBroken || alreadyBroken) return progression;
+  const { missedDays, lives, coveredByLives } = computeGap(progression, today);
+  const streak = progression.daily_streak;
+  if (missedDays === 0) return { progression, event: null };
 
-  return prisma.user_progression.update({
-    where: { user_id: userId },
-    data: {
-      daily_streak:          0,
-      streak_lives:          0,
-      consecutive_miss_days: missedDays,
-    },
+  if (coveredByLives) {
+    // No streak to protect: leave the lives banked for one that is.
+    if (streak <= 0) return { progression, event: null };
+    return prisma.$transaction(async (tx) => {
+      const { count } = await tx.user_progression.updateMany({
+        where: { user_id: userId, last_active_date: progression.last_active_date, streak_lives: { gte: missedDays } },
+        data:  { streak_lives: { decrement: missedDays }, last_active_date: new Date(today.getTime() - MS_PER_DAY) },
+      });
+      const event = count === 1
+        ? await tx.streak_events.create({
+            data: { user_id: userId, type: 'LIFE_USED', lives_lost: missedDays, lives_left: lives - missedDays, streak_days: streak },
+          })
+        : null;
+      return { progression: await tx.user_progression.findUnique({ where: { user_id: userId } }), event };
+    });
+  }
+
+  const alreadyBroken = streak === 0 && progression.streak_lives === 0;
+  if (alreadyBroken) return { progression, event: null };
+
+  return prisma.$transaction(async (tx) => {
+    const { count } = await tx.user_progression.updateMany({
+      where: {
+        user_id:          userId,
+        last_active_date: progression.last_active_date,
+        daily_streak:     streak,
+        streak_lives:     progression.streak_lives,
+      },
+      data: { daily_streak: 0, streak_lives: 0, consecutive_miss_days: missedDays },
+    });
+    const event = count === 1 && streak > 0
+      ? await tx.streak_events.create({
+          data: { user_id: userId, type: 'STREAK_BROKEN', lives_lost: progression.streak_lives, lives_left: 0, streak_days: streak },
+        })
+      : null;
+    return { progression: await tx.user_progression.findUnique({ where: { user_id: userId } }), event };
   });
+}
+
+// applyGap for read paths that only need the corrected progression row.
+export async function reconcileStreak(userId) {
+  return (await applyGap(userId)).progression;
+}
+
+// For the 07:00 streak status push: what the reconcile just applied.
+export async function reconcileStreakWithEvent(userId) {
+  return applyGap(userId);
+}
+
+// ── Streak events (the app's "streak life lost" card) ─────────────
+
+function toApiStreakEvent(e) {
+  return {
+    id:          String(e.id),
+    type:        e.type,
+    lives_lost:  e.lives_lost,
+    lives_left:  e.lives_left,
+    streak_days: e.streak_days,
+    created_at:  e.created_at,
+  };
+}
+
+// Applies any pending gap first, so opening the app is enough to see it.
+export async function listUnseenStreakEvents(userId) {
+  const bUserId = BigInt(userId);
+  await reconcileStreak(bUserId);
+  const rows = await prisma.streak_events.findMany({
+    where:   { user_id: bUserId, seen_at: null },
+    orderBy: { id: 'asc' },
+    take:    20,
+  });
+  return { events: rows.map(toApiStreakEvent) };
+}
+
+export async function markStreakEventsSeen(userId, ids) {
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > 50 || !ids.every((id) => /^\d+$/.test(String(id)))) {
+    throw new Error('INVALID_IDS');
+  }
+  const { count } = await prisma.streak_events.updateMany({
+    where: { user_id: BigInt(userId), id: { in: ids.map((id) => BigInt(id)) }, seen_at: null },
+    data:  { seen_at: new Date() },
+  });
+  return { marked: count };
 }
 
 // Surfaced in GET /api/tasks/today so the client can decide whether to

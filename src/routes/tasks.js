@@ -84,10 +84,55 @@ router.put('/:taskId/complete', verifyToken, async (req, res, next) => {
       return error(res, 'This task is already completed and cannot be changed', 400);
     if (err.message === 'PARTIAL_NOT_ALLOWED')
       return error(res, 'This task does not support partial completion', 400);
+    if (PROOF_ERRORS[err.message]) return proofError(res, err);
     if (err.message === 'INVALID_STATUS')
       return error(res, 'Invalid status', 400);
     if (err.message === 'INVALID_PROGRESS_VALUE')
       return error(res, 'progress_value must be a non-negative number', 400);
+    next(err);
+  }
+});
+
+// Shared by /complete and /proof; each carries error.code for the app.
+const PROOF_ERRORS = {
+  PROOF_REQUIRED:      [400, 'This quest needs photo proof — upload it to complete the quest'],
+  PROOF_NOT_REQUIRED:  [400, "This quest doesn't need proof — complete it directly"],
+  INVALID_PROOF:       [400, 'Upload the required number of proof photos'],
+  TASK_IN_REVIEW:      [409, 'Your proof is being reviewed'],
+  TASK_PROOF_REJECTED: [409, 'Your proof for this quest was not accepted'],
+};
+
+function proofError(res, err) {
+  const [status, message] = PROOF_ERRORS[err.message];
+  const text = err.message === 'INVALID_PROOF' ? `Upload exactly ${err.expected} proof photo${err.expected === 1 ? '' : 's'}` : message;
+  return error(res, text, status, err.message);
+}
+
+// ── POST /api/tasks/:taskId/proof ─────────────────────────
+// Completes a proof task (proof_count > 0) for review. The app uploads the
+// photos to Cloudinary first (POST /api/media/signature, folder
+// 'task-proof'), then sends their URLs here.
+// Body: { proof_urls: string[] } — exactly proof_count, all from the
+// caller's own task-proof folder.
+// The task goes IN_REVIEW: no XP until an admin approves; it counts as an
+// active day for the streak right away. Allowed when not yet submitted,
+// SKIPPED, or RESUBMIT (the admin asked for new photos).
+// Returns { task_id, status, proof_urls, daily_streak, rewards_earned,
+// streak_milestone, ... }. Errors carry error.code: INVALID_PROOF,
+// PROOF_NOT_REQUIRED, TASK_IN_REVIEW (409), TASK_PROOF_REJECTED (409),
+// TASK_ALREADY_COMPLETED.
+router.post('/:taskId/proof', verifyToken, async (req, res, next) => {
+  try {
+    if (!/^\d+$/.test(String(req.params.taskId))) return error(res, 'Invalid task id', 400);
+    const result = await taskService.submitTaskProof(req.user.id, req.params.taskId, req.body?.proof_urls);
+    return success(res, result, 'Proof submitted for review');
+  } catch (err) {
+    if (err.message === 'TASK_NOT_FOUND') return error(res, 'Task not found', 404);
+    if (err.message === 'TASK_NOT_ASSIGNED')
+      return error(res, 'This task is not assigned to you for the current period', 403);
+    if (err.message === 'TASK_ALREADY_COMPLETED')
+      return error(res, 'This task is already completed', 400, 'TASK_ALREADY_COMPLETED');
+    if (PROOF_ERRORS[err.message]) return proofError(res, err);
     next(err);
   }
 });
@@ -150,6 +195,37 @@ router.post('/streak/resolve', verifyToken, async (req, res, next) => {
       return error(res, 'No at-risk streak to resolve right now', 400);
     if (err.message === 'INVALID_ACTION')
       return error(res, "action must be 'USE_LIVES' or 'DROP'", 400);
+    next(err);
+  }
+});
+
+// ── GET /api/tasks/streak/events ──────────────────────────
+// Streak lives spent / streaks broken that the app hasn't shown yet
+// (the "streak life lost" card). Applies any pending missed-day gap
+// first, so opening the app is enough to surface it. Oldest first.
+// Header: Authorization: Bearer <access_token>
+// → { events: [{ id, type: 'LIFE_USED'|'STREAK_BROKEN', lives_lost,
+//               lives_left, streak_days, created_at }] }
+
+router.get('/streak/events', verifyToken, async (req, res, next) => {
+  try {
+    const data = await streakService.listUnseenStreakEvents(req.user.id);
+    return success(res, data, 'Streak events fetched');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/tasks/streak/events/seen ────────────────────
+// Body: { ids: string[] } — the events the card just showed.
+
+router.post('/streak/events/seen', verifyToken, async (req, res, next) => {
+  try {
+    const data = await streakService.markStreakEventsSeen(req.user.id, req.body?.ids);
+    return success(res, data, 'Streak events marked seen');
+  } catch (err) {
+    if (err.message === 'INVALID_IDS')
+      return error(res, 'ids must be 1-50 streak event ids', 400);
     next(err);
   }
 });

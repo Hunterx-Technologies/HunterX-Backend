@@ -1,5 +1,5 @@
-// scripts/rebuildLeaderboard.js — Full rebuild of the lb:global / lb:genz
-// Redis sorted sets from Postgres (the source of truth).
+// scripts/rebuildLeaderboard.js — Full rebuild of the lb:global Redis
+// sorted set from Postgres (the source of truth).
 //
 // Reads users in keyset batches of 5k (by id), pipelines ZADDs into
 // temporary keys, then RENAMEs over the live keys at the end — so
@@ -20,19 +20,13 @@ import { info, logError } from '../src/utils/logger.js';
 import {
   REDIS_KEYS,
   DISPLAY_HASH_TTL_SECONDS,
-  GENZ_BIRTH_YEAR_START,
-  GENZ_BIRTH_YEAR_END,
 } from '../src/config/leaderboardConfig.js';
 import { encodeScore, buildAvatarThumbUrl } from '../src/services/leaderboardService.js';
 
 const BATCH_SIZE = 5000;
+// Keys of the removed Gen Z leaderboard, deleted on every rebuild (no-op once gone).
+const LEGACY_KEYS = ['lb:genz', 'lb:genz:rebuilding'];
 const LOCK_TTL_MS = 10 * 60 * 1000; // 10 minutes — generous for a 10M-row scan
-
-function isGenzDob(dob) {
-  if (!dob) return false;
-  const year = dob.getUTCFullYear();
-  return year >= GENZ_BIRTH_YEAR_START && year <= GENZ_BIRTH_YEAR_END;
-}
 
 async function acquireLock() {
   const token = crypto.randomUUID();
@@ -59,15 +53,15 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
   }
 
   const tmpGlobal = `${REDIS_KEYS.global}:rebuilding`;
-  const tmpGenz = `${REDIS_KEYS.genz}:rebuilding`;
 
   try {
-    await redis.del(tmpGlobal, tmpGenz);
+    await redis.del(tmpGlobal);
+    // The Gen Z leaderboard was removed; drop its old keys if still there.
+    await redis.del(...LEGACY_KEYS);
 
     let lastId = 0n;
     let scanned = 0;
     let globalCount = 0;
-    let genzCount = 0;
 
     // eslint-disable-next-line no-constant-condition
     while (true) {
@@ -81,7 +75,6 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
           onboarding_done: true,
           is_banned: true,
           role: true,
-          date_of_birth: true,
           avatars: { select: { image_url: true } },
           user_settings: { select: { leaderboard_visible: true } },
           user_progression: { select: { total_xp: true } },
@@ -102,11 +95,6 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
           pipeline.zadd(tmpGlobal, score, member);
           globalCount++;
 
-          if (isGenzDob(row.date_of_birth)) {
-            pipeline.zadd(tmpGenz, score, member);
-            genzCount++;
-          }
-
           const thumbUrl = buildAvatarThumbUrl(row.avatars?.image_url) ?? '';
           pipeline.hset(REDIS_KEYS.userHash(member), { name: row.name ?? '', avatarThumbUrl: thumbUrl });
           pipeline.expire(REDIS_KEYS.userHash(member), DISPLAY_HASH_TTL_SECONDS);
@@ -123,20 +111,17 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
     }
 
     // Atomic swap — RENAME replaces the destination key in one step, so
-    // there's no window where lb:global/lb:genz is missing or empty.
+    // there's no window where lb:global is missing or empty.
     // Empty-set edge case: RENAME fails if the source key was never
     // written to (e.g. zero eligible users) — ZADD a sentinel-free empty
     // set via DEL+creating the key isn't needed; guard with EXISTS.
     if (await redis.exists(tmpGlobal)) await redis.rename(tmpGlobal, REDIS_KEYS.global);
     else await redis.del(REDIS_KEYS.global);
 
-    if (await redis.exists(tmpGenz)) await redis.rename(tmpGenz, REDIS_KEYS.genz);
-    else await redis.del(REDIS_KEYS.genz);
-
-    info(`rebuildLeaderboard: done — scanned ${scanned} users, lb:global=${globalCount}, lb:genz=${genzCount}`);
-    return { skipped: false, scanned, globalCount, genzCount };
+    info(`rebuildLeaderboard: done — scanned ${scanned} users, lb:global=${globalCount}`);
+    return { skipped: false, scanned, globalCount };
   } finally {
-    await redis.del(tmpGlobal, tmpGenz).catch(() => {});
+    await redis.del(tmpGlobal).catch(() => {});
     await releaseLock(token).catch((err) => logError(`rebuildLeaderboard: failed to release lock: ${err.message}`));
   }
 }

@@ -1,9 +1,9 @@
 // src/services/leaderboardService.js — Leaderboard feature: Redis-backed
-// global/genz ranking, Postgres-backed friends ranking, and the
-// Postgres-down fallback path for global/genz.
+// global ranking, Postgres-backed friends ranking, and the
+// Postgres-down fallback path for global.
 //
 // Postgres (user_progression.total_xp) is the source of truth. Redis
-// sorted sets (lb:global / lb:genz) are a live index kept in sync by
+// sorted set (lb:global) is a live index kept in sync by
 // syncLeaderboardMember(), called after any DB transaction that changes
 // a field this ranking depends on. Nothing here ever lets a Redis
 // problem fail the caller — see syncLeaderboardMember's try/catch.
@@ -11,10 +11,10 @@
 import prisma from '../config/prisma.js';
 import redis, { isRedisUp } from '../config/redis.js';
 import { logError, info } from '../utils/logger.js';
+import { getISTDateOnly } from '../utils/helpers.js';
+import { computeGap } from './streakService.js';
 import {
   XP_SHIFT,
-  GENZ_BIRTH_YEAR_START,
-  GENZ_BIRTH_YEAR_END,
   FRIENDS_REFERRAL_CAP,
   REDIS_KEYS,
   DISPLAY_HASH_TTL_SECONDS,
@@ -77,16 +77,9 @@ export function buildAvatarThumbUrl(imageUrl) {
 // Eligibility
 // ─────────────────────────────────────────────────────────────
 
-function isGenzDob(dob) {
-  if (!dob) return false;
-  const year = dob.getUTCFullYear();
-  return year >= GENZ_BIRTH_YEAR_START && year <= GENZ_BIRTH_YEAR_END;
-}
-
-function computeEligibility({ onboarding_done, is_banned, role, leaderboard_visible, total_xp, date_of_birth }) {
+function computeEligibility({ onboarding_done, is_banned, role, leaderboard_visible, total_xp }) {
   const global = Boolean(onboarding_done) && !is_banned && role === 'USER' && Boolean(leaderboard_visible) && total_xp > 0;
-  const genz = global && isGenzDob(date_of_birth);
-  return { global, genz };
+  return { global };
 }
 
 async function loadFullMemberRow(bUserId) {
@@ -98,7 +91,6 @@ async function loadFullMemberRow(bUserId) {
       onboarding_done: true,
       is_banned: true,
       role: true,
-      date_of_birth: true,
       avatars: { select: { image_url: true } },
       user_settings: { select: { leaderboard_visible: true } },
       user_progression: { select: { total_xp: true } },
@@ -108,7 +100,7 @@ async function loadFullMemberRow(bUserId) {
 
 const KNOWN_VALUE_KEYS = [
   'name', 'onboarding_done', 'is_banned', 'role',
-  'date_of_birth', 'leaderboard_visible', 'total_xp',
+  'leaderboard_visible', 'total_xp',
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -146,7 +138,6 @@ export async function syncLeaderboardMember(userId, knownValues = {}) {
         role: row.role,
         leaderboard_visible: row.user_settings?.leaderboard_visible ?? true,
         total_xp: totalXp,
-        date_of_birth: row.date_of_birth,
       });
     }
 
@@ -163,9 +154,9 @@ export async function syncLeaderboardMember(userId, knownValues = {}) {
     // `<key>:rebuilding` from a Postgres snapshot and will RENAME it over
     // the live key — mirror this write into it too, or the swap would
     // roll this user back to their pre-rebuild score.
-    const keys = [[REDIS_KEYS.global, eligibility.global], [REDIS_KEYS.genz, eligibility.genz]];
+    const keys = [[REDIS_KEYS.global, eligibility.global]];
     if (await redis.exists(REDIS_KEYS.rebuildLock)) {
-      keys.push([`${REDIS_KEYS.global}:rebuilding`, eligibility.global], [`${REDIS_KEYS.genz}:rebuilding`, eligibility.genz]);
+      keys.push([`${REDIS_KEYS.global}:rebuilding`, eligibility.global]);
     }
 
     const pipeline = redis.pipeline();
@@ -196,7 +187,6 @@ export async function removeLeaderboardMember(userId) {
   try {
     const pipeline = redis.pipeline();
     pipeline.zrem(REDIS_KEYS.global, member);
-    pipeline.zrem(REDIS_KEYS.genz, member);
     pipeline.del(REDIS_KEYS.userHash(member));
     await pipeline.exec();
   } catch (err) {
@@ -259,13 +249,41 @@ export async function getLeaderboard({ meId, meSnapshot, scope, cursorStr, limit
   return getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit });
 }
 
+// Each row's (and "me"'s) current daily streak, shown under the name.
+// Streaks change daily, so they're read from Postgres per page (one
+// indexed query for at most a page of users) rather than kept in Redis.
+// A gap longer than the user's lives counts as broken (0) even before
+// reconcileStreak has written that. Never fails the leaderboard: on error
+// the rows go out with streak null.
+export async function attachStreaks(entries, me, meId) {
+  const ids = [...new Set([...entries.map((e) => String(e.userId)), ...(me ? [String(meId)] : [])])];
+  if (ids.length === 0) return;
+  try {
+    const rows = await prisma.user_progression.findMany({
+      where:  { user_id: { in: ids.map((id) => BigInt(id)) } },
+      select: { user_id: true, daily_streak: true, streak_lives: true, last_active_date: true },
+    });
+    const today = getISTDateOnly();
+    const streakById = new Map(rows.map((r) => {
+      const { missedDays, coveredByLives } = computeGap(r, today);
+      return [r.user_id.toString(), missedDays > 0 && !coveredByLives ? 0 : r.daily_streak];
+    }));
+    for (const e of entries) e.streak = streakById.get(String(e.userId)) ?? 0;
+    if (me) me.streak = streakById.get(String(meId)) ?? 0;
+  } catch (err) {
+    logError(`Leaderboard streaks failed: ${err.message}`);
+    for (const e of entries) e.streak = null;
+    if (me) me.streak = null;
+  }
+}
+
 function meStatusFromSnapshot(meSnapshot) {
   if (!meSnapshot.leaderboardVisible) return 'hidden';
   if (!(meSnapshot.totalXp > 0)) return 'unranked_no_xp';
   return 'unranked_no_xp'; // onboarding/role gap with no XP yet — same empty-state copy applies
 }
 
-// ── Redis path (global / genz) ──────────────────────────────
+// ── Redis path (global) ─────────────────────────────────────
 
 async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }) {
   const key = REDIS_KEYS[scope];
@@ -399,7 +417,7 @@ async function attachDisplayData(rows) {
   });
 }
 
-// ── Postgres fallback path (global / genz, Redis down) ──────
+// ── Postgres fallback path (global, Redis down) ─────────────
 // Offset-based keyset pagination carried entirely through the cursor —
 // no COUNT(*), no OFFSET clause; rank numbers are computed from the
 // carried offset, not from a global count.
@@ -411,21 +429,14 @@ async function attachDisplayData(rows) {
 // every user who's never opened Settings.
 export const VISIBLE_FILTER = { user_settings: { isNot: { leaderboard_visible: false } } };
 
-export function eligibilityWhere(scope) {
-  const where = {
+export function eligibilityWhere() {
+  return {
     onboarding_done: true,
     is_banned: false,
     role: 'USER',
     ...VISIBLE_FILTER,
     user_progression: { total_xp: { gt: 0 } },
   };
-  if (scope === 'genz') {
-    where.date_of_birth = {
-      gte: new Date(Date.UTC(GENZ_BIRTH_YEAR_START, 0, 1)),
-      lte: new Date(Date.UTC(GENZ_BIRTH_YEAR_END, 11, 31, 23, 59, 59, 999)),
-    };
-  }
-  return where;
 }
 
 async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }) {
@@ -437,7 +448,7 @@ async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorS
     offset = cursor.offset;
   }
 
-  const where = eligibilityWhere(scope);
+  const where = eligibilityWhere();
   if (cursor) {
     where.OR = [
       { user_progression: { total_xp: { lt: cursor.xp } } },

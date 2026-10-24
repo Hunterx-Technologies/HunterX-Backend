@@ -12,6 +12,7 @@ import ratingsRouter from './ratings.js';
 import feedbackRouter from './feedback.js';
 import leaderboardRouter from './leaderboard.js';
 import notificationsRouter from './notifications.js';
+import rewardsRouter from './rewards.js';
 
 const router = Router();
 
@@ -57,11 +58,14 @@ router.use('/ratings', ratingsRouter);
 // Send Feedback screen
 router.use('/feedback', feedbackRouter);
 
-// Leaderboard (global / friends / genz)
+// Leaderboard (global / friends)
 router.use('/leaderboard', leaderboardRouter);
 
 // Notification inbox (Home bell)
 router.use('/notifications', notificationsRouter);
+
+// Reward wallet + streak scratch cards
+router.use('/rewards', rewardsRouter);
 
 export default router;
 

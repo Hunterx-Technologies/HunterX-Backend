@@ -104,6 +104,7 @@ async function gatherUserData(bUserId) {
       where:   { user_id: bUserId },
       orderBy: { assigned_at: 'asc' },
       include: {
+        reward_coupons: { select: { title: true } },
         reward_pool: {
           select: {
             description:    true,
@@ -194,7 +195,10 @@ async function gatherUserData(bUserId) {
     },
 
     rewards: userRewards.map((r) => ({
-      reward_name: r.reward_pool?.description || r.reward_pool?.reward_partners?.name || 'Reward',
+      // An unscratched card's prize stays hidden here too.
+      reward_name: !r.scratched_at ? 'Scratch card'
+        : [r.reward_coupons?.title, r.reward_text].filter(Boolean).join(' · ')
+          || r.reward_pool?.description || r.reward_pool?.reward_partners?.name || 'Reward',
       type:        r.trigger_type,
       received_at: fmtDateTime(r.assigned_at),
     })),

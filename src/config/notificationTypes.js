@@ -18,7 +18,7 @@ export const NOTIFICATION_TYPES = {
   TASK_REMINDER:      { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: true },
   NEW_QUEST:          { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_AT_RISK:     { setting: 'notify_streak_preservation', channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
-  STREAK_MILESTONE:   { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)/profile', capped: false, quietHours: true },
+  STREAK_MILESTONE:   { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true }, // home shows the badge popup
   STREAK_FREEZE_USED: { setting: 'notify_streak_freeze',       channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_BROKEN:      { setting: 'notify_streak_freeze',       channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   LEVEL_UP:           { setting: 'notify_level_up',            channel: 'rewards',   url: '/(tabs)',         capped: false, quietHours: true },
@@ -34,6 +34,8 @@ export const NOTIFICATION_TYPES = {
   QUEST_COMPLETED:    { setting: 'notify_level_up',            channel: 'rewards',   url: '/(tabs)',         capped: false, quietHours: true },
   DAY_COMPLETE:       { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   ACCOUNT_UPDATE:     { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: false },
+  // Proof review outcome (approved / new proof needed / rejected) — transactional.
+  TASK_REVIEW:        { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: true },
 };
 
 const FALLBACK = { setting: null, channel: 'system', url: '/(tabs)', capped: false, quietHours: true };

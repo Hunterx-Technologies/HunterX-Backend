@@ -12,10 +12,6 @@ export const XP_SHIFT = 2 ** XP_SHIFT_BITS;
 export const MAX_SAFE_TOTAL_XP = 2 ** (53 - XP_SHIFT_BITS) - 1;
 export const MAX_SAFE_USER_ID  = XP_SHIFT - 1;
 
-// Gen Z scope — birth year window, inclusive on both ends.
-export const GENZ_BIRTH_YEAR_START = 1997;
-export const GENZ_BIRTH_YEAR_END   = 2012;
-
 // Friends scope — bounds the worst case for a heavy referrer; only the
 // most recently created referrals count toward the friend set.
 export const FRIENDS_REFERRAL_CAP = 2000;
@@ -25,7 +21,6 @@ export const LEADERBOARD_MAX_LIMIT     = 50;
 
 export const REDIS_KEYS = {
   global:      'lb:global',
-  genz:        'lb:genz',
   dirty:       'lb:dirty',
   rebuildLock: 'lb:rebuild:lock',
   userHash:    (id) => `lb:u:${id}`,

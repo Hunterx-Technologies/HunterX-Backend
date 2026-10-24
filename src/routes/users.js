@@ -10,6 +10,8 @@ import * as dataExportService from '../services/dataExportService.js';
 import * as healthMetricsService from '../services/healthMetricsService.js';
 import * as pushService from '../services/pushService.js';
 import { deleteUserAccount } from '../services/accountDeletionService.js';
+import * as xpService from '../services/xpService.js';
+import * as rewardService from '../services/rewardService.js';
 
 const router = Router();
 
@@ -111,6 +113,60 @@ router.get('/activity', verifyToken, async (req, res, next) => {
   }
 });
 
+
+// ── GET /api/users/me/streak-badges/unseen ───────────────
+// Streak badges earned but not shown yet (the home screen's crack-the-seal
+// popup), oldest first: { badges: [{ id, badge_id, name, description,
+// streak_days, earned_at }] }.
+// Header: Authorization: Bearer <access_token>
+router.get('/me/streak-badges/unseen', verifyToken, async (req, res, next) => {
+  try {
+    const data = await rewardService.listUnseenStreakBadges(req.user.id);
+    return success(res, data, 'Unseen streak badges fetched');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/users/me/streak-badges/seen ────────────────
+// Body: { ids: string[] } — the badges just shown and continued.
+router.post('/me/streak-badges/seen', verifyToken, async (req, res, next) => {
+  try {
+    const data = await rewardService.markStreakBadgesSeen(req.user.id, req.body?.ids);
+    return success(res, data, 'Streak badges marked seen');
+  } catch (err) {
+    if (err.message === 'INVALID_IDS')
+      return error(res, 'ids must be 1-20 streak badge ids', 400);
+    next(err);
+  }
+});
+
+// ── GET /api/users/me/level-up ───────────────────────────
+// Level-ups the app hasn't shown yet (XP from an approved proof or a
+// referral, or a completion screen that was cut short), as one level-up
+// screen's content — same shape as a completion's level_up. Null if none.
+// Header: Authorization: Bearer <access_token>
+router.get('/me/level-up', verifyToken, async (req, res, next) => {
+  try {
+    const data = await xpService.getPendingLevelUp(req.user.id);
+    return success(res, data, 'Level-up fetched');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/users/me/level-up/seen ─────────────────────
+// Body: { ids: string[] } — the level_up.event_ids just shown.
+router.post('/me/level-up/seen', verifyToken, async (req, res, next) => {
+  try {
+    const data = await xpService.markLevelUpsSeen(req.user.id, req.body?.ids);
+    return success(res, data, 'Level-up marked seen');
+  } catch (err) {
+    if (err.message === 'INVALID_IDS')
+      return error(res, 'ids must be 1-50 level-up event ids', 400);
+    next(err);
+  }
+});
 
 // ── GET & PATCH /api/users/me/settings ───────────────────
 router.get('/me/settings', verifyToken, async (req, res, next) => {

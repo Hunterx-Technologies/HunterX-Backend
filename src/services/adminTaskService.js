@@ -67,6 +67,16 @@ function dateKey(date) {
   return date ? date.toISOString().slice(0, 10) : null;
 }
 
+// special_reward_id from a request: null / '' / 'none' = no special reward;
+// otherwise it must be a special (TASK kind) reward. Returns a BigInt or null.
+async function resolveSpecialReward(value) {
+  if (value === null || value === '' || value === 'none') return null;
+  if (!/^\d+$/.test(String(value))) throw new Error('INVALID_SPECIAL_REWARD');
+  const trigger = await prisma.reward_triggers.findUnique({ where: { id: BigInt(value) } });
+  if (!trigger || trigger.kind !== 'TASK') throw new Error('INVALID_SPECIAL_REWARD');
+  return trigger.id;
+}
+
 // Validates a full task definition and returns the tasks row fields.
 // `existing` (edit only) relaxes the "not in the past" checks to dates the
 // admin actually changed, so a task that has already started stays editable.
@@ -88,6 +98,7 @@ function buildTaskData(input, existing = null) {
     end_date,
     is_paid,
     price,
+    proof_count,
   } = input;
 
   if (!title?.trim()) throw new Error('TITLE_REQUIRED');
@@ -95,6 +106,9 @@ function buildTaskData(input, existing = null) {
   if (typeof is_recurring !== 'boolean') throw new Error('IS_RECURRING_REQUIRED');
   if (typeof allows_partial !== 'boolean') throw new Error('INVALID_ALLOWS_PARTIAL');
   if (typeof is_paid !== 'boolean') throw new Error('INVALID_IS_PAID');
+  // 0 = no proof; 1–5 photos the hunter uploads for an admin to review.
+  const proofCount = proof_count === undefined || proof_count === null || proof_count === '' ? 0 : Number(proof_count);
+  if (!Number.isInteger(proofCount) || proofCount < 0 || proofCount > 5) throw new Error('INVALID_PROOF_COUNT');
 
   if (
     target_value !== undefined && target_value !== null &&
@@ -163,6 +177,7 @@ function buildTaskData(input, existing = null) {
     recurrence_days:  [], // no longer used — weekly tasks run every day of their window
     is_paid,
     price:            resolvedPrice,
+    proof_count:      proofCount,
   };
 }
 
@@ -173,8 +188,9 @@ function buildTaskData(input, existing = null) {
 //
 // On edit (`existing` set), a new file for a gender whose current image is
 // one we uploaded overwrites that same Cloudinary image instead of adding
-// another — unless both genders share that image, in which case
-// overwriting would change the other one too. After a successful write,
+// another — unless that image is also shown elsewhere (the other gender,
+// or another task the URL was pasted into), where overwriting would change
+// it there too; then a new image is uploaded. After a successful write,
 // any of our images no longer referenced by the task are deleted (e.g. an
 // image swapped for a different URL).
 async function writeWithImages(data, files, write, existing = null) {
@@ -183,12 +199,18 @@ async function writeWithImages(data, files, write, existing = null) {
   const femaleId = ownId(existing?.image_url_female);
   const shared   = maleId && maleId === femaleId;
 
+  // The id to overwrite for a replaced image, or null to upload a new one.
+  const overwriteId = async (id) => {
+    if (!id || shared) return null;
+    return (await usedByOtherTask(id, existing.id)) ? null : id;
+  };
+
   const [male, female] = await Promise.all([
     files.image_male
-      ? uploadCompressedImage(files.image_male, TASK_IMAGE_FOLDER, { publicId: shared ? null : maleId })
+      ? overwriteId(maleId).then(publicId => uploadCompressedImage(files.image_male, TASK_IMAGE_FOLDER, { publicId }))
       : null,
     files.image_female
-      ? uploadCompressedImage(files.image_female, TASK_IMAGE_FOLDER, { publicId: shared ? null : femaleId })
+      ? overwriteId(femaleId).then(publicId => uploadCompressedImage(files.image_female, TASK_IMAGE_FOLDER, { publicId }))
       : null,
   ]);
   if (male) {
@@ -209,24 +231,120 @@ async function writeWithImages(data, files, write, existing = null) {
     const before = [existing.image_url, existing.image_url_male, existing.image_url_female].map(ownId);
     const after  = new Set([saved.image_url, saved.image_url_male, saved.image_url_female].map(ownId));
     const candidates = [...new Set(before.filter(id => id && !after.has(id)))];
-    // An admin may have pasted the same image URL into another task.
     const orphaned = [];
     for (const id of candidates) {
-      const usedElsewhere = await prisma.tasks.count({
-        where: {
-          id: { not: existing.id },
-          OR: [
-            { image_url:        { contains: id } },
-            { image_url_male:   { contains: id } },
-            { image_url_female: { contains: id } },
-          ],
-        },
-      });
-      if (!usedElsewhere) orphaned.push(id);
+      if (!(await usedByOtherTask(id, existing.id))) orphaned.push(id);
     }
     if (orphaned.length) await deleteImages(orphaned);
   }
   return saved;
+}
+
+// An admin may have pasted one task's image URL into another task.
+async function usedByOtherTask(publicId, taskId) {
+  const count = await prisma.tasks.count({
+    where: {
+      id: { not: taskId },
+      OR: [
+        { image_url:        { contains: publicId } },
+        { image_url_male:   { contains: publicId } },
+        { image_url_female: { contains: publicId } },
+      ],
+    },
+  });
+  return count > 0;
+}
+
+// Every task, active and inactive, newest first — for the admin Tasks
+// page. The app only ever sees active ones (taskService.js /
+// taskAssignmentService.js filter on is_active). DAILY_FIXED routine tasks
+// are listed too but are seed-managed, so updateTask refuses them.
+// can_delete: no hunter has ever been touched by it (see deleteTask).
+export async function listTasks() {
+  const [tasks, used] = await Promise.all([
+    prisma.tasks.findMany({ orderBy: [{ created_at: 'desc' }, { id: 'desc' }] }),
+    prisma.$queryRaw`
+      SELECT task_id FROM task_schedule
+      UNION SELECT task_id FROM task_completions
+      UNION SELECT task_id FROM task_purchases
+      UNION SELECT task_id FROM xp_transactions WHERE task_id IS NOT NULL`,
+  ]);
+  const usedIds = new Set(used.map((r) => String(r.task_id)));
+  return tasks.map((t) => ({
+    ...t,
+    can_delete: CREATABLE_TYPES.includes(t.task_type) && !usedIds.has(String(t.id)),
+  }));
+}
+
+// For the admin task page's Assignment Stats tab: how many hunters have
+// had the task on their list, when it was first / last shown to anyone,
+// and how many of them completed it at least once (COMPLETED or PARTIAL).
+export async function getTaskAssignmentStats(taskId) {
+  if (!/^\d+$/.test(String(taskId))) throw new Error('TASK_NOT_FOUND');
+  const bTaskId = BigInt(taskId);
+  const task = await prisma.tasks.findUnique({ where: { id: bTaskId }, select: { id: true } });
+  if (!task) throw new Error('TASK_NOT_FOUND');
+
+  const [[shown], [done]] = await Promise.all([
+    prisma.$queryRaw`
+      SELECT COUNT(DISTINCT user_id)::int AS users, MIN(active_date) AS first_shown, MAX(active_date) AS last_shown,
+             COUNT(*) FILTER (WHERE active_date = ${getISTDateOnly()})::int AS today
+      FROM task_schedule WHERE task_id = ${bTaskId}`,
+    prisma.$queryRaw`
+      SELECT COUNT(DISTINCT user_id)::int AS users, COUNT(*)::int AS completions
+      FROM task_completions WHERE task_id = ${bTaskId} AND status IN ('COMPLETED', 'PARTIAL')`,
+  ]);
+  return {
+    users_assigned:   shown.users,
+    shown_today:      shown.today,
+    first_shown_on:   shown.first_shown ? dateKey(shown.first_shown) : null,
+    last_shown_on:    shown.last_shown ? dateKey(shown.last_shown) : null,
+    users_completed:  done.users,
+    completions:      done.completions,
+    // Share of assigned hunters who completed it at least once.
+    completion_rate:  shown.users ? Math.round((done.users / shown.users) * 100) : 0,
+  };
+}
+
+// Permanently deletes a task no hunter has been touched by: never assigned
+// (task_schedule), completed, bought, or paid XP for. Anything else can
+// only be deactivated, so users' history stays intact. Its Cloudinary
+// images go too (unless another task uses the same image). The row lock
+// makes a concurrent assignment wait, so it can't slip in between the
+// check and the delete.
+export async function deleteTask(taskId) {
+  if (!/^\d+$/.test(String(taskId))) throw new Error('TASK_NOT_FOUND');
+  const bTaskId = BigInt(taskId);
+
+  const deleted = await prisma.$transaction(async (tx) => {
+    const [row] = await tx.$queryRaw`SELECT id FROM tasks WHERE id = ${bTaskId} FOR UPDATE`;
+    if (!row) throw new Error('TASK_NOT_FOUND');
+    const task = await tx.tasks.findUnique({ where: { id: bTaskId } });
+    if (!CREATABLE_TYPES.includes(task.task_type)) throw new Error('TASK_NOT_EDITABLE');
+
+    const [scheduled, completed, purchased, xp] = await Promise.all([
+      tx.task_schedule.count({ where: { task_id: bTaskId } }),
+      tx.task_completions.count({ where: { task_id: bTaskId } }),
+      tx.task_purchases.count({ where: { task_id: bTaskId } }),
+      tx.xp_transactions.count({ where: { task_id: bTaskId } }),
+    ]);
+    if (scheduled + completed + purchased + xp > 0) throw new Error('TASK_IN_USE');
+
+    await tx.tasks.delete({ where: { id: bTaskId } });
+    return task;
+  });
+
+  const imageIds = [...new Set(
+    [deleted.image_url, deleted.image_url_male, deleted.image_url_female]
+      .map((url) => ownPublicIdFromUrl(url, TASK_IMAGE_FOLDER))
+      .filter(Boolean)
+  )];
+  const orphaned = [];
+  for (const id of imageIds) {
+    if (!(await usedByOtherTask(id, bTaskId))) orphaned.push(id);
+  }
+  if (orphaned.length) await deleteImages(orphaned);
+  return { deleted: true };
 }
 
 // files: optional uploaded images { image_male, image_female }, each a
@@ -239,6 +357,8 @@ export async function createTask(adminId, body, files = {}) {
     is_active:        true,
     created_by:       BigInt(adminId),
   };
+  // Optional special reward: completing the task grants a card from it.
+  if (input.special_reward_id !== undefined) data.special_reward_id = await resolveSpecialReward(input.special_reward_id);
   const saved = await writeWithImages(data, files, d => prisma.tasks.create({ data: d }));
   announceInBackground(saved);
   return saved;
@@ -249,7 +369,13 @@ export async function createTask(adminId, body, files = {}) {
 export async function updateTask(taskId, body, files = {}) {
   const existing = await prisma.tasks.findUnique({ where: { id: BigInt(taskId) } });
   if (!existing) throw new Error('TASK_NOT_FOUND');
-  if (!CREATABLE_TYPES.includes(existing.task_type)) throw new Error('TASK_NOT_EDITABLE');
+  // Built-in daily tasks (DAILY_FIXED, seed-managed) can only be switched
+  // on or off — nothing else about them is editable.
+  if (!CREATABLE_TYPES.includes(existing.task_type)) {
+    const keys = Object.keys(body ?? {}).filter((k) => body[k] !== undefined);
+    if (keys.length !== 1 || keys[0] !== 'is_active' || typeof body.is_active !== 'boolean') throw new Error('TASK_NOT_EDITABLE');
+    return prisma.tasks.update({ where: { id: existing.id }, data: { is_active: body.is_active, updated_at: new Date() } });
+  }
 
   const changes = Object.fromEntries(
     Object.entries(body ?? {}).filter(([, v]) => v !== undefined)
@@ -280,6 +406,7 @@ export async function updateTask(taskId, body, files = {}) {
     end_date:         dateKey(existing.end_date),
     is_paid:          existing.is_paid,
     price:            existing.price === null ? undefined : Number(existing.price),
+    proof_count:      existing.proof_count,
   };
   const input = { ...current, ...changes };
 
@@ -295,6 +422,22 @@ export async function updateTask(taskId, body, files = {}) {
   if ('image_url' in changes && !('image_url_male' in changes)) input.image_url_male = changes.image_url;
 
   const data = buildTaskData(input, existing);
+
+  // Special reward: can be added, swapped or removed until it has given a
+  // hunter a card for this task — then it's fixed, so what was promised
+  // for the task stays the same for everyone (switch the reward off to stop it).
+  if ('special_reward_id' in changes) {
+    const next = await resolveSpecialReward(changes.special_reward_id);
+    if (next !== existing.special_reward_id) {
+      if (existing.special_reward_id) {
+        const granted = await prisma.user_rewards.count({
+          where: { trigger_id: existing.special_reward_id, period: Number(existing.id) },
+        });
+        if (granted > 0) throw new Error('SPECIAL_REWARD_LOCKED');
+      }
+      data.special_reward_id = next;
+    }
+  }
 
   if (typeof changes.is_active === 'boolean') {
     data.is_active = changes.is_active;

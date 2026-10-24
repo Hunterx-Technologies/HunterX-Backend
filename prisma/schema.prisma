@@ -236,6 +236,12 @@ model levels {
   title          String? @db.VarChar(100)
   rank_name      String? @db.VarChar(100)
   unlock_message String?
+  /// Level-up screen text, shown as-is by the app.
+  level_up_label   String? @db.VarChar(40)
+  level_up_title   String? @db.VarChar(100)
+  level_up_message String?
+  /// First level of a new rank: the level-up screen also shows the new dragon stage.
+  is_rank_up       Boolean @default(false)
   badges         badges? @relation(fields: [badge_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 }
 
@@ -377,6 +383,57 @@ model streak_milestones {
   user_streak_milestones user_streak_milestones[]
 }
 
+// An event that grants a scratch card: a streak of `value` days, reaching
+// level `value`, the user's birthday (value 0), or completing a task that
+// has this special reward linked (kind TASK; value is just a running
+// number, description is its name). Only triggers with at
+// least one active coupon grant anything (rewardService.js#grantTriggerCard).
+model reward_triggers {
+  id             BigInt              @id @default(autoincrement())
+  kind           reward_trigger_kind
+  value          Int                 @default(0)
+  description    String?             @db.VarChar(500)
+  /// Inactive = grants no new cards. Cards already granted stay with their owners.
+  is_active      Boolean             @default(true)
+  created_at     DateTime            @default(now()) @db.Timestamp(6)
+  reward_coupons reward_coupons[]
+  user_rewards   user_rewards[]
+  tasks          tasks[]
+
+  @@unique([kind, value])
+}
+
+// One prize a trigger's scratch card can land on. A trigger with several
+// active coupons picks one per user by weight at the moment it fires
+// (rewardService.js#pickCoupon). code is shared by every winner;
+// total_quantity caps how many get it (null = unlimited).
+model reward_coupons {
+  id                     BigInt               @id @default(autoincrement())
+  trigger_id             BigInt
+  title                  String               @db.VarChar(120)
+  description            String?              @db.VarChar(500)
+  coupon_code            String               @db.VarChar(50)
+  discount_type          reward_discount_type
+  discount_value         Decimal              @db.Decimal(10, 2)
+  currency               String?              @db.VarChar(8)
+  weight                 Int                  @default(1)
+  total_quantity         Int?
+  awarded_count          Int                  @default(0)
+  valid_from             DateTime?            @db.Timestamp(6)
+  valid_until            DateTime?            @db.Timestamp(6)
+  valid_days_after_award Int?
+  product_name           String?              @db.VarChar(120)
+  product_category       String?              @db.VarChar(120)
+  product_image_url      String?              @db.VarChar(500)
+  is_active              Boolean              @default(true)
+  created_at             DateTime             @default(now()) @db.Timestamp(6)
+  updated_at             DateTime             @default(now()) @updatedAt @db.Timestamp(6)
+  reward_triggers        reward_triggers      @relation(fields: [trigger_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  user_rewards           user_rewards[]
+
+  @@index([trigger_id, is_active], map: "idx_reward_coupons_trigger")
+}
+
 model subscriptions {
   id           BigInt                @id @default(autoincrement())
   user_id      BigInt
@@ -405,12 +462,20 @@ model task_completions {
   xp_earned      Int               @default(0)
   completed_at   DateTime?         @default(now()) @db.Timestamp(6)
   created_at     DateTime?         @default(now()) @db.Timestamp(6)
+  /// Proof photos (our Cloudinary task-proof folder), for proof tasks.
+  proof_urls         String[]      @default([])
+  proof_submitted_at DateTime?     @db.Timestamp(6)
+  reviewed_at        DateTime?     @db.Timestamp(6)
+  reviewed_by        BigInt?
+  /// Admin's reason, shown to the hunter on RESUBMIT / REJECTED.
+  review_note        String?       @db.VarChar(300)
   tasks          tasks             @relation(fields: [task_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   users          users             @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, task_id, schedule_date])
   @@index([task_id, schedule_date], map: "idx_completions_task_date")
   @@index([user_id, schedule_date], map: "idx_completions_user_date")
+  @@index([proof_submitted_at], map: "idx_completions_in_review", where: raw("(status = 'IN_REVIEW'::completion_status)"))
 }
 
 model task_schedule {
@@ -500,8 +565,14 @@ model tasks {
   task_purchases     task_purchases[]
   task_schedule      task_schedule[]
   users              users?               @relation(fields: [created_by], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  /// Photos a hunter must upload to complete it (0 = no proof; 1–5). Proof tasks are reviewed by an admin before XP is paid.
+  proof_count        Int                  @default(0)
+  /// Optional special reward (reward_triggers kind TASK): completing the task grants a scratch card from it.
+  special_reward_id  BigInt?
+  reward_triggers    reward_triggers?     @relation(fields: [special_reward_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
   xp_transactions    xp_transactions[]
 
+  @@index([special_reward_id], map: "idx_tasks_special_reward", where: raw("(special_reward_id IS NOT NULL)"))
   @@index([task_type, is_active, start_date, end_date], map: "idx_tasks_type_active_window")
 }
 
@@ -510,10 +581,13 @@ model user_badges {
   user_id   BigInt
   badge_id  BigInt
   earned_at DateTime? @default(now()) @db.Timestamp(6)
+  /// When the app showed the unlock popup; null = not shown yet.
+  seen_at   DateTime? @db.Timestamp(6)
   badges    badges    @relation(fields: [badge_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
   users     users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, badge_id])
+  @@index([user_id], map: "idx_user_badges_unseen", where: raw("(seen_at IS NULL)"))
 }
 
 model user_discovery_interests {
@@ -585,20 +659,44 @@ model user_progression {
   @@index([total_xp(sort: Desc), user_id], map: "idx_user_progression_leaderboard")
 }
 
+// A reward card. Scratch cards (trigger_id set) carry their prize
+// as a snapshot (coupon_code, discount_*) taken when it was picked, so a
+// later admin edit never rewrites what a user won; coupon_code is null
+// while no coupon was in stock (picked again on scratch). Legacy rows
+// point at a reward_pool code instead. period makes a trigger repeatable:
+// the birthday trigger uses the year, a special (TASK) reward the id of the
+// task that earned it (one card per task), other triggers 0. The API
+// status is derived from
+// status + seen_at/scratched_at (rewardService.js#apiStatus).
 model user_rewards {
-  id           BigInt         @id @default(autoincrement())
-  user_id      BigInt
-  pool_id      BigInt
-  trigger_type reward_trigger
-  status       reward_status  @default(ACTIVE)
-  assigned_at  DateTime?      @default(now()) @db.Timestamp(6)
-  claimed_at   DateTime?      @db.Timestamp(6)
-  expires_at   DateTime?      @db.Timestamp(6)
-  reward_pool  reward_pool    @relation(fields: [pool_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
-  users        users          @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  id                BigInt                @id @default(autoincrement())
+  user_id           BigInt
+  pool_id           BigInt?
+  trigger_id        BigInt?
+  period            Int                   @default(0)
+  coupon_id         BigInt?
+  trigger_type      reward_trigger
+  status            reward_status         @default(ACTIVE)
+  rarity            String                @default("common") @db.VarChar(16)
+  coupon_code       String?               @db.VarChar(50)
+  discount_type     reward_discount_type?
+  discount_value    Decimal?              @db.Decimal(10, 2)
+  currency          String?               @db.VarChar(8)
+  reward_text       String?               @db.VarChar(100)
+  assigned_at       DateTime?             @default(now()) @db.Timestamp(6)
+  seen_at           DateTime?             @db.Timestamp(6)
+  scratched_at      DateTime?             @db.Timestamp(6)
+  claimed_at        DateTime?             @db.Timestamp(6)
+  expires_at        DateTime?             @db.Timestamp(6)
+  reward_pool       reward_pool?          @relation(fields: [pool_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reward_triggers   reward_triggers?      @relation(fields: [trigger_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  reward_coupons    reward_coupons?       @relation(fields: [coupon_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  users             users                 @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
+  @@unique([user_id, trigger_id, period], map: "uq_user_rewards_user_trigger", where: raw("(trigger_id IS NOT NULL)"))
   @@index([expires_at], map: "idx_rewards_expires", where: raw("(status = 'ACTIVE'::reward_status)"))
   @@index([user_id, status], map: "idx_rewards_user_status")
+  @@index([coupon_id], map: "idx_rewards_coupon")
 }
 
 model user_streak_milestones {
@@ -632,6 +730,8 @@ model users {
   referred_by                                             BigInt?
   gender                                                  user_gender?
   date_of_birth                                           DateTime?                  @db.Date
+  /// When the user last changed date_of_birth; null = set before tracking began. Birthday rewards wait 30 days after a change.
+  dob_updated_at                                          DateTime?                  @db.Timestamp(6)
   age                                                     Int?
   height_cm                                               Float?
   weight_kg                                               Float?
@@ -695,6 +795,8 @@ model users {
   admin_actions_received                                  admin_user_actions[]       @relation("admin_user_actions_user")
   admin_actions_performed                                 admin_user_actions[]       @relation("admin_user_actions_admin")
 
+  streak_events                                           streak_events[]
+  level_up_events                                         level_up_events[]
   @@index([email], map: "idx_users_email")
   @@index([hunter_id], map: "idx_users_hunter_id")
   @@index([last_latitude, last_longitude], map: "idx_users_location", where: raw("(location_visible = true)"))
@@ -765,10 +867,17 @@ enum badge_type {
   CAMPAIGN
 }
 
+// IN_REVIEW / RESUBMIT / REJECTED: proof tasks (tasks.proof_count > 0).
+// Submitting proof → IN_REVIEW (no XP yet); the admin then approves
+// (→ COMPLETED, XP paid), asks for new proof (→ RESUBMIT) or rejects
+// for good (→ REJECTED). See taskProofService.js.
 enum completion_status {
   COMPLETED
   SKIPPED
   PARTIAL
+  IN_REVIEW
+  RESUBMIT
+  REJECTED
 }
 
 enum push_platform {
@@ -844,6 +953,7 @@ enum notification_type {
   QUEST_COMPLETED
   DAY_COMPLETE
   ACCOUNT_UPDATE
+  TASK_REVIEW
 }
 
 enum reward_status {
@@ -852,7 +962,21 @@ enum reward_status {
   EXPIRED
 }
 
+enum reward_discount_type {
+  PERCENT
+  FLAT
+}
+
+enum reward_trigger_kind {
+  STREAK
+  LEVEL_UP
+  BIRTHDAY
+  TASK
+}
+
 enum reward_trigger {
+  STREAK_MILESTONE
+  BIRTHDAY
   STREAK_7
   STREAK_14
   STREAK_21
@@ -935,4 +1059,41 @@ model user_settings {
   created_at                 DateTime? @default(now()) @db.Timestamp(6)
   updated_at                 DateTime? @default(now()) @db.Timestamp(6)
   users                      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+}
+
+/// A streak life spent or a streak broken, recorded when the backend applies
+/// it (streakService.js#reconcileStreak). The app shows each one once.
+model streak_events {
+  id          BigInt            @id @default(autoincrement())
+  user_id     BigInt
+  type        streak_event_type
+  lives_lost  Int               @default(0)
+  lives_left  Int               @default(0)
+  streak_days Int               @default(0)
+  created_at  DateTime          @default(now()) @db.Timestamp(6)
+  seen_at     DateTime?         @db.Timestamp(6)
+  users       users             @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id], map: "idx_streak_events_unseen", where: raw("(seen_at IS NULL)"))
+  @@index([user_id, created_at], map: "idx_streak_events_user_created")
+}
+
+enum streak_event_type {
+  LIFE_USED
+  STREAK_BROKEN
+}
+
+/// An XP award that raised the user's level (xpService.js#checkLevelUp).
+/// The app shows the level-up screen for it once, then marks it seen.
+model level_up_events {
+  id         BigInt    @id @default(autoincrement())
+  user_id    BigInt
+  from_level Int
+  to_level   Int
+  xp_earned  Int       @default(0)
+  created_at DateTime  @default(now()) @db.Timestamp(6)
+  seen_at    DateTime? @db.Timestamp(6)
+  users      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id], map: "idx_level_up_events_unseen", where: raw("(seen_at IS NULL)"))
 }

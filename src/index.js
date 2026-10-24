@@ -56,7 +56,7 @@ app.use(errorHandler);
 
 // Leaderboard startup — loads the in-memory levels cache, checks the
 // Redis score-packing bit widths still hold against live data, and
-// rebuilds lb:global/lb:genz from Postgres if they don't exist yet
+// rebuilds lb:global from Postgres if it doesn't exist yet
 // (fresh Redis instance, or one that lost its data). None of this
 // blocks the server from accepting requests — on failure it logs and
 // the API falls back to the Postgres leaderboard path.

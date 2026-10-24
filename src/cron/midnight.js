@@ -14,7 +14,7 @@ import cron from 'node-cron';
 import prisma from '../config/prisma.js';
 import { assignDailyTasks, loadSharedTasks } from '../services/taskAssignmentService.js';
 import { deactivateExpiredPaidTasks } from '../services/taskPurchaseService.js';
-import { expireRewards } from '../services/rewardService.js';
+import { expireRewards, grantBirthdayCards } from '../services/rewardService.js';
 import { deleteOldNotifications, NOTIFICATION_RETENTION_DAYS } from '../services/notificationService.js';
 import { getISTDateOnly, calculateStepsGoal } from '../utils/helpers.js';
 import { info, logError } from '../utils/logger.js';
@@ -79,6 +79,15 @@ export async function runNightlyTaskAssignment() {
     await syncUserAgesForBirthdays(today);
   } catch (err) {
     logError(`Birthday age sync failed: ${err.message}`);
+  }
+
+  // Birthday scratch cards (only once an admin has put coupons on the
+  // birthday trigger) — see rewardService.js#grantBirthdayCards.
+  try {
+    const granted = await grantBirthdayCards(today);
+    if (granted > 0) info(`Granted ${granted} birthday scratch card(s)`);
+  } catch (err) {
+    logError(`Birthday scratch cards failed: ${err.message}`);
   }
 
   // Paid tasks whose end_date has passed stop being offered/assigned.

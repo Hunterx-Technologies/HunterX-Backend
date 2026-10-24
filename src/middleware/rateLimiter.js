@@ -41,3 +41,19 @@ export const leaderboardLimiter = rateLimit({
     message: 'Too many leaderboard requests. Try again in a moment.',
   },
 });
+
+// Rewards writes (seen / scratch / use) — 30/min per user. Scratch is
+// idempotent anyway; this just keeps a stuck retry loop from hammering
+// the row locks.
+export const rewardLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator: (req) => req.user?.id?.toString() || req.ip,
+  message: {
+    success: false,
+    message: 'Too many reward requests. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many reward requests. Try again in a moment.' },
+  },
+});

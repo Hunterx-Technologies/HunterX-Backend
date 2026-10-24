@@ -338,9 +338,11 @@ export async function getUserDetail(id) {
         orderBy: { assigned_at: 'desc' },
         select: {
           id: true, status: true, trigger_type: true, assigned_at: true, claimed_at: true, expires_at: true,
+          reward_text: true, coupon_code: true, scratched_at: true,
+          reward_coupons: { select: { title: true } },
           reward_pool: {
             select: {
-              discount_value: true, description: true,
+              description: true,
               reward_partners: { select: { name: true } },
             },
           },
@@ -454,11 +456,13 @@ export async function getUserDetail(id) {
     })),
 
     reward_claims: user.user_rewards.map((r) => {
-      const partner = r.reward_pool?.reward_partners?.name;
-      const value   = r.reward_pool?.discount_value;
+      // Admins see the prize even on an unscratched card; one still
+      // waiting on stock has none yet.
+      const partner = r.reward_coupons?.title ?? r.reward_pool?.reward_partners?.name;
+      const value   = r.reward_text;
       return {
         id:           r.id.toString(),
-        reward_name:  [partner, value].filter(Boolean).join(' · ') || r.reward_pool?.description || 'Reward',
+        reward_name:  [partner, value].filter(Boolean).join(' · ') || r.reward_pool?.description || (r.coupon_code ? 'Reward' : 'Scratch card (awaiting stock)'),
         type:         'coupon',
         status:       r.status, // ACTIVE | CLAIMED | EXPIRED
         trigger_type: r.trigger_type,
@@ -525,7 +529,7 @@ export async function banUser(adminUserId, id, reason) {
     }),
   ]);
 
-  await syncLeaderboardMember(userId); // drops them from global/genz
+  await syncLeaderboardMember(userId); // drops them from global
   await notifyAccountUpdate(
     userId, 'ACCOUNT_BANNED',
     'Your account has been suspended',

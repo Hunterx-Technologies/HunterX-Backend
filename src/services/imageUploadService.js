@@ -11,11 +11,13 @@ import cloudinary from '../config/cloudinary.js';
 const MAX_DIMENSION = 1080;
 const WEBP_QUALITY  = 80;
 
-export async function compressImage(buffer) {
+// maxDimension: longest side in px (default 1080). Reward coupon images
+// use 1200 — the app shows them up to ~400pt wide on 3x screens.
+export async function compressImage(buffer, { maxDimension = MAX_DIMENSION } = {}) {
   try {
     return await sharp(buffer)
       .rotate() // respect EXIF orientation before metadata is stripped
-      .resize(MAX_DIMENSION, MAX_DIMENSION, { fit: 'inside', withoutEnlargement: true })
+      .resize(maxDimension, maxDimension, { fit: 'inside', withoutEnlargement: true })
       .webp({ quality: WEBP_QUALITY })
       .toBuffer();
   } catch {
@@ -27,8 +29,8 @@ export async function compressImage(buffer) {
 // Cloudinary image is overwritten in place (and its CDN cache purged)
 // instead of a new file being created; the returned URL carries a new
 // version so clients don't keep showing the old image.
-export async function uploadCompressedImage(buffer, folder, { publicId = null } = {}) {
-  const compressed = await compressImage(buffer);
+export async function uploadCompressedImage(buffer, folder, { publicId = null, maxDimension } = {}) {
+  const compressed = await compressImage(buffer, { maxDimension });
 
   const options = publicId
     ? { public_id: publicId, overwrite: true, invalidate: true, resource_type: 'image', format: 'webp' }

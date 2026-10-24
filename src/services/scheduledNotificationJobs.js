@@ -13,13 +13,14 @@
 
 import prisma from '../config/prisma.js';
 import { createNotification } from './notificationService.js';
-import { computeGap, reconcileStreak } from './streakService.js';
+import { computeGap, reconcileStreakWithEvent } from './streakService.js';
 import { eligibilityWhere, VISIBLE_FILTER } from './leaderboardService.js';
 import { FRIENDS_REFERRAL_CAP } from '../config/leaderboardConfig.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { getTaskPeriod } from './taskService.js';
 import { getLocalTime } from '../utils/timezone.js';
 import { getActivePurchase } from './taskPurchaseService.js';
+import { rewardLabel } from './rewardService.js';
 import {
   QUEST_LABELS, newQuestKey, paidLaunchKey, paidLaunchMessage, formatDay, isOnSale,
 } from './questNotificationService.js';
@@ -62,6 +63,8 @@ async function countOpenTasks(userId, { types, from, to, periodDate }) {
       user_id:       userId,
       task_id:       { in: scheduled.map((s) => s.task_id) },
       schedule_date: periodDate,
+      // A proof the admin sent back still needs the hunter.
+      status:        { not: 'RESUBMIT' },
     },
   });
   return scheduled.length - handled;
@@ -108,6 +111,14 @@ const streakAtRisk = {
     const { daysSince, lives } = computeGap(progression, today);
     if (daysSince !== 1) return null; // active today, or a gap — streak_status handles gaps
 
+    // A life spent on an overnight gap leaves the same "active yesterday"
+    // state; streak_status already pushed this morning, so don't stack a
+    // second streak push on it.
+    const lifeUsedToday = await prisma.streak_events.count({
+      where: { user_id: userId, type: 'LIFE_USED', created_at: { gte: new Date(today.getTime() - IST_OFFSET_MS) } },
+    });
+    if (lifeUsedToday > 0) return null;
+
     const costsLife = lives >= 1;
     const body = costsLife
       ? 'Clear one quest today or it costs you 1 streak life.'
@@ -124,47 +135,38 @@ const streakAtRisk = {
 };
 
 // ── 2.3 Streak status after a missed day ───────────────────
-// Lives are spent lazily (on next completion / explicit resolve) and
-// breaks are only written when observed, so this job is what turns an
-// overnight miss into a push: shielded-by-lives, or broken (reconciled
-// write-through here, same as any other read path would).
+// Turns an overnight miss into a push for users who haven't opened the
+// app yet: applies the gap (streakService.js#applyGap spends the lives
+// or breaks the streak, recording the event the app's card shows) and
+// pushes what happened. Someone who already opened the app since the
+// miss saw the card, so nothing new gets applied and nothing is pushed.
 
 const streakStatus = {
   name: 'streak_status',
   type: 'STREAK_FREEZE_USED', // gate: notify_streak_freeze covers both outcomes
   slot: () => '07:00',
   run: async ({ userId }) => {
-    const today       = getISTDateOnly();
-    const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
-    if (!progression) return null;
-
-    const streak = progression.daily_streak;
-    const { missedDays, coveredByLives } = computeGap(progression, today);
-    if (missedDays === 0) return null;
+    const today = getISTDateOnly();
+    const { event } = await reconcileStreakWithEvent(userId);
+    if (!event) return null;
 
     const dedupeKey = `streak_status:${dateKey(today)}`;
 
-    if (coveredByLives) {
-      if (streak <= 0) return null;
+    if (event.type === 'LIFE_USED') {
       return createNotification(
         prisma, userId, 'STREAK_FREEZE_USED',
-        'A streak life is shielding you',
-        `You missed ${plural(missedDays, 'day')}. Clear a quest today to keep your ${streak}-day streak alive.`,
-        { event: 'STREAK_SHIELDED', daily_streak: streak, missed_days: missedDays },
+        '🛡️ A streak life saved your streak',
+        `You missed ${plural(event.lives_lost, 'day')}, so ${event.lives_lost === 1 ? 'a streak life was' : `${event.lives_lost} streak lives were`} used to keep your ${event.streak_days}-day streak alive. Clear a quest today to keep it going.`,
+        { event: 'STREAK_LIFE_USED', daily_streak: event.streak_days, lives_lost: event.lives_lost, streak_lives: event.lives_left },
         { dedupeKey, expiresAt: istDayEnd(today) }
       );
     }
 
-    const alreadyBroken = streak === 0 && progression.streak_lives === 0;
-    if (alreadyBroken) return null;
-    await reconcileStreak(userId);
-    if (streak <= 0) return null; // lives zeroed, but there was no streak to mourn
-
     return createNotification(
       prisma, userId, 'STREAK_BROKEN',
       'Your streak has fallen',
-      `Your ${streak}-day streak ended. Every S-rank started at day one — begin again today.`,
-      { event: 'STREAK_BROKEN', previous_streak: streak },
+      `Your ${event.streak_days}-day streak ended. Every S-rank started at day one — begin again today.`,
+      { event: 'STREAK_BROKEN', previous_streak: event.streak_days },
       { dedupeKey }
     );
   },
@@ -203,7 +205,7 @@ const weeklyDeadline = {
       if (period.end.getTime() !== tomorrow.getTime()) continue;
       if (await endsWithPaidAccess(userId, task, period)) continue;
       const handled = await prisma.task_completions.count({
-        where: { user_id: userId, task_id: task.id, schedule_date: period.start },
+        where: { user_id: userId, task_id: task.id, schedule_date: period.start, status: { not: 'RESUBMIT' } },
       });
       if (!handled) open += 1;
     }
@@ -246,7 +248,7 @@ const monthlyDeadline = {
       if (!MONTHLY_NUDGE_DAYS.includes(daysLeft)) continue;
       if (await endsWithPaidAccess(userId, task, period)) continue;
       const handled = await prisma.task_completions.count({
-        where: { user_id: userId, task_id: task.id, schedule_date: period.start },
+        where: { user_id: userId, task_id: task.id, schedule_date: period.start, status: { not: 'RESUBMIT' } },
       });
       if (handled) continue;
       const entry = openByDays.get(daysLeft) ?? { count: 0, end: period.end };
@@ -342,16 +344,15 @@ const rewardExpiring = {
           { expires_at: null, reward_pool: { expires_at: window } },
         ],
       },
-      include: { reward_pool: { select: { discount_value: true, expires_at: true, reward_partners: { select: { name: true } } } } },
+      include: { reward_pool: { select: { expires_at: true, reward_partners: { select: { name: true } } } } },
       orderBy: { id: 'asc' },
     });
 
     let created = null;
     for (const reward of rewards) {
-      const expiresAt = reward.expires_at ?? reward.reward_pool.expires_at;
+      const expiresAt = reward.expires_at ?? reward.reward_pool?.expires_at;
       const hoursLeft = Math.max(1, Math.round((expiresAt.getTime() - now.getTime()) / (60 * 60 * 1000)));
-      const prize     = reward.reward_pool.discount_value || 'Your reward';
-      const partner   = reward.reward_pool.reward_partners?.name;
+      const { prize, partner } = rewardLabel(reward);
 
       const from  = `${prize}${partner ? ` from ${partner}` : ''}`;
       const final = hoursLeft <= REWARD_FINAL_WINDOW_H;
@@ -588,7 +589,7 @@ async function computeRanks(userId, settings) {
   }
 
   const globalRank = 1 + await prisma.users.count({
-    where: { AND: [eligibilityWhere('global'), aheadOf(userId, xp)] },
+    where: { AND: [eligibilityWhere(), aheadOf(userId, xp)] },
   });
 
   const referred = await prisma.referrals.findMany({
