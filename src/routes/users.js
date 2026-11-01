@@ -12,6 +12,7 @@ import * as pushService from '../services/pushService.js';
 import { deleteUserAccount } from '../services/accountDeletionService.js';
 import * as xpService from '../services/xpService.js';
 import * as rewardService from '../services/rewardService.js';
+import { handleEmailChange } from './emailChange.js';
 
 const router = Router();
 
@@ -45,6 +46,8 @@ const handleUpdateProfile = async (req, res, next) => {
       return error(res, 'Invalid email format', 400);
     if (err.message === 'EMAIL_EXISTS')
       return error(res, 'An account with this email already exists', 409);
+    if (err.message === 'EMAIL_CHANGE_REQUIRES_VERIFICATION')
+      return error(res, 'Change your email from Settings — the new address needs a verification code.', 400, 'EMAIL_CHANGE_REQUIRES_VERIFICATION');
     next(err);
   }
 };
@@ -76,28 +79,10 @@ const handleUpdateAvatar = async (req, res, next) => {
 router.patch('/me/avatar', verifyToken, handleUpdateAvatar);
 router.patch('/avatar', verifyToken, handleUpdateAvatar);
 
-// Handler for email update
-const handleUpdateEmail = async (req, res, next) => {
-  try {
-    const { email } = req.body;
-    const user = await authService.updateUserEmail(req.user.id, email);
-    return success(res, { user }, 'Email updated successfully');
-  } catch (err) {
-    if (err.message === 'USER_NOT_FOUND')
-      return error(res, 'User not found', 404);
-    if (err.message === 'EMAIL_REQUIRED')
-      return error(res, 'Email is required', 400);
-    if (err.message === 'INVALID_EMAIL')
-      return error(res, 'Invalid email format', 400);
-    if (err.message === 'EMAIL_EXISTS')
-      return error(res, 'An account with this email already exists', 409);
-    next(err);
-  }
-};
-
 // ── PATCH /api/users/me/email & /api/users/email ─────────
-router.patch('/me/email', verifyToken, handleUpdateEmail);
-router.patch('/email', verifyToken, handleUpdateEmail);
+// Two-step verified email change — see routes/emailChange.js.
+router.patch('/me/email', verifyToken, handleEmailChange);
+router.patch('/email', verifyToken, handleEmailChange);
 
 // ── GET /api/users/activity ───────────────────────────────
 router.get('/activity', verifyToken, async (req, res, next) => {
@@ -142,8 +127,8 @@ router.post('/me/streak-badges/seen', verifyToken, async (req, res, next) => {
 });
 
 // ── GET /api/users/me/level-up ───────────────────────────
-// Level-ups the app hasn't shown yet (XP from an approved proof or a
-// referral, or a completion screen that was cut short), as one level-up
+// Level-ups the app hasn't shown yet (XP from an approved proof, or a
+// completion screen that was cut short), as one level-up
 // screen's content — same shape as a completion's level_up. Null if none.
 // Header: Authorization: Bearer <access_token>
 router.get('/me/level-up', verifyToken, async (req, res, next) => {

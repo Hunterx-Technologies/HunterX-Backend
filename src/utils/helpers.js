@@ -19,10 +19,37 @@ export async function generateHunterId(client = prisma) {
   return `${prefix}${number}`;
 }
 
-// Generate random 8 character referral code e.g. AX7KPQ2M
+// Referral codes: 8 uppercase alphanumerics without the look-alikes
+// 0/O/1/I, so a code typed off a screenshot can't land on someone else's.
+// e.g. AX7KPQ2M
+const REFERRAL_CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const REFERRAL_CODE_LENGTH   = 8;
+
 export function generateReferralCode() {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  return Array.from({ length: 8 }, () => chars[crypto.randomInt(chars.length)]).join('');
+  return Array.from(
+    { length: REFERRAL_CODE_LENGTH },
+    () => REFERRAL_CODE_ALPHABET[crypto.randomInt(REFERRAL_CODE_ALPHABET.length)]
+  ).join('');
+}
+
+// users.referral_code is UNIQUE — check first so a (very unlikely) clash
+// doesn't abort the signup transaction. `client` may be a transaction client.
+export async function generateUniqueReferralCode(client = prisma) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const code  = generateReferralCode();
+    const taken = await client.users.findUnique({ where: { referral_code: code }, select: { id: true } });
+    if (!taken) return code;
+  }
+  throw new Error('REFERRAL_CODE_EXHAUSTED');
+}
+
+// Uppercased code, or null if it can't be one. Accepts 6-8 of any
+// A-Z/0-9: codes issued before the look-alike-free alphabet may still
+// contain 0/O/1/I, and links carrying them are already out in the wild.
+export function normalizeReferralCode(raw) {
+  if (typeof raw !== 'string') return null;
+  const code = raw.trim().toUpperCase();
+  return /^[A-Z0-9]{6,8}$/.test(code) ? code : null;
 }
 
 // 6-digit email verification code
@@ -166,30 +193,47 @@ export function isStrongPassword(password) {
   };
 }
 
+// Only HS256 is ever issued; verification refuses any other algorithm.
+const JWT_ALGORITHM = 'HS256';
+
 // Generate access + refresh token pair. tokenVersion (users.token_version)
-// rides in the refresh token so a password reset can revoke older ones.
-export function generateTokens(userId, role, gender, tokenVersion = 0) {
+// rides in the refresh token so a password reset can revoke older ones;
+// jti / familyId tie the refresh token to its refresh_tokens row
+// (services/sessionService.js) for rotation, reuse detection and logout.
+export function generateTokens(userId, role, gender, tokenVersion = 0, { jti, familyId } = {}) {
   const payload = { userId, role };
   if (gender) payload.gender = gender;
   const accessToken = jwt.sign(
     payload,
     process.env.JWT_SECRET,
-    { expiresIn: process.env.JWT_ACCESS_EXPIRES || '15m' }
+    { algorithm: JWT_ALGORITHM, expiresIn: process.env.JWT_ACCESS_EXPIRES || '15m' }
   );
+  const refreshPayload = { userId, tv: tokenVersion };
+  if (familyId) refreshPayload.fam = familyId;
   const refreshToken = jwt.sign(
-    { userId, tv: tokenVersion },
+    refreshPayload,
     process.env.JWT_REFRESH_SECRET,
-    { expiresIn: process.env.JWT_REFRESH_EXPIRES || '30d' }
+    {
+      algorithm: JWT_ALGORITHM,
+      expiresIn: process.env.JWT_REFRESH_EXPIRES || '30d',
+      ...(jti ? { jwtid: jti } : {}),
+    }
   );
   return { accessToken, refreshToken };
 }
 
 // Verify access token — returns decoded payload or throws
 export function verifyAccessToken(token) {
-  return jwt.verify(token, process.env.JWT_SECRET);
+  return jwt.verify(token, process.env.JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
 }
 
 // Verify refresh token — returns decoded payload or throws
 export function verifyRefreshToken(token) {
-  return jwt.verify(token, process.env.JWT_REFRESH_SECRET);
+  return jwt.verify(token, process.env.JWT_REFRESH_SECRET, { algorithms: [JWT_ALGORITHM] });
+}
+
+// SHA-256 hex of a one-time secret (deletion link token, account OTP) —
+// only the hash is stored.
+export function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
 }

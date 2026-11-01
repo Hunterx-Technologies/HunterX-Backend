@@ -9,23 +9,29 @@ import { mailTransporter } from '../utils/mailer.js';
 import { logError }      from '../utils/logger.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { getWeekStatus }    from './taskService.js';
-import { checkLevelUp }     from './xpService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import { createNotification } from './notificationService.js';
+import { attachLateReferral, countAcceptedInvites, findActiveReferrer } from './referralService.js';
+import { selectAllRoutineTasks, setUserRoutineTasks } from './routineTaskService.js';
+import { issueSession, rotateSession, revokeAllSessions } from './sessionService.js';
+import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpService.js';
+import { allowCodeEmail, isLoginLocked, recordLoginFailure, clearLoginFailures } from '../utils/throttle.js';
+import { brandedEmail, escapeHtml } from '../utils/emailTemplates.js';
+import { sendMail } from '../utils/mailer.js';
 import { getISTDateOnly }   from '../utils/helpers.js';
 import {
   generateHunterId,
-  generateReferralCode,
+  generateUniqueReferralCode,
   generateResetToken,
   hashResetToken,
   generateOtp,
   normalizeEmail,
-  generateTokens,
   calculateBMI,
   calculateProtein,
   calculateWaterGoal,
   calculateStepsGoal,
   isValidEmail,
+  isStrongPassword,
 } from '../utils/helpers.js';
 
 // Expo/React Native apps get Google ID tokens issued for different
@@ -48,8 +54,20 @@ function findUserByEmail(email) {
   return prisma.users.findFirst({ where: { email: { equals: email, mode: 'insensitive' } } });
 }
 
+// Account-deletion status in the shape the app reads (camelCase, plus the
+// whole days left). All null when no deletion is scheduled.
+export function deletionStatus(user) {
+  const deleteAt = user?.delete_at ? new Date(user.delete_at) : null;
+  return {
+    deletionRequestedAt: user?.deletion_requested_at ? new Date(user.deletion_requested_at).toISOString() : null,
+    deleteAt:            deleteAt ? deleteAt.toISOString() : null,
+    daysLeft:            deleteAt ? Math.max(0, Math.ceil((deleteAt.getTime() - Date.now()) / 86_400_000)) : null,
+  };
+}
+
 // Removes sensitive fields before sending user to client
-// Never expose password_hash, reset_token, or reset_token_expiry
+// Never expose password_hash, reset_token, reset_token_expiry, or the
+// deletion-link hash
 function sanitizeUser(user) {
   if (!user) return user;
   const {
@@ -57,18 +75,38 @@ function sanitizeUser(user) {
     reset_token,
     reset_token_expiry,
     token_version,
+    deletion_token_hash,
+    deletion_token_expiry,
     ...safeUser
   } = user;
-  return safeUser;
+  return { ...safeUser, ...deletionStatus(user) };
+}
+
+// A bcrypt hash of a random string: compared against when the email has no
+// account, so a login takes as long whether or not the account exists.
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 12);
+
+function sameEmail(a, b) {
+  return !!a && !!b && normalizeEmail(a) === normalizeEmail(b);
+}
+
+// Marks the account's email verified when a provider vouches for that same
+// address (Google/Apple token with email_verified). Heals accounts created
+// before email_verified_at existed.
+async function markEmailVerifiedIfMatches(user, verifiedEmail) {
+  if (!user.email_verified_at && sameEmail(user.email, verifiedEmail)) {
+    await prisma.users.update({ where: { id: user.id }, data: { email_verified_at: new Date() } });
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
 // INTERNAL — processOnboarding
-// Saves all 10 onboarding answers and updates users table
+// Saves all 10 onboarding answers and updates users table, plus
+// the routine tasks picked in the wizard (routineTaskIds, BigInts).
 // Called inside register/google/apple after user is created
 // ─────────────────────────────────────────────────────────────
 
-async function processOnboarding(userId, answers) {
+async function processOnboarding(userId, answers, routineTaskIds = []) {
   if (!answers || answers.length === 0) return;
 
   // Validate all answers have questionId and answer
@@ -265,6 +303,21 @@ async function processOnboarding(userId, answers) {
     data:  userUpdates,
   });
 
+  // Routine tasks selected in the wizard — saved before today's tasks are
+  // assigned below, so the hunter starts with just those. None sent (an
+  // older app build) or none valid: every routine task on. Never fatal.
+  try {
+    try {
+      if (routineTaskIds.length === 0) throw new Error('NO_ROUTINE_TASKS');
+      await setUserRoutineTasks(bUserId, routineTaskIds, { syncToday: false });
+    } catch (err) {
+      if (err.message !== 'NO_ROUTINE_TASKS') throw err;
+      await selectAllRoutineTasks(bUserId, { syncToday: false });
+    }
+  } catch (err) {
+    logError(`Saving routine tasks on onboarding failed for user ${bUserId}: ${err.message}`);
+  }
+
   // Trigger B of the automatic task-assignment system (see
   // taskAssignmentService.js) — this is the one place all onboarding
   // flows (register, Google, Apple, completeOnboarding) funnel through,
@@ -277,15 +330,13 @@ async function processOnboarding(userId, answers) {
     logError(`Task assignment on onboarding failed for user ${bUserId}: ${err.message}`);
   }
 
-  // Referral payout — the referrer gets 50 XP once (and only once) the
-  // referred user finishes onboarding, not at signup. This is the same
-  // funnel point as the task-assignment trigger above, so it fires no
-  // matter which auth path (register/Google/Apple/completeOnboarding)
-  // got them here. xp_awarded on the referrals row makes this idempotent.
+  // Tell the inviter their friend made it through onboarding. Same funnel
+  // point as the task-assignment trigger above, so it fires whichever auth
+  // path got them here. Attribution only — referrals pay out no reward.
   try {
-    await awardReferralXpIfEligible(bUserId);
+    await notifyReferrerFriendJoined(bUserId);
   } catch (err) {
-    logError(`Referral XP payout failed for referred user ${bUserId}: ${err.message}`);
+    logError(`Friend-joined push failed for referred user ${bUserId}: ${err.message}`);
   }
   // Welcome push. Once per user (dedupe), however many times onboarding
   // is re-submitted. Shows in the inbox even before a device is registered.
@@ -303,62 +354,26 @@ async function processOnboarding(userId, answers) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// INTERNAL — awardReferralXpIfEligible
-// Pays the REFERRER 50 XP the moment the user they referred
-// completes onboarding. No-op if this user wasn't referred, or
-// the referral already got its XP.
+// INTERNAL — notifyReferrerFriendJoined
+// "Friend joined" push to whoever referred this user, once they
+// finish onboarding. No-op if this user wasn't referred; the
+// dedupe key keeps re-submitted onboarding from sending it twice.
 // ─────────────────────────────────────────────────────────────
 
-const REFERRAL_XP_REWARD = 50;
-
-async function awardReferralXpIfEligible(referredUserId) {
-  const referral = await prisma.referrals.findFirst({
-    where: { referred_id: referredUserId, xp_awarded: false },
+async function notifyReferrerFriendJoined(referredUserId) {
+  const friend = await prisma.users.findUnique({
+    where:  { id: referredUserId },
+    select: { name: true, referred_by: true },
   });
-  if (!referral) return;
+  if (!friend?.referred_by) return;
 
-  const paid = await prisma.$transaction(async (tx) => {
-    // Re-check inside the transaction so two concurrent onboarding
-    // completions for the same user can't double-pay the referrer.
-    const { count } = await tx.referrals.updateMany({
-      where: { id: referral.id, xp_awarded: false },
-      data:  { xp_awarded: true },
-    });
-    if (count === 0) return false;
-
-    await tx.xp_transactions.create({
-      data: {
-        user_id: referral.referrer_id,
-        amount:  REFERRAL_XP_REWARD,
-        reason:  'REFERRAL: invited friend completed onboarding',
-      },
-    });
-
-    await tx.user_progression.upsert({
-      where:  { user_id: referral.referrer_id },
-      create: { user_id: referral.referrer_id, total_xp: REFERRAL_XP_REWARD },
-      update: { total_xp: { increment: REFERRAL_XP_REWARD } },
-    });
-    // The bonus can cross a level: same level-up (push, cards, the app's
-    // level-up screen on next open) as XP from a quest.
-    await checkLevelUp(tx, referral.referrer_id, { xpEarned: REFERRAL_XP_REWARD });
-
-    // One push covers both "friend joined" and "referral reward earned" —
-    // the XP is paid at exactly the moment the friend becomes a hunter.
-    const friend = await tx.users.findUnique({ where: { id: referredUserId }, select: { name: true } });
-    await createNotification(
-      tx, referral.referrer_id, 'FRIEND_JOINED',
-      `⚔️ ${friend?.name || 'Your recruit'} answered your call`,
-      `Your Guest Pass recruit just became a hunter. +${REFERRAL_XP_REWARD} XP earned.`,
-      { event: 'FRIEND_JOINED', friend_id: referredUserId, xp: REFERRAL_XP_REWARD }
-    );
-
-    return true;
-  });
-
-  // Outside the transaction (it already committed) — the referrer's
-  // total_xp just moved, which can change their leaderboard standing.
-  if (paid) await syncLeaderboardMember(referral.referrer_id);
+  await createNotification(
+    prisma, friend.referred_by, 'FRIEND_JOINED',
+    `⚔️ ${friend.name || 'A friend'} answered your call`,
+    'A friend you invited just joined HunterX.',
+    { event: 'FRIEND_JOINED', friend_id: referredUserId },
+    { dedupeKey: `friend_joined:${referredUserId}` }
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -367,16 +382,13 @@ async function awardReferralXpIfEligible(referredUserId) {
 // Used by all three auth methods
 // ─────────────────────────────────────────────────────────────
 
-async function createBaseUser({ name, email, provider, providerId, passwordHash, referralCode }) {
+async function createBaseUser({ name, email, provider, providerId, passwordHash, referralCode, emailVerified = false }) {
   // Resolve the inviter's referral code, if one was passed in. A
-  // missing/invalid/unknown code is never fatal to signup — it just
-  // means this account isn't attributed to anyone.
-  let referrer = null;
-  if (typeof referralCode === 'string' && referralCode.trim()) {
-    referrer = await prisma.users.findUnique({
-      where: { referral_code: referralCode.trim().toUpperCase() },
-    });
-  }
+  // missing/invalid/unknown/banned code is never fatal to signup — it
+  // just means this account isn't attributed to anyone. Only brand-new
+  // accounts come through here, so the code can't be the user's own and
+  // they can't already have a referrer.
+  const referrer = await findActiveReferrer(referralCode);
 
   // One transaction: a failure part-way can't leave a user without its
   // auth_providers / user_progression rows.
@@ -386,8 +398,9 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
         hunter_id:     await generateHunterId(tx),
         name:          name?.trim() || 'Hunter',
         email:         normalizeEmail(email) || null,
+        email_verified_at: email && emailVerified ? new Date() : null,
         password_hash: passwordHash || null,
-        referral_code: generateReferralCode(),
+        referral_code: await generateUniqueReferralCode(tx),
         referred_by:   referrer?.id || null,
         role:          'USER',
       },
@@ -405,10 +418,7 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
       data: { user_id: user.id },
     });
 
-    // Record the referral. XP for the referrer is paid out later, once
-    // this new user actually completes onboarding (see processOnboarding)
-    // — not here — so a code can't be farmed for XP with throwaway
-    // accounts that never activate.
+    // Record the referral — attribution only, nothing is paid out.
     if (referrer) {
       await tx.referrals.create({
         data: {
@@ -426,12 +436,44 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
 // SEND OTP FOR EMAIL VERIFICATION
 // ─────────────────────────────────────────────────────────────
 
+// Sent instead of a code when the address already has an account, so
+// send-otp answers the same either way and can't be used to find out
+// which emails are registered — only the inbox owner learns it.
+function sendAccountExistsEmail(user) {
+  const pending = !!user.delete_at;
+  return sendMail({
+    to:      user.email,
+    subject: pending ? 'Your HunterX account is scheduled for deletion' : 'You already have a HunterX account',
+    html: brandedEmail({
+      heading: pending ? 'Your account is waiting to be deleted' : 'You already have an account',
+      paragraphs: pending
+        ? ['Someone tried to create a new HunterX account with this email. It already belongs to an account that is <strong style="color:#ffffff;">scheduled for deletion</strong>.',
+           'Log in to the app to see it, and tap <strong style="color:#ffffff;">Keep my account</strong> if you want to keep it.']
+        : ['Someone tried to create a new HunterX account with this email, but it already has one.',
+           'Open the app and log in instead. Forgot your password? Use <strong style="color:#ffffff;">Forgot password</strong> on the login screen.'],
+      note: 'If this wasn\'t you, you can ignore this email — nothing has changed.',
+    }),
+  });
+}
+
 export async function sendOtp(rawEmail) {
   const email = normalizeEmail(rawEmail);
 
-  // Step 1 — Check email not already registered
+  // One code a minute, ten a day per address — counted the same whether or
+  // not the address has an account.
+  if (!(await allowCodeEmail('signup', email))) throw new Error('OTP_COOLDOWN');
+
+  // Step 1 — An address that already has an account gets a notice instead
+  // of a code. The response is identical.
   const existing = await findUserByEmail(email);
-  if (existing) throw new Error('email is already exist');
+  if (existing) {
+    try {
+      await sendAccountExistsEmail(existing);
+    } catch (err) {
+      logError(`Account-exists notice to ${email} failed: ${err.message || err}`);
+    }
+    return true;
+  }
 
   // Step 2 — Generate 6 digit OTP
   const otp = generateOtp();
@@ -611,7 +653,7 @@ export async function verifyOtp(rawEmail, otp) {
 
   // Step 3 — Check OTP matches exactly. Every wrong guess counts; after
   // MAX_OTP_ATTEMPTS the code is dead and a new one must be requested.
-  if (record.otp !== otp.trim()) {
+  if (record.otp !== String(otp).trim()) {
     await prisma.email_otps.update({
       where: { id: record.id },
       data:  { attempts: { increment: 1 } },
@@ -633,7 +675,7 @@ export async function verifyOtp(rawEmail, otp) {
 // REGISTER WITH EMAIL AND PASSWORD
 // ─────────────────────────────────────────────────────────────
 
-export async function registerWithEmail(name, rawEmail, password, onboarding = [], referralCode = null) {
+export async function registerWithEmail(name, rawEmail, password, onboarding = [], referralCode = null, routineTaskIds = []) {
   const email = normalizeEmail(rawEmail);
 
   // Check OTP was verified for this email before allowing registration
@@ -656,7 +698,7 @@ export async function registerWithEmail(name, rawEmail, password, onboarding = [
   const salt         = await bcrypt.genSalt(12);
   const passwordHash = await bcrypt.hash(password, salt);
 
-  // Create user
+  // Create user — the OTP above proved the address
   const user = await createBaseUser({
     name,
     email,
@@ -664,17 +706,18 @@ export async function registerWithEmail(name, rawEmail, password, onboarding = [
     providerId:   email,
     passwordHash,
     referralCode,
+    emailVerified: true,
   });
 
   // Save onboarding answers and calculate profile fields
-  await processOnboarding(user.id, onboarding);
+  await processOnboarding(user.id, onboarding, routineTaskIds);
 
   // Fetch updated user after onboarding updates
   const updatedUser = await prisma.users.findUnique({
     where: { id: user.id },
   });
 
-  const tokens = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
+  const tokens = await issueSession(updatedUser);
 
   // Clean up OTP record — no longer needed after registration
   await prisma.email_otps.deleteMany({ where: { email } });
@@ -691,16 +734,23 @@ export async function registerWithEmail(name, rawEmail, password, onboarding = [
 // No onboarding — existing users go straight to home
 // ─────────────────────────────────────────────────────────────
 
-export async function loginWithEmail(email, password) {
-  const user = await findUserByEmail(normalizeEmail(email));
+export async function loginWithEmail(rawEmail, password) {
+  const email = normalizeEmail(rawEmail);
 
-  if (!user || !user.password_hash) throw new Error('INVALID_CREDENTIALS');
+  // Ten wrong passwords in 15 minutes locks the account's password login
+  // for the rest of that window, whichever IPs they came from.
+  if (await isLoginLocked(email)) throw new Error('LOGIN_LOCKED');
+
+  const user = await findUserByEmail(email);
+  const valid = await bcrypt.compare(String(password), user?.password_hash || DUMMY_PASSWORD_HASH);
+  if (!user || !user.password_hash || !valid) {
+    await recordLoginFailure(email);
+    throw new Error('INVALID_CREDENTIALS');
+  }
   if (user.is_banned) throw new Error('ACCOUNT_BANNED');
 
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) throw new Error('INVALID_CREDENTIALS');
-
-  const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
+  await clearLoginFailures(email);
+  const tokens = await issueSession(user);
 
   return {
     user:  sanitizeUser(user),
@@ -715,7 +765,7 @@ export async function loginWithEmail(email, password) {
 // Existing users — log in, skip onboarding
 // ─────────────────────────────────────────────────────────────
 
-export async function loginWithGoogle(idToken, onboarding = [], referralCode = null) {
+export async function loginWithGoogle(idToken, onboarding = [], referralCode = null, routineTaskIds = []) {
   if (GOOGLE_AUDIENCES.length === 0) throw new Error('GOOGLE_NOT_CONFIGURED');
 
   // Verify Google token — throws for expired/malformed/wrong-audience tokens
@@ -747,7 +797,8 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
       where: { id: existingProvider.user_id },
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
-    const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
+    await markEmailVerifiedIfMatches(user, email);
+    const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
 
@@ -756,6 +807,9 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
     const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
       if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
+      // Only into an account whose own email was proven: an address
+      // merely typed onto an account must not capture this sign-in.
+      if (!existingByEmail.email_verified_at) throw new Error('EMAIL_LINK_UNVERIFIED');
       // Link Google to existing account
       await prisma.auth_providers.create({
         data: {
@@ -766,9 +820,9 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
       });
       // Save onboarding if not yet done
       if (onboarding.length > 0 && !existingByEmail.onboarding_done) {
-        await processOnboarding(existingByEmail.id, onboarding);
+        await processOnboarding(existingByEmail.id, onboarding, routineTaskIds);
       }
-      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender, existingByEmail.token_version);
+      const tokens = await issueSession(existingByEmail);
       return { user: sanitizeUser(existingByEmail), ...tokens, isNew: false, linked: true };
     }
   }
@@ -780,12 +834,13 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
     provider:   'GOOGLE',
     providerId: googleId,
     referralCode,
+    emailVerified: !!email,
   });
 
-  await processOnboarding(user.id, onboarding);
+  await processOnboarding(user.id, onboarding, routineTaskIds);
 
   const updatedUser = await prisma.users.findUnique({ where: { id: user.id } });
-  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
+  const tokens      = await issueSession(updatedUser);
 
   return { user: sanitizeUser(updatedUser), ...tokens, isNew: true };
 }
@@ -796,7 +851,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
 // Name comes from onboarding Q1 answer — more reliable
 // ─────────────────────────────────────────────────────────────
 
-export async function loginWithApple(idToken, nonce, onboarding = [], referralCode = null) {
+export async function loginWithApple(idToken, nonce, onboarding = [], referralCode = null, routineTaskIds = []) {
   // Verify Apple token — throws for expired/malformed/wrong-audience tokens
   let appleUser;
   try {
@@ -824,7 +879,8 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
       where: { id: existingProvider.user_id },
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
-    const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
+    await markEmailVerifiedIfMatches(user, email);
+    const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
 
@@ -833,6 +889,7 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
     const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
       if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
+      if (!existingByEmail.email_verified_at) throw new Error('EMAIL_LINK_UNVERIFIED');
       await prisma.auth_providers.create({
         data: {
           user_id:     existingByEmail.id,
@@ -841,9 +898,9 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
         },
       });
       if (onboarding.length > 0 && !existingByEmail.onboarding_done) {
-        await processOnboarding(existingByEmail.id, onboarding);
+        await processOnboarding(existingByEmail.id, onboarding, routineTaskIds);
       }
-      const tokens = generateTokens(existingByEmail.id.toString(), existingByEmail.role, existingByEmail.gender, existingByEmail.token_version);
+      const tokens = await issueSession(existingByEmail);
       return { user: sanitizeUser(existingByEmail), ...tokens, isNew: false, linked: true };
     }
   }
@@ -859,12 +916,13 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
     provider:   'APPLE',
     providerId: appleId,
     referralCode,
+    emailVerified: !!email,
   });
 
-  await processOnboarding(user.id, onboarding);
+  await processOnboarding(user.id, onboarding, routineTaskIds);
 
   const updatedUser = await prisma.users.findUnique({ where: { id: user.id } });
-  const tokens      = generateTokens(updatedUser.id.toString(), updatedUser.role, updatedUser.gender, updatedUser.token_version);
+  const tokens      = await issueSession(updatedUser);
 
   return { user: sanitizeUser(updatedUser), ...tokens, isNew: true };
 }
@@ -874,19 +932,10 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
 // ─────────────────────────────────────────────────────────────
 
 export async function refreshAccessToken(refreshToken) {
-  const { verifyRefreshToken } = await import('../utils/helpers.js');
-  const decoded = verifyRefreshToken(refreshToken);
-
-  const userId = BigInt(decoded.userId);
-  const user = await prisma.users.findUnique({ where: { id: userId } });
-  if (!user)           throw new Error('USER_NOT_FOUND');
-  if (user.is_banned)  throw new Error('ACCOUNT_BANNED');
-  // Issued before the last password reset — revoked. Tokens minted before
-  // token_version existed carry no `tv` and count as version 0.
-  if ((decoded.tv ?? 0) !== user.token_version) throw new Error('TOKEN_REVOKED');
-
-  const tokens = generateTokens(user.id.toString(), user.role, user.gender, user.token_version);
-  return { user: sanitizeUser(user), ...tokens };
+  // Rotation, reuse detection and the token_version check live in
+  // sessionService.js.
+  const { user, accessToken, refreshToken: next } = await rotateSession(refreshToken);
+  return { user: sanitizeUser(user), accessToken, refreshToken: next };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1078,17 +1127,50 @@ export async function resetPassword(resetToken, newPassword) {
 
   // Update password, clear reset token, and revoke every refresh token
   // issued before now (signs out other devices — e.g. whoever had access).
-  await prisma.users.update({
-    where: { id: user.id },
-    data: {
-      password_hash:      newHash,
-      reset_token:        null,
-      reset_token_expiry: null,
-      token_version:      { increment: 1 },
-    },
-  });
+  // The reset link reached the inbox, so the address is proven too.
+  await prisma.$transaction([
+    prisma.users.update({
+      where: { id: user.id },
+      data: {
+        password_hash:      newHash,
+        reset_token:        null,
+        reset_token_expiry: null,
+        token_version:      { increment: 1 },
+        email_verified_at:  user.email_verified_at ?? new Date(),
+      },
+    }),
+    revokeAllSessions(user.id),
+  ]);
 
   return true;
+}
+
+// ─────────────────────────────────────────────────────────────
+// CHANGE PASSWORD (signed in)
+// Checks the current password, applies the new one, signs out every other
+// device (token_version + refresh-token revocation) and returns a fresh
+// pair for this one.
+// ─────────────────────────────────────────────────────────────
+
+export async function changePassword(userId, currentPassword, newPassword) {
+  const user = await prisma.users.findUnique({ where: { id: BigInt(userId) } });
+  if (!user) throw new Error('USER_NOT_FOUND');
+  if (!user.password_hash) throw new Error('NO_PASSWORD');
+
+  const valid = await bcrypt.compare(String(currentPassword ?? ''), user.password_hash);
+  if (!valid) throw new Error('INVALID_CURRENT_PASSWORD');
+  if (await bcrypt.compare(String(newPassword), user.password_hash)) throw new Error('SAME_PASSWORD');
+
+  const newHash = await bcrypt.hash(newPassword, 12);
+  const [updated] = await prisma.$transaction([
+    prisma.users.update({
+      where: { id: user.id },
+      data:  { password_hash: newHash, token_version: { increment: 1 }, updated_at: new Date() },
+    }),
+    revokeAllSessions(user.id),
+  ]);
+
+  return issueSession(updated);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1100,14 +1182,24 @@ export async function resetPassword(resetToken, newPassword) {
 // new one or issuing new tokens.
 // ─────────────────────────────────────────────────────────────
 
-export async function completeOnboarding(userId, onboarding = []) {
+export async function completeOnboarding(userId, onboarding = [], routineTaskIds = [], referralCode = null) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
 
   const user = await prisma.users.findUnique({ where: { id: bUserId } });
   if (!user) throw new Error('USER_NOT_FOUND');
   if (user.onboarding_done) throw new Error('ONBOARDING_ALREADY_DONE');
 
-  await processOnboarding(bUserId, onboarding);
+  // Before processOnboarding, so its friend-joined push reaches the inviter.
+  // Never fatal: a bad code just means no attribution.
+  if (referralCode && !user.referred_by) {
+    try {
+      await attachLateReferral(bUserId, referralCode);
+    } catch (err) {
+      logError(`Late referral failed for user ${bUserId}: ${err.message}`);
+    }
+  }
+
+  await processOnboarding(bUserId, onboarding, routineTaskIds);
 
   return getCurrentUser(bUserId);
 }
@@ -1148,6 +1240,9 @@ export async function getCurrentUser(userId) {
       oath_accepted:                 true,
       oath_accepted_at:              true,
       location_visible:              true,
+      email_verified_at:             true,
+      deletion_requested_at:         true,
+      delete_at:                     true,
       created_at:                    true,
       updated_at:                    true,
       user_progression:              true,
@@ -1161,9 +1256,17 @@ export async function getCurrentUser(userId) {
 
   if (!user) return null;
 
+<<<<<<< Updated upstream
   const { auth_providers, ...flatUser } = user;
+=======
+  const { auth_providers, ...rest } = user;
+  const flatUser = { ...rest, ...deletionStatus(user) };
+  flatUser.gender        = GENDER_LABELS[user.gender] ?? user.gender;
+>>>>>>> Stashed changes
   flatUser.auth_provider = auth_providers?.[0]?.provider || null;
   flatUser.week_status   = await getWeekStatus(bUserId);
+  // Display only — referrals carry no reward.
+  flatUser.accepted_invites_count = await countAcceptedInvites(bUserId);
 
   if (flatUser.user_progression) {
     const currentLvlNum = flatUser.user_progression.current_level || 1;
@@ -1260,23 +1363,13 @@ export async function updateUserProfile(userId, payload = {}) {
   const userUpdates = {};
   const { name, email, gender, birthday, date_of_birth, height, height_cm, weight, weight_kg, avatar_id } = payload;
 
-  // 0. Email
+  // 0. Email — changes only through the verified flow
+  // (requestEmailChange / confirmEmailChange). The current address is
+  // accepted unchanged so clients that echo it back keep working.
   if (email !== undefined && email !== null) {
     const normalizedEmail = String(email).trim().toLowerCase();
-    if (!isValidEmail(normalizedEmail)) {
-      throw new Error('INVALID_EMAIL');
-    }
-    if (currentUser.email !== normalizedEmail) {
-      const existingUser = await prisma.users.findFirst({
-        where: {
-          email: normalizedEmail,
-          id: { not: bUserId },
-        },
-      });
-      if (existingUser) {
-        throw new Error('EMAIL_EXISTS');
-      }
-      userUpdates.email = normalizedEmail;
+    if (!sameEmail(currentUser.email, normalizedEmail)) {
+      throw new Error('EMAIL_CHANGE_REQUIRES_VERIFICATION');
     }
   }
 
@@ -1508,56 +1601,86 @@ export async function updateUserAvatar(userId, avatarId) {
   return await getCurrentUser(bUserId);
 }
 
-// ── Update User Email ────────────────────────────────────────
-export async function updateUserEmail(userId, email) {
+// ── Change User Email ────────────────────────────────────────
+// Two steps, so an address can't be put on an account without proving it:
+//   1. requestEmailChange — re-checks the password (password accounts),
+//      emails a 6-digit code to the NEW address.
+//   2. confirmEmailChange — the code switches the email, marks it verified
+//      and tells the old address.
+
+export async function requestEmailChange(userId, rawEmail, currentPassword) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
 
-  if (!email || typeof email !== 'string') {
-    throw new Error('EMAIL_REQUIRED');
+  if (!rawEmail || typeof rawEmail !== 'string') throw new Error('EMAIL_REQUIRED');
+  const email = normalizeEmail(rawEmail);
+  if (!isValidEmail(email)) throw new Error('INVALID_EMAIL');
+
+  const user = await prisma.users.findUnique({ where: { id: bUserId } });
+  if (!user) throw new Error('USER_NOT_FOUND');
+  if (sameEmail(user.email, email)) throw new Error('EMAIL_UNCHANGED');
+
+  if (user.password_hash) {
+    if (!currentPassword) throw new Error('CURRENT_PASSWORD_REQUIRED');
+    if (!(await bcrypt.compare(String(currentPassword), user.password_hash))) throw new Error('INVALID_CURRENT_PASSWORD');
   }
 
-  const normalizedEmail = email.trim().toLowerCase();
+  const taken = await findUserByEmail(email);
+  if (taken && taken.id !== bUserId) throw new Error('EMAIL_EXISTS');
 
-  if (!isValidEmail(normalizedEmail)) {
-    throw new Error('INVALID_EMAIL');
+  if (!(await allowCodeEmail('email-change', email))) throw new Error('OTP_COOLDOWN');
+
+  const code = await createAccountOtp(bUserId, OTP_PURPOSES.EMAIL_CHANGE, email);
+  try {
+    await sendMail({
+      to:      email,
+      subject: 'Confirm your new HunterX email',
+      html: brandedEmail({
+        heading:    'Confirm your new email',
+        paragraphs: ['Enter this code in the app to make this address the email on your HunterX account.'],
+        code,
+        note:       'If you did not ask for this, ignore this email — nothing will change.',
+      }),
+    });
+  } catch (err) {
+    logError(`Email-change code to ${email} failed: ${err.message || err}`);
+    throw new Error('EMAIL_SEND_FAILED');
   }
+  return { email };
+}
 
-  const currentUser = await prisma.users.findUnique({
-    where: { id: bUserId },
-    select: { id: true, email: true },
-  });
+export async function confirmEmailChange(userId, rawEmail, otp) {
+  const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
+  const email = normalizeEmail(rawEmail);
+  if (!email || !isValidEmail(email)) throw new Error('INVALID_EMAIL');
 
-  if (!currentUser) {
-    throw new Error('USER_NOT_FOUND');
-  }
+  await consumeAccountOtp(bUserId, OTP_PURPOSES.EMAIL_CHANGE, otp, { email });
 
-  // If email is unchanged, return current user
-  if (currentUser.email === normalizedEmail) {
-    return await getCurrentUser(bUserId);
-  }
-
-  // Check if email is already taken by another user
-  const existingUser = await prisma.users.findFirst({
-    where: {
-      email: normalizedEmail,
-      id: { not: bUserId },
-    },
-  });
-
-  if (existingUser) {
-    throw new Error('EMAIL_EXISTS');
-  }
+  const before = await prisma.users.findUnique({ where: { id: bUserId }, select: { email: true } });
+  const taken = await findUserByEmail(email);
+  if (taken && taken.id !== bUserId) throw new Error('EMAIL_EXISTS');
 
   await prisma.users.update({
     where: { id: bUserId },
-    data: {
-      email: normalizedEmail,
-      updated_at: new Date(),
-    },
+    data:  { email, email_verified_at: new Date(), updated_at: new Date() },
   });
+
+  // The account's EMAIL sign-in identity follows the address.
+  await prisma.auth_providers.updateMany({
+    where: { user_id: bUserId, provider: 'EMAIL' },
+    data:  { provider_id: email },
+  });
+
+  if (before?.email) {
+    sendMail({
+      to:      before.email,
+      subject: 'Your HunterX email was changed',
+      html: brandedEmail({
+        heading:    'Your email was changed',
+        paragraphs: [`The email on your HunterX account is now <strong style="color:#ffffff;">${escapeHtml(email)}</strong>.`],
+        note:       'If you did not make this change, reply to support at once from the app\'s Send Feedback screen.',
+      }),
+    }).catch((err) => logError(`Email-changed notice to ${before.email} failed: ${err.message || err}`));
+  }
 
   return await getCurrentUser(bUserId);
 }
-
-
-

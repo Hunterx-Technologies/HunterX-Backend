@@ -20,7 +20,7 @@
 // `local` = getLocalTime(user timezone), `clock` = the job's clock (same as
 // `local` unless the job sets `timezone`) → { dateStr, weekday, hour, minute, minutesOfDay }.
 
-import cron from 'node-cron';
+import { scheduleJob } from './lock.js';
 import prisma from '../config/prisma.js';
 import { SCHEDULED_NOTIFICATION_JOBS } from '../services/scheduledNotificationJobs.js';
 import { isNotificationEnabled } from '../services/userSettingsService.js';
@@ -81,10 +81,6 @@ export async function runNotificationScheduler(now = new Date()) {
 
 // Fires at :00/:15/:30/:45 UTC — every whole-hour, :30 and :45 offset zone
 // lands on a local quarter-hour too.
-export const notificationSchedulerJob = cron.schedule('*/15 * * * *', () => {
-  runNotificationScheduler().catch((err) =>
-    logError(`Notification scheduler run crashed: ${err.message}`)
-  );
-});
+export const notificationSchedulerJob = scheduleJob('Notification scheduler', '*/15 * * * *', 14 * 60, runNotificationScheduler);
 
 export default notificationSchedulerJob;

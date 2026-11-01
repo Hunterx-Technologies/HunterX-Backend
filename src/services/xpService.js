@@ -20,8 +20,8 @@ import prisma from '../config/prisma.js';
 // user_progression.total_xp — `tx` is a Prisma transaction client,
 // `userId` is already a BigInt. `xpEarned` is the award that did it.
 // Every level-up is recorded in level_up_events, so the app shows its
-// screen once whatever paid the XP (a quest, an approved proof, a
-// referral) — straight from a completion response, or on next open.
+// screen once whatever paid the XP (a quest, an approved proof) —
+// straight from a completion response, or on next open.
 export async function checkLevelUp(tx, userId, { xpEarned = 0 } = {}) {
   const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
   if (!progression) return { leveledUp: false, rewards: [], levelUp: null };
@@ -119,7 +119,7 @@ async function buildLevelUp(tx, levelByNumber, { fromLevel, toLevel, totalXp, xp
 }
 
 // ── Level-ups the app hasn't shown (GET /api/users/me/level-up) ──
-// Several unseen ones (e.g. a proof approved, then a referral) become one
+// Several unseen ones (e.g. two proofs approved back to back) become one
 // screen: from the first one's old level to the highest level reached,
 // with their XP added up. Null when there's nothing to show.
 export async function getPendingLevelUp(userId) {

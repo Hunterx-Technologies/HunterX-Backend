@@ -26,8 +26,16 @@
 // task_purchases row, so a new end_date or price only applies to the
 // offer and to new buyers.
 //
-// DAILY_FIXED is not creatable or editable here — those 3 routine tasks are seed-managed
-// (prisma/seed.js) since every user gets exactly those three, every day.
+// Routine (tasks.is_routine) isn't set by hand: a free, recurring
+// DAILY_ADMIN task is a routine task. It joins the built-in routine tasks
+// in the hunter's Daily Routine (onboarding and Home > Add task): on by
+// default, and each hunter can turn it off. A one-time DAILY_ADMIN task
+// (the end date defaults to the start date) goes to everyone for its day;
+// a paid recurring one stays a locked offer that only buyers get. See
+// routineTaskService.js.
+//
+// DAILY_FIXED is not creatable or editable here — the built-in routine
+// tasks (sleep, water, protein, steps) are seed-managed (prisma/seed.js).
 
 import prisma from '../config/prisma.js';
 import { parseDateOnly, getISTDateOnly } from '../utils/helpers.js';
@@ -178,6 +186,8 @@ function buildTaskData(input, existing = null) {
     is_paid,
     price:            resolvedPrice,
     proof_count:      proofCount,
+    // Free recurring daily = routine (see the file comment).
+    is_routine:       task_type === 'DAILY_ADMIN' && is_recurring && !is_paid,
   };
 }
 
@@ -353,7 +363,6 @@ export async function createTask(adminId, body, files = {}) {
   const input = { allows_partial: false, is_paid: false, ...(body ?? {}) };
   const data = {
     ...buildTaskData(input),
-    is_default_daily: false,
     is_active:        true,
     created_by:       BigInt(adminId),
   };

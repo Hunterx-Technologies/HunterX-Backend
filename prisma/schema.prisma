@@ -550,6 +550,8 @@ model tasks {
   level_target       level_target         @default(ALL)
   is_recurring       Boolean              @default(false)
   is_default_daily   Boolean              @default(false)
+  /// Routine task: built-in, or a free recurring DAILY_ADMIN task (set by adminTaskService). On for every hunter unless they turned it off (user_routine_tasks.selected = false).
+  is_routine         Boolean              @default(false)
   recurrence_days    Int[]                @default([])
   start_date         DateTime?            @db.Date // admin-created DAILY_ADMIN/WEEKLY tasks: first date this task is assignable (can be future-dated)
   end_date           DateTime?            @db.Date // last date this task is assignable — is_recurring=false: same as start_date (DAILY_ADMIN), start_date+6 (WEEKLY) or start_date+29 (MONTHLY) unless admin-set; is_recurring=true: admin-set or null (no end). For paid tasks start..end is when the locked offer is shown; a buyer's access runs from their purchase day to end_date, and the nightly cron deactivates the task once end_date has passed
@@ -571,9 +573,26 @@ model tasks {
   special_reward_id  BigInt?
   reward_triggers    reward_triggers?     @relation(fields: [special_reward_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
   xp_transactions    xp_transactions[]
+  user_routine_tasks user_routine_tasks[]
 
   @@index([special_reward_id], map: "idx_tasks_special_reward", where: raw("(special_reward_id IS NOT NULL)"))
   @@index([task_type, is_active, start_date, end_date], map: "idx_tasks_type_active_window")
+}
+
+/// A hunter's choice for each routine task (tasks.is_routine), set during
+/// onboarding and from Home > Add task. A routine task is assigned unless
+/// selected = false; no row (e.g. a routine task added later) = on.
+model user_routine_tasks {
+  user_id    BigInt
+  task_id    BigInt
+  selected   Boolean   @default(true)
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  updated_at DateTime? @default(now()) @db.Timestamp(6)
+  users      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  tasks      tasks     @relation(fields: [task_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@id([user_id, task_id])
+  @@index([task_id], map: "idx_user_routine_tasks_task")
 }
 
 model user_badges {
@@ -751,11 +770,21 @@ model users {
   reset_token                                             String?                    @db.VarChar(255)
   reset_token_expiry                                      DateTime?                  @db.Timestamp(6)
   token_version                                           Int                        @default(0) // bumped on password reset — invalidates older refresh tokens
+  /// When the account's email was last proven to belong to its owner. Google/Apple sign-in only links into an account whose email is verified.
+  email_verified_at                                       DateTime?                  @db.Timestamp(6)
+  /// Account deletion: set = scheduled; the hourly purge deletes the account once delete_at passes.
+  deletion_requested_at                                   DateTime?                  @db.Timestamp(6)
+  delete_at                                               DateTime?                  @db.Timestamp(6)
+  /// SHA-256 of the one-time website deletion link (10 minutes).
+  deletion_token_hash                                     String?                    @unique @db.VarChar(64)
+  deletion_token_expiry                                   DateTime?                  @db.Timestamp(6)
   oath_accepted                                          Boolean                    @default(false)
   oath_accepted_at                                        DateTime?                  @db.Timestamp(6)
   created_at                                              DateTime?                  @default(now()) @db.Timestamp(6)
   updated_at                                              DateTime?                  @default(now()) @db.Timestamp(6)
   app_ratings                                             app_ratings?
+  account_otps                                            account_otps[]
+  refresh_tokens                                          refresh_tokens[]
   auth_providers                                          auth_providers[]
   data_export_requests                                    data_export_requests[]
   discovery_matches_discovery_matches_unmatched_byTousers discovery_matches[]        @relation("discovery_matches_unmatched_byTousers")
@@ -786,6 +815,7 @@ model users {
   user_progression                                        user_progression?
   user_settings                                           user_settings?
   user_rewards                                            user_rewards[]
+  user_routine_tasks                                      user_routine_tasks[]
   user_streak_milestones                                  user_streak_milestones[]
   dragon_stages                                           dragon_stages              @relation(fields: [dragon_stage], references: [stage_number], onDelete: NoAction, onUpdate: NoAction, map: "fk_users_dragon_stage")
   avatars                                                 avatars?                   @relation(fields: [avatar_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
@@ -802,6 +832,7 @@ model users {
   @@index([last_latitude, last_longitude], map: "idx_users_location", where: raw("(location_visible = true)"))
   @@index([referral_code], map: "idx_users_referral_code")
   @@index([referred_by], map: "idx_users_referred_by")
+  @@index([delete_at], map: "idx_users_delete_at", where: raw("(delete_at IS NOT NULL)"))
 }
 
 // Audit trail of admin moderation actions on a user (ban / unban / streak
@@ -834,6 +865,37 @@ model xp_transactions {
 
   @@index([created_at], map: "idx_xp_created_at")
   @@index([user_id], map: "idx_xp_user_id")
+}
+
+/// One-time codes bound to an account (email change, website deletion / cancellation). Only the SHA-256 of the code is stored.
+model account_otps {
+  id         BigInt    @id @default(autoincrement())
+  user_id    BigInt
+  purpose    String    @db.VarChar(32)
+  email      String    @db.VarChar(255)
+  otp_hash   String    @db.VarChar(64)
+  attempts   Int       @default(0)
+  expires_at DateTime  @db.Timestamp(6)
+  created_at DateTime? @default(now()) @db.Timestamp(6)
+  users      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id, purpose], map: "idx_account_otps_user_purpose")
+}
+
+/// One row per issued refresh token. Rotation revokes the old row; replaying a revoked token revokes its family.
+model refresh_tokens {
+  jti         String    @id @db.VarChar(64)
+  user_id     BigInt
+  family_id   String    @db.VarChar(64)
+  expires_at  DateTime  @db.Timestamp(6)
+  revoked_at  DateTime? @db.Timestamp(6)
+  replaced_by String?   @db.VarChar(64)
+  created_at  DateTime? @default(now()) @db.Timestamp(6)
+  users       users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([user_id], map: "idx_refresh_tokens_user")
+  @@index([family_id], map: "idx_refresh_tokens_family")
+  @@index([expires_at], map: "idx_refresh_tokens_expires")
 }
 
 model email_otps {

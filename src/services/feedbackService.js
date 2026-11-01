@@ -5,6 +5,7 @@
 // user sees back.
 
 import prisma            from '../config/prisma.js';
+import { ownPublicIdFromUrl } from './imageUploadService.js';
 import { notifyFeedback } from './discordService.js';
 import { createNotification } from './notificationService.js';
 import { logError }       from '../utils/logger.js';
@@ -47,12 +48,16 @@ export async function submitFeedback(user, { category, message, attachmentUrl, a
     throw new Error('MESSAGE_TOO_LONG');
   }
 
+  const bUserId = typeof user.id === 'bigint' ? user.id : BigInt(user.id);
+
+  // Only a screenshot this user uploaded through the app (signed upload,
+  // folder 'misc' → hunterx/misc/<userId>/...) — never an arbitrary URL
+  // that would load in Discord and the admin panel.
   if (attachmentUrl &&
-      (typeof attachmentUrl !== 'string' || attachmentUrl.length > 500 || !/^https:\/\//.test(attachmentUrl))) {
+      (typeof attachmentUrl !== 'string' || attachmentUrl.length > 500 ||
+       !ownPublicIdFromUrl(attachmentUrl, `hunterx/misc/${bUserId}`))) {
     throw new Error('INVALID_ATTACHMENT_URL');
   }
-
-  const bUserId = typeof user.id === 'bigint' ? user.id : BigInt(user.id);
 
   const progression = await prisma.user_progression.findUnique({
     where:  { user_id: bUserId },

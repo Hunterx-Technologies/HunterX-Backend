@@ -21,7 +21,7 @@
 // see the version of this file before this change for that
 // implementation (checkDrift/DRIFT_REBUILD_THRESHOLD) to resurrect.
 
-import cron from 'node-cron';
+import { scheduleJob } from './lock.js';
 import redis, { isRedisUp } from '../config/redis.js';
 import { info, logError } from '../utils/logger.js';
 import { REDIS_KEYS } from '../config/leaderboardConfig.js';
@@ -61,8 +61,6 @@ export async function runLeaderboardNightlyJob() {
 }
 
 // 30 21 * * * = 03:00 IST
-export const leaderboardNightlyJob = cron.schedule('30 21 * * *', () => {
-  runLeaderboardNightlyJob();
-});
+export const leaderboardNightlyJob = scheduleJob('Leaderboard nightly', '30 21 * * *', 60 * 60, runLeaderboardNightlyJob);
 
 export default leaderboardNightlyJob;

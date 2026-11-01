@@ -42,6 +42,20 @@ export const leaderboardLimiter = rateLimit({
   },
 });
 
+// Public referral-code lookup — 20/min per IP. Unauthenticated, so this
+// is what stops anyone enumerating codes (and inviter names).
+export const referralLookupLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: {
+    success: false,
+    message: 'Too many invite lookups. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many invite lookups. Try again in a moment.' },
+  },
+});
+
 // Rewards writes (seen / scratch / use) — 30/min per user. Scratch is
 // idempotent anyway; this just keeps a stuck retry loop from hammering
 // the row locks.
@@ -55,5 +69,46 @@ export const rewardLimiter = rateLimit({
     success: false,
     message: 'Too many reward requests. Try again in a moment.',
     error:   { code: 'RATE_LIMITED', message: 'Too many reward requests. Try again in a moment.' },
+  },
+});
+
+// Token refresh — 60 per 15 minutes per IP. A healthy client refreshes
+// about every 15 minutes per device.
+export const refreshLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: process.env.NODE_ENV === 'development' ? 1000 : 60,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: {
+    success: false,
+    message: 'Too many requests. Try again later.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many requests. Try again later.' },
+  },
+});
+
+// Public account-deletion endpoints (website) — 10/min per IP.
+export const accountDeletionLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  message: {
+    success: false,
+    message: 'Too many attempts. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many attempts. Try again in a moment.' },
+  },
+});
+
+// Upload signatures — 30/min per user.
+export const uploadLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator: (req) => req.user?.id?.toString() || req.ip,
+  message: {
+    success: false,
+    message: 'Too many uploads. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many uploads. Try again in a moment.' },
   },
 });

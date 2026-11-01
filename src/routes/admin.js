@@ -116,7 +116,7 @@ const TASK_ERRORS = {
   SPECIAL_REWARD_LOCKED:         "Hunters have already received this task's special reward, so it can't be changed or removed — switch the reward off instead",
   END_DATE_IN_PAST:              'end_date cannot be in the past',
   TASK_HAS_BUYERS:               'This task has buyers, so it cannot be changed from paid to free',
-  TASK_NOT_EDITABLE:             'Routine (DAILY_FIXED) tasks are seed-managed and cannot be edited here',
+  TASK_NOT_EDITABLE:             'Built-in routine tasks (DAILY_FIXED) are seed-managed and cannot be edited here',
 };
 
 // ── GET /api/admin/tasks ──────────────────────────────────

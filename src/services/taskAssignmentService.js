@@ -21,9 +21,11 @@ import prisma from '../config/prisma.js';
 // passes them in, instead of re-querying both per user.
 export async function loadSharedTasks(date) {
   const [routine, adminDated] = await Promise.all([
-    // 1. Routine daily tasks — same 3 tasks, every user, every day, no exceptions.
+    // 1. Routine tasks (tasks.is_routine) — every active one in its date
+    //    window (the built-in ones have none; admin ones marked routine
+    //    do); assignDailyTasks keeps only the ones each user selected.
     prisma.tasks.findMany({
-      where: { is_active: true, is_default_daily: true },
+      where: routineTaskWhere(date),
       select: { id: true },
     }),
     // 2. Admin-created free DAILY_ADMIN / WEEKLY / MONTHLY tasks whose
@@ -37,6 +39,8 @@ export async function loadSharedTasks(date) {
       where: {
         is_active:  true,
         is_paid:    false,
+        // Routine-marked admin tasks come through (1) instead — optional.
+        is_routine: false,
         task_type:  { in: ['DAILY_ADMIN', 'WEEKLY', 'MONTHLY'] },
         start_date: { lte: date },
         OR: [{ end_date: { gte: date } }, { end_date: null }],
@@ -48,6 +52,32 @@ export async function loadSharedTasks(date) {
     }),
   ]);
   return { routine, adminDated };
+}
+
+// Routine tasks live on `date`: active, flagged is_routine and inside
+// their [start_date, end_date] window, where one is set.
+export function routineTaskWhere(date) {
+  return {
+    is_active:  true,
+    is_routine: true,
+    AND: [
+      { OR: [{ start_date: null }, { start_date: { lte: date } }] },
+      { OR: [{ end_date: null }, { end_date: { gte: date } }] },
+    ],
+  };
+}
+
+// The routine task ids a user does, out of `activeIds` (active routine
+// task ids): every one they haven't turned off (user_routine_tasks.selected
+// = false, see routineTaskService.js). No row = on, so a new routine task
+// reaches everyone until they turn it off.
+export async function selectedRoutineIds(userId, activeIds, client = prisma) {
+  const turnedOff = await client.user_routine_tasks.findMany({
+    where:  { user_id: userId, selected: false },
+    select: { task_id: true },
+  });
+  const off = new Set(turnedOff.map((p) => p.task_id));
+  return activeIds.filter((id) => !off.has(id));
 }
 
 // date is a UTC-midnight Date representing an IST calendar day — same
@@ -74,6 +104,9 @@ export async function assignDailyTasks(userId, date, shared = null) {
     }),
   ]);
 
+  // The routine tasks this user hasn't turned off.
+  const routineIds = await selectedRoutineIds(bUserId, routine.map(t => t.id));
+
   const purchasedIds = purchased.map(p => p.task_id);
 
   const eligibleAdminIds = adminDated
@@ -81,7 +114,7 @@ export async function assignDailyTasks(userId, date, shared = null) {
     .map(t => t.id);
 
   const taskIds = [
-    ...routine.map(t => t.id),
+    ...routineIds,
     ...eligibleAdminIds,
     ...purchasedIds,
   ];

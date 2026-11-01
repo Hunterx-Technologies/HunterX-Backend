@@ -10,7 +10,7 @@
 // Safe to re-run / overlap with the request-time fallback (trigger C) —
 // assignDailyTasks() is idempotent per user/date.
 
-import cron from 'node-cron';
+import { scheduleJob } from './lock.js';
 import prisma from '../config/prisma.js';
 import { assignDailyTasks, loadSharedTasks } from '../services/taskAssignmentService.js';
 import { deactivateExpiredPaidTasks } from '../services/taskPurchaseService.js';
@@ -148,10 +148,6 @@ export async function runNightlyTaskAssignment() {
 }
 
 // Cron schedule: 0 19 * * * corresponding to 00:30 IST (19:00 UTC)
-export const midnightJob = cron.schedule('0 19 * * *', () => {
-  runNightlyTaskAssignment().catch(err =>
-    logError(`Nightly task assignment run crashed: ${err.message}`)
-  );
-});
+export const midnightJob = scheduleJob('Nightly task assignment', '0 19 * * *', 2 * 60 * 60, runNightlyTaskAssignment);
 
 export default midnightJob;

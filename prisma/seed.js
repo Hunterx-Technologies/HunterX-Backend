@@ -42,6 +42,7 @@ const DAILY_TASKS = [
     level_target:      'ALL',
     is_recurring:      true,
     is_default_daily:  true,
+    is_routine:        true, // optional per hunter (user_routine_tasks.selected)
     is_active:         true,
     image_url:         'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861237/hunterx/app-assets/sleep.jpg',
     image_url_male:    'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861237/hunterx/app-assets/sleep.jpg',
@@ -65,6 +66,7 @@ const DAILY_TASKS = [
     level_target:      'ALL',
     is_recurring:      true,
     is_default_daily:  true,
+    is_routine:        true, // optional per hunter (user_routine_tasks.selected)
     is_active:         true,
     image_url:         'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861238/hunterx/app-assets/threelitterwater.jpg',
     image_url_male:    'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861238/hunterx/app-assets/threelitterwater.jpg',
@@ -83,6 +85,7 @@ const DAILY_TASKS = [
     level_target:      'ALL',
     is_recurring:      true,
     is_default_daily:  true,
+    is_routine:        true, // optional per hunter (user_routine_tasks.selected)
     is_active:         true,
     image_url:         'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861229/hunterx/app-assets/nutrition.jpg',
     image_url_male:    'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1787861229/hunterx/app-assets/nutrition.jpg',
@@ -101,6 +104,7 @@ const DAILY_TASKS = [
     level_target:      'ALL',
     is_recurring:      true,
     is_default_daily:  true,
+    is_routine:        true, // optional per hunter (user_routine_tasks.selected)
     is_active:         true,
     image_url:         'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1789321894/hunterx/app-assets/steps.jpg',
     image_url_male:    'https://res.cloudinary.com/sc8zzixt/image/upload/f_auto,q_auto/v1789321894/hunterx/app-assets/steps.jpg',

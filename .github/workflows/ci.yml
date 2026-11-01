@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Prisma schema
+        run: npx prisma validate && npx prisma generate
+      - name: Syntax check
+        run: find src scripts prisma -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Tests
+        run: npm test
+      # Fails on critical advisories in production dependencies.
+      - name: Dependency audit
+        run: npm audit --omit=dev --audit-level=critical

@@ -13,6 +13,9 @@ import feedbackRouter from './feedback.js';
 import leaderboardRouter from './leaderboard.js';
 import notificationsRouter from './notifications.js';
 import rewardsRouter from './rewards.js';
+import publicRouter from './public.js';
+import referralsRouter from './referrals.js';
+import accountRouter from './account.js';
 
 const router = Router();
 
@@ -66,6 +69,15 @@ router.use('/notifications', notificationsRouter);
 
 // Reward wallet + streak scratch cards
 router.use('/rewards', rewardsRouter);
+
+// Unauthenticated lookups (invite landing pages, signup)
+router.use('/public', publicRouter);
+
+// The signed-in hunter's invites (who joined with their code)
+router.use('/referrals', referralsRouter);
+
+// Account deletion (one-time website link, "Keep my account")
+router.use('/account', accountRouter);
 
 export default router;
 

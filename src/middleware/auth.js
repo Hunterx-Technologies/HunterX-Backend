@@ -26,11 +26,14 @@ export async function verifyToken(req, res, next) {
         name:     true,
         email:    true,
         gender:   true,
+        delete_at: true,
       },
     });
 
-    if (!user) {
-      return error(res, 'Unauthorized — user not found', 401);
+    // Deleted, or past its scheduled deletion and waiting for the hourly
+    // purge — the app signs out and says the account is gone.
+    if (!user || (user.delete_at && user.delete_at <= new Date())) {
+      return error(res, 'Unauthorized — user not found', 401, 'ACCOUNT_NOT_FOUND');
     }
 
     if (user.is_banned) {

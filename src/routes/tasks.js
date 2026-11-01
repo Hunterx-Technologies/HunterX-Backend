@@ -1,12 +1,52 @@
 // src/routes/tasks.js — Daily routine + weekly quest endpoints for the logged-in user
 
 import { Router }         from 'express';
+import { blockPendingDeletion } from '../middleware/pendingDeletion.js';
 import { verifyToken }    from '../middleware/auth.js';
 import { success, error } from '../utils/response.js';
 import * as taskService   from '../services/taskService.js';
 import * as streakService from '../services/streakService.js';
+import * as routineTaskService from '../services/routineTaskService.js';
 
 const router = Router();
+
+// ── GET /api/tasks/routine ────────────────────────────────
+// Every routine task (sleep, water, protein, steps), each marked
+// `selected` if it's on this hunter's daily list. Backs Home's
+// "Add task" picker.
+// Header: Authorization: Bearer <access_token>
+
+router.get('/routine', verifyToken, async (req, res, next) => {
+  try {
+    const tasks = await routineTaskService.getUserRoutineTasks(req.user.id, req.user.gender);
+    return success(res, { tasks }, 'Routine tasks fetched');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── PUT /api/tasks/routine ────────────────────────────────
+// Replace this hunter's routine tasks. Added tasks show up in today's
+// list straight away; removed ones leave it unless already acted on
+// today. Weekly / monthly / admin tasks aren't affected.
+// Header: Authorization: Bearer <access_token>
+// Body: { task_ids: string[] } — at least one routine task
+
+router.put('/routine', verifyToken, async (req, res, next) => {
+  try {
+    const taskIds = routineTaskService.parseRoutineTaskIds(req.body?.task_ids ?? req.body?.taskIds);
+    if (!taskIds || taskIds.length === 0)
+      return error(res, 'task_ids must list at least one routine task', 400, 'NO_ROUTINE_TASKS');
+
+    await routineTaskService.setUserRoutineTasks(req.user.id, taskIds);
+    const tasks = await routineTaskService.getUserRoutineTasks(req.user.id, req.user.gender);
+    return success(res, { tasks }, 'Routine tasks updated');
+  } catch (err) {
+    if (err.message === 'NO_ROUTINE_TASKS')
+      return error(res, 'Pick at least one routine task', 400, 'NO_ROUTINE_TASKS');
+    next(err);
+  }
+});
 
 // ── GET /api/tasks/today ──────────────────────────────────
 // Daily routine tasks + this week's weekly quests for the
@@ -51,7 +91,7 @@ router.get('/today', verifyToken, async (req, res, next) => {
 // status, not scaled off it. SKIPPED never earns XP and never extends
 // the daily streak — see taskService.js#setTaskCompletion.)
 
-router.put('/:taskId/complete', verifyToken, async (req, res, next) => {
+router.put('/:taskId/complete', verifyToken, blockPendingDeletion, async (req, res, next) => {
   try {
     const { taskId } = req.params;
     const { status, progress_value } = req.body;
@@ -121,7 +161,7 @@ function proofError(res, err) {
 // streak_milestone, ... }. Errors carry error.code: INVALID_PROOF,
 // PROOF_NOT_REQUIRED, TASK_IN_REVIEW (409), TASK_PROOF_REJECTED (409),
 // TASK_ALREADY_COMPLETED.
-router.post('/:taskId/proof', verifyToken, async (req, res, next) => {
+router.post('/:taskId/proof', verifyToken, blockPendingDeletion, async (req, res, next) => {
   try {
     if (!/^\d+$/.test(String(req.params.taskId))) return error(res, 'Invalid task id', 400);
     const result = await taskService.submitTaskProof(req.user.id, req.params.taskId, req.body?.proof_urls);
@@ -146,7 +186,7 @@ router.post('/:taskId/proof', verifyToken, async (req, res, next) => {
 // the first place.
 // Header: Authorization: Bearer <access_token>
 
-router.put('/:taskId/reopen', verifyToken, async (req, res, next) => {
+router.put('/:taskId/reopen', verifyToken, blockPendingDeletion, async (req, res, next) => {
   try {
     const { taskId } = req.params;
 

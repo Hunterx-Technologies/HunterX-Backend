@@ -6,13 +6,17 @@
 //
 // Flow:
 //   1. Client: POST /api/media/signature { folder: 'avatars' }
-//   2. Us:     sign { timestamp, folder } with the API secret, return it
-//              alongside cloudName + apiKey (both public, not secret)
+//   2. Us:     sign { allowed_formats, folder, timestamp } with the API
+//              secret, return it alongside cloudName + apiKey (both
+//              public, not secret)
 //   3. Client: POST https://api.cloudinary.com/v1_1/<cloudName>/image/upload
-//              with { file, api_key, timestamp, signature, folder }
+//              with { file, api_key, timestamp, signature, folder,
+//              allowed_formats } — every signed param must be sent as-is,
+//              so the signature only works for image files in that folder.
 
 import { Router }         from 'express';
 import { verifyToken }    from '../middleware/auth.js';
+import { uploadLimiter }  from '../middleware/rateLimiter.js';
 import { success, error } from '../utils/response.js';
 import cloudinary          from '../config/cloudinary.js';
 
@@ -22,12 +26,17 @@ const router = Router();
 // arbitrary/unbounded path on our Cloudinary account.
 const ALLOWED_FOLDERS = ['avatars', 'guest-pass', 'task-proof', 'misc'];
 
+// Image formats the app uploads (photo library picks, screenshots, view
+// captures). Signed, so Cloudinary rejects anything else under this
+// signature — no video, PDF, HTML or other raw files.
+const ALLOWED_FORMATS = 'jpg,jpeg,png,webp,heic,heif';
+
 // ── POST /api/media/signature ─────────────────────────────
 // Body: { folder?: 'avatars' | 'guest-pass' | 'task-proof' | 'misc' }
 // (defaults to 'misc' if omitted)
 // Header: Authorization: Bearer <access_token>
 
-router.post('/signature', verifyToken, async (req, res, next) => {
+router.post('/signature', verifyToken, uploadLimiter, async (req, res, next) => {
   try {
     const folderInput = req.body?.folder || 'misc';
 
@@ -39,7 +48,7 @@ router.post('/signature', verifyToken, async (req, res, next) => {
     const timestamp = Math.round(Date.now() / 1000);
 
     const signature = cloudinary.utils.api_sign_request(
-      { timestamp, folder },
+      { timestamp, folder, allowed_formats: ALLOWED_FORMATS },
       process.env.CLOUDINARY_API_SECRET
     );
 
@@ -47,6 +56,7 @@ router.post('/signature', verifyToken, async (req, res, next) => {
       timestamp,
       signature,
       folder,
+      allowedFormats: ALLOWED_FORMATS,
       apiKey:    process.env.CLOUDINARY_API_KEY,
       cloudName: process.env.CLOUDINARY_CLOUD_NAME,
     }, 'Signature issued');

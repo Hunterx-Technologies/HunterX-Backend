@@ -21,6 +21,7 @@ import './cron/midnight.js';           // starts the nightly task-assignment cro
 import './cron/leaderboardNightly.js'; // starts the nightly leaderboard rebuild cron
 import './cron/pushDispatcher.js';     // starts push outbox delivery + receipt checks
 import './cron/notificationScheduler.js'; // starts local-time scheduled notifications
+import './cron/accountDeletion.js';   // starts the hourly scheduled-deletion purge
 
 const app  = express();
 const PORT = process.env.PORT || 5000;
@@ -34,7 +35,15 @@ app.set('trust proxy', 1);
 
 // Middleware
 app.use(helmet());
-app.use(cors({ origin: '*' }));
+// CORS_ORIGINS: comma-separated browser origins allowed to call the API
+// (the admin panel, the website's delete-account page). The mobile app
+// sends no Origin and is unaffected. Unset = any origin, as before — the
+// API uses bearer tokens, not cookies, so this is defence in depth.
+const corsOrigins = (process.env.CORS_ORIGINS || '').split(',').map((o) => o.trim()).filter(Boolean);
+if (corsOrigins.length === 0 && isProduction) {
+  logError('CORS_ORIGINS is not set — allowing every origin. Set it to the admin and website origins.');
+}
+app.use(cors({ origin: corsOrigins.length > 0 ? corsOrigins : '*' }));
 app.use(morgan(isProduction ? 'combined' : 'dev'));
 app.use(express.json({ limit: '100kb' }));
 app.use(express.urlencoded({ extended: true }));

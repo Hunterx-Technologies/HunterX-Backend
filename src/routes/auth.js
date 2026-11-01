@@ -1,7 +1,7 @@
 // src/routes/auth.js — All auth and onboarding endpoints
 
 import { Router }         from 'express';
-import { authLimiter }    from '../middleware/rateLimiter.js';
+import { authLimiter, refreshLimiter } from '../middleware/rateLimiter.js';
 import { verifyToken }    from '../middleware/auth.js';
 import { success, error } from '../utils/response.js';
 import {
@@ -10,12 +10,29 @@ import {
   isStrongPassword,
 } from '../utils/helpers.js';
 import * as authService   from '../services/authService.js';
+import { parseRoutineTaskIds } from '../services/routineTaskService.js';
+import { revokeSession }  from '../services/sessionService.js';
+import { handleEmailChange } from './emailChange.js';
+
+// Same rules everywhere a password is set (register, reset, change).
+function passwordRulesError(res, password) {
+  const { valid, errors } = isStrongPassword(password);
+  if (valid) return null;
+  return res.status(400).json({
+    success: false,
+    message: 'Password does not meet requirements',
+    errors,
+    error:   { code: 'WEAK_PASSWORD', message: 'Password does not meet requirements' },
+  });
+}
 
 const router = Router();
 
 // ── POST /api/auth/send-otp ───────────────────────────────
 // OTP for email + password registration only
-// Google and Apple users skip this entirely
+// Google and Apple users skip this entirely. The response is the same
+// whether or not the email already has an account (that address gets a
+// "you already have an account" email instead of a code).
 
 router.post('/send-otp', authLimiter, async (req, res, next) => {
   try {
@@ -33,8 +50,8 @@ router.post('/send-otp', authLimiter, async (req, res, next) => {
       'Verification code sent to your email. It expires in 10 minutes.');
 
   } catch (err) {
-    if (err.message === 'email is already exist' || err.message === 'EMAIL_EXISTS')
-      return error(res, 'email is already exist', 400);
+    if (err.message === 'OTP_COOLDOWN')
+      return error(res, 'Please wait a minute before requesting another code.', 429, 'OTP_COOLDOWN');
     next(err);
   }
 });
@@ -51,7 +68,7 @@ router.post('/verify-otp', authLimiter, async (req, res, next) => {
     if (!isValidEmail(email))
       return error(res, 'Invalid email format', 400);
 
-    if (!otp)
+    if (!otp || typeof otp !== 'string')
       return error(res, 'Verification code is required', 400);
 
     if (!/^\d{6}$/.test(otp.trim()))
@@ -72,11 +89,15 @@ router.post('/verify-otp', authLimiter, async (req, res, next) => {
 // ── POST /api/auth/register ───────────────────────────────
 // Creates account with email + password
 // Saves all onboarding answers in same call
-// Body: { name, email, password, onboarding[], referral_code? }
+// Body: { name, email, password, onboarding[], referral_code?, routine_task_ids? } (or camelCase)
 
 router.post('/register', authLimiter, async (req, res, next) => {
   try {
-    const { name, email, password, onboarding = [], referral_code } = req.body;
+    const { name, email, password, onboarding = [] } = req.body;
+    const referral_code = req.body.referral_code ?? req.body.referralCode;
+    const routineTaskIds = parseRoutineTaskIds(req.body.routine_task_ids ?? req.body.routineTaskIds);
+    if (!routineTaskIds)
+      return error(res, 'routine_task_ids must be a list of task ids', 400);
 
     // Validate required fields
     if (!name?.trim())
@@ -89,6 +110,8 @@ router.post('/register', authLimiter, async (req, res, next) => {
       return error(res, 'Secret Key (password) is required', 400);
     if (!isValidPassword(password))
       return error(res, 'Secret Key must be at least 8 characters', 400);
+    const weak = passwordRulesError(res, password);
+    if (weak) return weak;
 
     // Validate onboarding array if provided
     if (onboarding.length > 0) {
@@ -103,7 +126,7 @@ router.post('/register', authLimiter, async (req, res, next) => {
     }
 
     const result = await authService.registerWithEmail(
-      name, email, password, onboarding, referral_code
+      name, email, password, onboarding, referral_code, routineTaskIds
     );
 
     return success(res, {
@@ -149,6 +172,8 @@ router.post('/login', authLimiter, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'INVALID_CREDENTIALS')
       return error(res, 'Invalid email or password', 401);
+    if (err.message === 'LOGIN_LOCKED')
+      return error(res, 'Too many failed attempts. Try again in 15 minutes or reset your password.', 429, 'LOGIN_LOCKED');
     if (err.message === 'ACCOUNT_BANNED')
       return error(res, 'Your account has been suspended', 403);
     next(err);
@@ -158,11 +183,15 @@ router.post('/login', authLimiter, async (req, res, next) => {
 // ── POST /api/auth/google ─────────────────────────────────
 // New users — creates account + saves onboarding in one call
 // Existing users — logs in, ignores onboarding array
-// Body: { idToken, onboarding[], referral_code? }
+// Body: { idToken, onboarding[], referral_code?, routine_task_ids? } (or camelCase)
 
 router.post('/google', authLimiter, async (req, res, next) => {
   try {
-    const { idToken, onboarding = [], referral_code } = req.body;
+    const { idToken, onboarding = [] } = req.body;
+    const referral_code = req.body.referral_code ?? req.body.referralCode;
+    const routineTaskIds = parseRoutineTaskIds(req.body.routine_task_ids ?? req.body.routineTaskIds);
+    if (!routineTaskIds)
+      return error(res, 'routine_task_ids must be a list of task ids', 400);
 
     if (!idToken)
       return error(res, 'Google ID token is required', 400);
@@ -176,7 +205,7 @@ router.post('/google', authLimiter, async (req, res, next) => {
       }
     }
 
-    const result = await authService.loginWithGoogle(idToken, onboarding, referral_code);
+    const result = await authService.loginWithGoogle(idToken, onboarding, referral_code, routineTaskIds);
 
     return success(res, {
       user:          result.user,
@@ -189,6 +218,8 @@ router.post('/google', authLimiter, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'ACCOUNT_BANNED')
       return error(res, 'Your account has been suspended', 403);
+    if (err.message === 'EMAIL_LINK_UNVERIFIED')
+      return error(res, 'An account with this email already exists. Log in with your email and password first, then you can use this sign-in.', 409, 'EMAIL_LINK_UNVERIFIED');
     if (err.message === 'INVALID_GOOGLE_TOKEN')
       return error(res, 'Invalid or expired Google token', 401);
     if (err.message === 'GOOGLE_NOT_CONFIGURED')
@@ -200,11 +231,15 @@ router.post('/google', authLimiter, async (req, res, next) => {
 // ── POST /api/auth/apple ──────────────────────────────────
 // New users — creates account + saves onboarding in one call
 // Existing users — logs in, ignores onboarding array
-// Body: { idToken, nonce?, onboarding[], referral_code? }
+// Body: { idToken, nonce?, onboarding[], referral_code?, routine_task_ids? } (or camelCase)
 
 router.post('/apple', authLimiter, async (req, res, next) => {
   try {
-    const { idToken, nonce, onboarding = [], referral_code } = req.body;
+    const { idToken, nonce, onboarding = [] } = req.body;
+    const referral_code = req.body.referral_code ?? req.body.referralCode;
+    const routineTaskIds = parseRoutineTaskIds(req.body.routine_task_ids ?? req.body.routineTaskIds);
+    if (!routineTaskIds)
+      return error(res, 'routine_task_ids must be a list of task ids', 400);
 
     if (!idToken)
       return error(res, 'Apple ID token is required', 400);
@@ -218,7 +253,7 @@ router.post('/apple', authLimiter, async (req, res, next) => {
       }
     }
 
-    const result = await authService.loginWithApple(idToken, nonce, onboarding, referral_code);
+    const result = await authService.loginWithApple(idToken, nonce, onboarding, referral_code, routineTaskIds);
 
     return success(res, {
       user:          result.user,
@@ -231,6 +266,8 @@ router.post('/apple', authLimiter, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'ACCOUNT_BANNED')
       return error(res, 'Your account has been suspended', 403);
+    if (err.message === 'EMAIL_LINK_UNVERIFIED')
+      return error(res, 'An account with this email already exists. Log in with your email and password first, then you can use this sign-in.', 409, 'EMAIL_LINK_UNVERIFIED');
     if (err.message === 'INVALID_APPLE_TOKEN')
       return error(res, 'Invalid or expired Apple token', 401);
     next(err);
@@ -241,11 +278,11 @@ router.post('/apple', authLimiter, async (req, res, next) => {
 // Get new access token using refresh token
 // Body: { refreshToken }
 
-router.post('/refresh', async (req, res, next) => {
+router.post('/refresh', refreshLimiter, async (req, res, next) => {
   try {
-    const { refreshToken } = req.body;
+    const refreshToken = req.body?.refreshToken ?? req.body?.refresh_token;
 
-    if (!refreshToken)
+    if (!refreshToken || typeof refreshToken !== 'string')
       return error(res, 'Refresh token is required', 400);
 
     const result = await authService.refreshAccessToken(refreshToken);
@@ -257,13 +294,63 @@ router.post('/refresh', async (req, res, next) => {
 
   } catch (err) {
     if (err.message === 'USER_NOT_FOUND')
-      return error(res, 'User not found', 404);
+      return error(res, 'User not found', 404, 'ACCOUNT_NOT_FOUND');
     if (err.name === 'TokenExpiredError')
       return error(res, 'Refresh token expired — please login again', 401);
     if (err.name === 'JsonWebTokenError' || err.message === 'TOKEN_REVOKED')
       return error(res, 'Invalid refresh token — please login again', 401);
     if (err.message === 'ACCOUNT_BANNED')
       return error(res, 'Your account has been suspended', 403);
+    next(err);
+  }
+});
+
+// ── POST /api/auth/logout ─────────────────────────────────
+// Ends this device's session: the refresh token's whole rotation family is
+// revoked, so a copy of it stops working too. Always succeeds.
+// Body: { refreshToken }
+
+router.post('/logout', refreshLimiter, async (req, res, next) => {
+  try {
+    const refreshToken = req.body?.refreshToken ?? req.body?.refresh_token;
+    if (typeof refreshToken === 'string' && refreshToken) await revokeSession(refreshToken);
+    return success(res, null, 'Logged out');
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── POST /api/auth/change-password ────────────────────────
+// Signed in. Checks the current password, sets the new one (same rules as
+// reset), signs out every other device, and returns new tokens for this one.
+// Body: { currentPassword, newPassword, confirmPassword }
+
+router.post('/change-password', authLimiter, verifyToken, async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword, confirmPassword } = req.body || {};
+    if (!currentPassword || !newPassword)
+      return error(res, 'Current and new password are required', 400);
+    if (typeof newPassword !== 'string' || typeof currentPassword !== 'string')
+      return error(res, 'Passwords must be text', 400);
+    const weak = passwordRulesError(res, newPassword);
+    if (weak) return weak;
+    if (confirmPassword !== undefined && confirmPassword !== newPassword)
+      return error(res, 'Passwords do not match', 400, 'PASSWORD_MISMATCH');
+
+    const tokens = await authService.changePassword(req.user.id, currentPassword, newPassword);
+    return success(res, {
+      access_token:  tokens.accessToken,
+      refresh_token: tokens.refreshToken,
+    }, 'Password changed. Other devices have been signed out.');
+  } catch (err) {
+    if (err.message === 'USER_NOT_FOUND')
+      return error(res, 'User not found', 404, 'ACCOUNT_NOT_FOUND');
+    if (err.message === 'NO_PASSWORD')
+      return error(res, 'This account signs in with Google or Apple and has no password.', 400, 'NO_PASSWORD');
+    if (err.message === 'INVALID_CURRENT_PASSWORD')
+      return error(res, 'Current password is incorrect', 401, 'INVALID_CURRENT_PASSWORD');
+    if (err.message === 'SAME_PASSWORD')
+      return error(res, 'New password must be different from your current one', 400, 'SAME_PASSWORD');
     next(err);
   }
 });
@@ -299,7 +386,7 @@ router.post('/forgot-password', authLimiter, async (req, res, next) => {
 // Body: { token, newPassword, confirmPassword }
 // Accepts token from body or query params
 
-router.post('/reset-password', async (req, res, next) => {
+router.post('/reset-password', authLimiter, async (req, res, next) => {
   try {
     const { newPassword, confirmPassword } = req.body;
     const token = req.body?.token || req.query?.token;
@@ -313,14 +400,8 @@ router.post('/reset-password', async (req, res, next) => {
       return error(res, 'New password is required', 400);
 
     // Validate password strength — matches all 4 rules on Screen 3
-    const { valid, errors } = isStrongPassword(newPassword);
-    if (!valid) {
-      return res.status(400).json({
-        success: false,
-        message: 'Password does not meet requirements',
-        errors,
-      });
-    }
+    const weak = passwordRulesError(res, newPassword);
+    if (weak) return weak;
 
     // Validate confirm password matches
     if (confirmPassword !== undefined && confirmPassword !== newPassword)
@@ -343,11 +424,16 @@ router.post('/reset-password', async (req, res, next) => {
 // before the onboarding wizard ran). Saves the wizard answers onto
 // the existing account — does not create a user or issue new tokens.
 // Header: Authorization: Bearer <access_token>
-// Body: { onboarding[] }
+// Body: { onboarding[], routine_task_ids?, referral_code? } (or camelCase)
+// referral_code: typed in the wizard; attributes this account to the
+// inviter if nobody has yet. Unknown codes are ignored, never an error.
 
 router.post('/complete-onboarding', verifyToken, async (req, res, next) => {
   try {
     const { onboarding = [] } = req.body;
+    const routineTaskIds = parseRoutineTaskIds(req.body.routine_task_ids ?? req.body.routineTaskIds);
+    if (!routineTaskIds)
+      return error(res, 'routine_task_ids must be a list of task ids', 400);
 
     if (!Array.isArray(onboarding) || onboarding.length === 0)
       return error(res, 'Onboarding answers are required', 400);
@@ -359,7 +445,8 @@ router.post('/complete-onboarding', verifyToken, async (req, res, next) => {
         return error(res, `Invalid questionId ${a.questionId} — must be 1 to 10`, 400);
     }
 
-    const user = await authService.completeOnboarding(req.user.id, onboarding);
+    const referral_code = req.body.referral_code ?? req.body.referralCode;
+    const user = await authService.completeOnboarding(req.user.id, onboarding, routineTaskIds, referral_code);
 
     return success(res, { user }, 'Onboarding complete. Welcome, Hunter.');
 
@@ -423,6 +510,8 @@ const handleUpdateProfile = async (req, res, next) => {
       return error(res, 'Invalid email format', 400);
     if (err.message === 'EMAIL_EXISTS')
       return error(res, 'An account with this email already exists', 409);
+    if (err.message === 'EMAIL_CHANGE_REQUIRES_VERIFICATION')
+      return error(res, 'Change your email from Settings — the new address needs a verification code.', 400, 'EMAIL_CHANGE_REQUIRES_VERIFICATION');
     next(err);
   }
 };
@@ -431,23 +520,8 @@ router.patch('/profile', verifyToken, handleUpdateProfile);
 router.put('/profile', verifyToken, handleUpdateProfile);
 
 // ── PATCH /api/auth/email ─────────────────────────────────
-router.patch('/email', verifyToken, async (req, res, next) => {
-  try {
-    const { email } = req.body;
-    const user = await authService.updateUserEmail(req.user.id, email);
-    return success(res, { user }, 'Email updated successfully');
-  } catch (err) {
-    if (err.message === 'USER_NOT_FOUND')
-      return error(res, 'User not found', 404);
-    if (err.message === 'EMAIL_REQUIRED')
-      return error(res, 'Email is required', 400);
-    if (err.message === 'INVALID_EMAIL')
-      return error(res, 'Invalid email format', 400);
-    if (err.message === 'EMAIL_EXISTS')
-      return error(res, 'An account with this email already exists', 409);
-    next(err);
-  }
-});
+// Two-step verified email change — see routes/emailChange.js.
+router.patch('/email', verifyToken, handleEmailChange);
 
 export default router;
 

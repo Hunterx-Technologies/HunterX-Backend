@@ -7,6 +7,7 @@
 import { Router }         from 'express';
 import { verifyToken }    from '../middleware/auth.js';
 import { rewardLimiter }  from '../middleware/rateLimiter.js';
+import { blockPendingDeletion } from '../middleware/pendingDeletion.js';
 import { success, error } from '../utils/response.js';
 import * as rewardService from '../services/rewardService.js';
 
@@ -70,7 +71,7 @@ router.post('/:id/seen', verifyToken, rewardLimiter, async (req, res, next) => {
 // Reveals the prize. Idempotent: every call returns the same prize.
 // 409 REWARD_EXPIRED | REWARD_USED, 422 NO_COUPON_AVAILABLE (card stays
 // scratchable), 404 when it isn't the caller's reward.
-router.post('/:id/scratch', verifyToken, rewardLimiter, async (req, res, next) => {
+router.post('/:id/scratch', verifyToken, blockPendingDeletion, rewardLimiter, async (req, res, next) => {
   try {
     const reward = await rewardService.scratchReward(req.user.id, req.params.id);
     return success(res, reward, 'Reward revealed');
@@ -81,7 +82,7 @@ router.post('/:id/scratch', verifyToken, rewardLimiter, async (req, res, next) =
 
 // ── POST /api/rewards/:id/use ──────────────────────────────
 // Marks a scratched reward as used. Idempotent.
-router.post('/:id/use', verifyToken, rewardLimiter, async (req, res, next) => {
+router.post('/:id/use', verifyToken, blockPendingDeletion, rewardLimiter, async (req, res, next) => {
   try {
     const reward = await rewardService.markRewardUsed(req.user.id, req.params.id);
     return success(res, reward, 'Reward marked as used');

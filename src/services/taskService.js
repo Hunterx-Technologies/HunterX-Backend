@@ -162,6 +162,8 @@ export async function getTodayTasks(userId, overrideGender = null) {
       image_url_male:   task.image_url_male,
       image_url_female: task.image_url_female,
       task_type:        task.task_type,
+      // Optional routine task (built-in or admin-marked); see routineTaskService.js.
+      is_routine:       task.is_routine,
       xp_reward:        task.xp_reward,
       xp_partial:       task.xp_partial,
       allows_partial:   task.allows_partial,
