@@ -1208,6 +1208,15 @@ export async function completeOnboarding(userId, onboarding = [], routineTaskIds
 // GET CURRENT USER
 // ─────────────────────────────────────────────────────────────
 
+// users.gender is stored as an enum (MALE); clients get the display form (Male).
+// Writes still accept either form — updateUserProfile upper-cases the input.
+const GENDER_LABELS = {
+  MALE:              'Male',
+  FEMALE:            'Female',
+  OTHER:             'Other',
+  PREFER_NOT_TO_SAY: 'Prefer not to say',
+};
+
 export async function getCurrentUser(userId) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
   const user = await prisma.users.findUnique({
@@ -1256,13 +1265,9 @@ export async function getCurrentUser(userId) {
 
   if (!user) return null;
 
-<<<<<<< Updated upstream
-  const { auth_providers, ...flatUser } = user;
-=======
   const { auth_providers, ...rest } = user;
   const flatUser = { ...rest, ...deletionStatus(user) };
   flatUser.gender        = GENDER_LABELS[user.gender] ?? user.gender;
->>>>>>> Stashed changes
   flatUser.auth_provider = auth_providers?.[0]?.provider || null;
   flatUser.week_status   = await getWeekStatus(bUserId);
   // Display only — referrals carry no reward.
@@ -1387,7 +1392,7 @@ export async function updateUserProfile(userId, payload = {}) {
 
   // 2. Gender
   if (gender !== undefined && gender !== null) {
-    const g = String(gender).toUpperCase();
+    const g = String(gender).trim().toUpperCase().replace(/\s+/g, '_');
     const validGenders = ['MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY'];
     if (!validGenders.includes(g)) {
       throw new Error('INVALID_GENDER');
