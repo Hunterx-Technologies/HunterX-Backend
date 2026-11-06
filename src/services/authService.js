@@ -19,6 +19,7 @@ import { allowCodeEmail, isLoginLocked, recordLoginFailure, clearLoginFailures }
 import { brandedEmail, escapeHtml } from '../utils/emailTemplates.js';
 import { sendMail } from '../utils/mailer.js';
 import { getISTDateOnly }   from '../utils/helpers.js';
+import { exchangeAppleAuthorizationCode } from './appleTokenService.js';
 import {
   generateHunterId,
   generateUniqueReferralCode,
@@ -798,6 +799,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
     await markEmailVerifiedIfMatches(user, email);
+    await storeAppleRefreshToken(existingProvider.id, authorizationCode);
     const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
@@ -851,7 +853,10 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
 // Name comes from onboarding Q1 answer — more reliable
 // ─────────────────────────────────────────────────────────────
 
-export async function loginWithApple(idToken, nonce, onboarding = [], referralCode = null, routineTaskIds = []) {
+// authorizationCode: the app's one-time code, exchanged for Apple's refresh
+// token so account deletion can revoke it (appleTokenService.js). Optional —
+// older app builds don't send it.
+export async function loginWithApple(idToken, nonce, onboarding = [], referralCode = null, routineTaskIds = [], authorizationCode = null) {
   // Verify Apple token — throws for expired/malformed/wrong-audience tokens
   let appleUser;
   try {
@@ -890,13 +895,14 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
     if (existingByEmail) {
       if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
       if (!existingByEmail.email_verified_at) throw new Error('EMAIL_LINK_UNVERIFIED');
-      await prisma.auth_providers.create({
+      const linkedProvider = await prisma.auth_providers.create({
         data: {
           user_id:     existingByEmail.id,
           provider:    'APPLE',
           provider_id: appleId,
         },
       });
+      await storeAppleRefreshToken(linkedProvider.id, authorizationCode);
       if (onboarding.length > 0 && !existingByEmail.onboarding_done) {
         await processOnboarding(existingByEmail.id, onboarding, routineTaskIds);
       }
@@ -921,10 +927,28 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
 
   await processOnboarding(user.id, onboarding, routineTaskIds);
 
+  const newProvider = await prisma.auth_providers.findFirst({
+    where:  { provider: 'APPLE', provider_id: appleId },
+    select: { id: true },
+  });
+  if (newProvider) await storeAppleRefreshToken(newProvider.id, authorizationCode);
+
   const updatedUser = await prisma.users.findUnique({ where: { id: user.id } });
   const tokens      = await issueSession(updatedUser);
 
   return { user: sanitizeUser(updatedUser), ...tokens, isNew: true };
+}
+
+// Exchanges the code and keeps Apple's newest refresh token on the provider
+// row. Best effort: no code, no key or an Apple error leaves the old token.
+async function storeAppleRefreshToken(providerRowId, authorizationCode) {
+  if (!authorizationCode) return;
+  const refreshToken = await exchangeAppleAuthorizationCode(authorizationCode);
+  if (!refreshToken) return;
+  await prisma.auth_providers.update({
+    where: { id: providerRowId },
+    data:  { apple_refresh_token: refreshToken },
+  });
 }
 
 // ─────────────────────────────────────────────────────────────

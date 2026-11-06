@@ -29,6 +29,8 @@ model auth_providers {
   user_id     BigInt
   provider    auth_provider_type
   provider_id String?            @db.VarChar(255)
+  /// APPLE only: Apple's refresh token, revoked on account deletion (appleTokenService.js).
+  apple_refresh_token String?    @db.Text
   created_at  DateTime?          @default(now()) @db.Timestamp(6)
   users       users              @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
@@ -1112,7 +1114,7 @@ model user_settings {
   notify_streak_freeze       Boolean   @default(true)
   notify_level_up            Boolean   @default(true)
   notify_reward_ready        Boolean   @default(true)
-  notify_announcements       Boolean   @default(true)
+  notify_announcements       Boolean   @default(false) // promotional: opt-in only (App Store 4.5.4)
   notify_social              Boolean   @default(true)
   notify_leaderboard         Boolean   @default(true)
   leaderboard_visible        Boolean   @default(true)

@@ -19,7 +19,7 @@ function formatSettings(settings) {
     notify_streak_freeze: settings.notify_streak_freeze ?? true,
     notify_level_up: settings.notify_level_up ?? true,
     notify_reward_ready: settings.notify_reward_ready ?? true,
-    notify_announcements: settings.notify_announcements ?? true,
+    notify_announcements: settings.notify_announcements ?? false,
     notify_social: settings.notify_social ?? true,
     notify_leaderboard: settings.notify_leaderboard ?? true,
     leaderboard_visible: settings.leaderboard_visible ?? true,
@@ -50,7 +50,7 @@ export async function getUserSettings(userId) {
         notify_streak_freeze: true,
         notify_level_up: true,
         notify_reward_ready: true,
-        notify_announcements: true,
+        notify_announcements: false, // promotional push is opt-in
       },
     });
   }
@@ -125,7 +125,7 @@ export async function updateUserSettings(userId, payload) {
       notify_streak_freeze: payload.notify_streak_freeze !== undefined ? Boolean(payload.notify_streak_freeze) : true,
       notify_level_up: payload.notify_level_up !== undefined ? Boolean(payload.notify_level_up) : true,
       notify_reward_ready: payload.notify_reward_ready !== undefined ? Boolean(payload.notify_reward_ready) : true,
-      notify_announcements: payload.notify_announcements !== undefined ? Boolean(payload.notify_announcements) : true,
+      notify_announcements: payload.notify_announcements !== undefined ? Boolean(payload.notify_announcements) : false,
       ...updateData,
     },
     update: updateData,

@@ -231,12 +231,14 @@ router.post('/google', authLimiter, async (req, res, next) => {
 // ── POST /api/auth/apple ──────────────────────────────────
 // New users — creates account + saves onboarding in one call
 // Existing users — logs in, ignores onboarding array
-// Body: { idToken, nonce?, onboarding[], referral_code?, routine_task_ids? } (or camelCase)
+// Body: { idToken, nonce?, authorization_code?, onboarding[], referral_code?, routine_task_ids? } (or camelCase)
+// authorization_code lets the backend revoke the Apple token on account deletion.
 
 router.post('/apple', authLimiter, async (req, res, next) => {
   try {
     const { idToken, nonce, onboarding = [] } = req.body;
     const referral_code = req.body.referral_code ?? req.body.referralCode;
+    const authorizationCode = req.body.authorization_code ?? req.body.authorizationCode ?? null;
     const routineTaskIds = parseRoutineTaskIds(req.body.routine_task_ids ?? req.body.routineTaskIds);
     if (!routineTaskIds)
       return error(res, 'routine_task_ids must be a list of task ids', 400);
@@ -253,7 +255,7 @@ router.post('/apple', authLimiter, async (req, res, next) => {
       }
     }
 
-    const result = await authService.loginWithApple(idToken, nonce, onboarding, referral_code, routineTaskIds);
+    const result = await authService.loginWithApple(idToken, nonce, onboarding, referral_code, routineTaskIds, authorizationCode);
 
     return success(res, {
       user:          result.user,

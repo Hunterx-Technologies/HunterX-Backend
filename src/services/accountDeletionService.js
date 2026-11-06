@@ -12,6 +12,7 @@ import { removeLeaderboardMember } from './leaderboardService.js';
 import crypto from 'crypto';
 import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpService.js';
 import { revokeAllSessions } from './sessionService.js';
+import { revokeAppleRefreshToken } from './appleTokenService.js';
 import { normalizeEmail, sha256 } from '../utils/helpers.js';
 import { allowCodeEmail } from '../utils/throttle.js';
 import { brandedEmail } from '../utils/emailTemplates.js';
@@ -27,6 +28,12 @@ export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
   });
   if (!user) throw new Error('USER_NOT_FOUND');
   if (user.role === 'ADMIN' && !allowAdmin) throw new Error('CANNOT_DELETE_ADMIN');
+
+  // Read before the rows cascade away; revoked after commit (below).
+  const appleProviders = await prisma.auth_providers.findMany({
+    where:  { user_id: bUserId, provider: 'APPLE', apple_refresh_token: { not: null } },
+    select: { apple_refresh_token: true },
+  });
 
   await prisma.$transaction(async (tx) => {
     // NoAction relations pointing at this user.
@@ -47,6 +54,11 @@ export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
   });
 
   await removeLeaderboardMember(bUserId);
+
+  // Sign in with Apple (Guideline 5.1.1(v)): unlink the Apple ID. After the
+  // commit so an Apple outage can't block the deletion; failures are logged.
+  for (const p of appleProviders) await revokeAppleRefreshToken(p.apple_refresh_token);
+
   info(`Deleted account ${bUserId}`);
 }
 
