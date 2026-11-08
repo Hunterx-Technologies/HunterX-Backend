@@ -11,6 +11,7 @@ import * as adminUserService from '../services/adminUserService.js';
 import * as broadcastService from '../services/broadcastService.js';
 import * as adminRewardService from '../services/adminRewardService.js';
 import * as taskProofService from '../services/taskProofService.js';
+import * as dashboardService from '../services/adminDashboardService.js';
 
 const router = Router();
 
@@ -611,5 +612,35 @@ router.delete('/rewards/coupons/:id', verifyToken, verifyAdmin, async (req, res,
     handleRewardAdminError(res, next, err);
   }
 });
+
+// ── GET /api/admin/dashboard/* ────────────────────────────
+// Admin-only. One read-only endpoint per Dashboard widget (HunterX-Admin
+// app/(dashboard)/page.tsx). Shapes match HunterX-Admin types/dashboard.ts;
+// see adminDashboardService.js for how each number is derived.
+const DASHBOARD_WIDGETS = {
+  'kpis':              dashboardService.getCoreKpis,
+  'subscriptions':     dashboardService.getSubscriptionOverview,
+  'mrr-trend':         dashboardService.getMrrTrend,
+  'transactions':      dashboardService.getRecentTransactions,
+  'referrals':         dashboardService.getReferralOverview,
+  'top-referrers':     dashboardService.getTopReferrers,
+  'referral-activity': dashboardService.getRecentReferralActivity,
+  'coupons':           dashboardService.getCouponOverview,
+  'coupon-activity':   dashboardService.getCouponActivityLog,
+  'dau-trend':         dashboardService.getDauTrend,
+  'rank-distribution': dashboardService.getRankDistribution,
+  'streak-dropoff':    dashboardService.getStreakDropoff,
+  'needs-attention':   dashboardService.getNeedsAttention,
+};
+
+for (const [path, load] of Object.entries(DASHBOARD_WIDGETS)) {
+  router.get(`/dashboard/${path}`, verifyToken, verifyAdmin, async (req, res, next) => {
+    try {
+      return success(res, await load(), 'Dashboard data fetched');
+    } catch (err) {
+      next(err);
+    }
+  });
+}
 
 export default router;
