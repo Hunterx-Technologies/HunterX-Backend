@@ -49,7 +49,8 @@ function model(rows, { idKey = 'id', autoId = true } = {}) {
     findUnique: async ({ where }) => copy(uniqueWhere(where)),
     findFirst: async ({ where = {}, orderBy } = {}) => {
       let found = rows.filter((r) => matches(r, where));
-      if (orderBy?.created_at === 'desc') found = [...found].sort((a, b) => b.created_at - a.created_at);
+      const [sortKey, dir] = Object.entries(orderBy ?? {})[0] ?? [];
+      if (sortKey) found = [...found].sort((a, b) => (dir === 'desc' ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]));
       return copy(found[0]);
     },
     findMany: async ({ where = {}, take } = {}) => rows.filter((r) => matches(r, where)).slice(0, take ?? Infinity).map(copy),
@@ -90,6 +91,7 @@ export function createFakePrisma(seed = {}) {
     account_otps:   model(seed.account_otps ?? []),
     email_otps:     model(seed.email_otps ?? []),
     refresh_tokens: model(seed.refresh_tokens ?? [], { idKey: 'jti', autoId: false }),
+    data_export_requests: model(seed.data_export_requests ?? []),
   };
   const empty = model([]);
 

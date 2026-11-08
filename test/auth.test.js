@@ -65,6 +65,15 @@ test('Google sign-in still links into an account with a verified email', async (
   assert.equal(fake.models.auth_providers.rows[0].provider_id, 'google-owner');
 });
 
+test('a returning Google user (provider already linked) logs straight in', async () => {
+  seedUser({ email: 'returning@gmail.com' });
+  fake.models.auth_providers.rows.push({ id: 10n, user_id: 1n, provider: 'GOOGLE', provider_id: 'google-returning' });
+  googlePayload = { sub: 'google-returning', email: 'returning@gmail.com', email_verified: true, name: 'Returning' };
+  const result = await auth.loginWithGoogle('token');
+  assert.equal(result.isNew, false);
+  assert.ok(result.accessToken && result.refreshToken);
+});
+
 test('profile update cannot change the email', async () => {
   seedUser();
   await assert.rejects(
@@ -96,13 +105,24 @@ test('password login locks after 10 failures', async () => {
   await assert.rejects(auth.loginWithEmail('lockme@example.com', PASSWORD), /LOGIN_LOCKED/);
 });
 
-test('signup code request answers the same for a registered email', async () => {
+test('signup code request for a registered email: ACCOUNT_EXISTS, no code, no email', async () => {
   seedUser({ email: 'taken@example.com' });
-  assert.equal(await auth.sendOtp('taken@example.com'), true);
+  fake.models.auth_providers.rows.push({ id: 5n, user_id: 1n, provider: 'GOOGLE', provider_id: 'g-taken' });
+  await assert.rejects(auth.sendOtp('taken@example.com'), { message: 'ACCOUNT_EXISTS', providers: ['GOOGLE'] });
   assert.equal(fake.models.email_otps.rows.length, 0, 'no code for an existing account');
-  assert.equal(sent[0].to, 'taken@example.com');
-  assert.match(sent[0].subject, /already have/);
-  await assert.rejects(auth.sendOtp('taken@example.com'), /OTP_COOLDOWN/);
+  assert.equal(sent.length, 0, 'no email');
+});
+
+test('signup code request for an account waiting to be deleted: log in to restore', async () => {
+  seedUser({ email: 'leaving@example.com', delete_at: new Date(Date.now() + 86_400_000) });
+  await assert.rejects(auth.sendOtp('leaving@example.com'), /ACCOUNT_PENDING_DELETION_LOGIN_TO_RESTORE/);
+  assert.equal(sent.length, 0);
+});
+
+test('signup code request for a new email sends a code', async () => {
+  assert.equal(await auth.sendOtp('brand-new@example.com'), true);
+  assert.equal(fake.models.email_otps.rows.length, 1);
+  assert.equal(sent[0].to, 'brand-new@example.com');
 });
 
 test('change password rejects a wrong current password and revokes sessions on success', async () => {

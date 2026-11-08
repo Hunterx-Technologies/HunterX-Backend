@@ -5,6 +5,7 @@ import express            from 'express';
 import cors               from 'cors';
 import helmet             from 'helmet';
 import morgan             from 'morgan';
+import compression        from 'compression';
 import { generalLimiter } from './middleware/rateLimiter.js';
 import { errorHandler }   from './middleware/errorHandler.js';
 import router             from './routes/index.js';
@@ -16,6 +17,7 @@ import { REDIS_KEYS }      from './config/leaderboardConfig.js';
 import { rebuildLeaderboard } from '../scripts/rebuildLeaderboard.js';
 import { ensureDefaultAdmin } from './services/adminBootstrapService.js';
 import { waitForRedis } from './config/redis.js';
+import { clearAuthUserLocal, setAuthUserInvalidationPublisher } from './services/authUserCache.js';
 import cron              from 'node-cron';
 import './cron/midnight.js';           // starts the nightly task-assignment cron
 import './cron/leaderboardNightly.js'; // starts the nightly leaderboard rebuild cron
@@ -35,6 +37,9 @@ app.set('trust proxy', 1);
 
 // Middleware
 app.use(helmet());
+// gzip JSON responses (the task list, leaderboard and profile shrink ~70-80%).
+// Clients opt in via Accept-Encoding, so nothing changes for one that doesn't.
+app.use(compression());
 // CORS_ORIGINS: comma-separated browser origins allowed to call the API
 // (the admin panel, the website's delete-account page). The mobile app
 // sends no Origin and is unaffected. Unset = any origin, as before — the
@@ -84,6 +89,26 @@ async function initLeaderboard() {
   }
 }
 
+// Auth-user cache: with Redis, a cleared entry is broadcast so every server
+// instance drops it (a ban on one applies on all). Without Redis — or while
+// it's down — each instance relies on its own clearing plus the short TTL.
+const AUTH_CACHE_CHANNEL = 'hx:auth-user-invalidate';
+let authCacheSubscriber = null;
+function startAuthCacheSync() {
+  if (!redis) return;
+  // Its own connection (a subscribed client can't run other commands). Unlike
+  // the main client it may queue while connecting, so the SUBSCRIBE below
+  // isn't lost at startup; ioredis re-subscribes after any reconnect.
+  authCacheSubscriber = redis.duplicate({ enableOfflineQueue: true, maxRetriesPerRequest: null });
+  authCacheSubscriber.on('error', (err) => logError(`Auth cache subscriber: ${err.message}`));
+  authCacheSubscriber.subscribe(AUTH_CACHE_CHANNEL).catch((err) => logError(`Auth cache subscribe failed: ${err.message}`));
+  authCacheSubscriber.on('message', (_channel, key) => clearAuthUserLocal(key === '*' ? null : key));
+  setAuthUserInvalidationPublisher((key) => {
+    if (isRedisUp()) redis.publish(AUTH_CACHE_CHANNEL, key).catch(() => {});
+  });
+}
+startAuthCacheSync();
+
 // Start
 const server = app.listen(PORT, '0.0.0.0', () => {
   info(`HunterX backend running on port ${PORT}`);
@@ -103,7 +128,7 @@ function shutdown(signal) {
   for (const task of cron.getTasks().values()) task.stop();
   setTimeout(() => process.exit(1), 10_000).unref();
   server.close(async () => {
-    await Promise.allSettled([prisma.$disconnect(), redis?.quit()]);
+    await Promise.allSettled([prisma.$disconnect(), redis?.quit(), authCacheSubscriber?.quit()]);
     process.exit(0);
   });
 }

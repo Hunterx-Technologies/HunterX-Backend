@@ -68,12 +68,6 @@ test('signup verification code', async () => {
   assert.match(sent[0].html, /\d{6}/);
 });
 
-test('"you already have an account" notice', async () => {
-  await auth.sendOtp('hunter@example.com');
-  assertWellFormed(sent[0], 'hunter@example.com');
-  assert.match(sent[0].subject, /already have/);
-});
-
 test('password reset link', async () => {
   await auth.forgotPassword('hunter@example.com');
   await waitForMail(1);
@@ -81,12 +75,37 @@ test('password reset link', async () => {
   assert.match(sent[0].html, /https:\/\/www\.example\.com\/reset-password\?token=[a-f0-9]{64}/);
 });
 
-test('"no password to reset" notice for Google accounts', async () => {
+test('password reset for an unregistered email: ACCOUNT_NOT_FOUND, no email', async () => {
+  await assert.rejects(auth.forgotPassword('nobody@example.com'), { message: 'ACCOUNT_NOT_FOUND' });
+  assert.equal(sent.length, 0);
+});
+
+test('password reset for a Google account: SOCIAL_ACCOUNT, no email', async () => {
   fake.models.auth_providers.rows[0].provider = 'GOOGLE';
-  await auth.forgotPassword('hunter@example.com');
-  await waitForMail(1);
-  assertWellFormed(sent[0], 'hunter@example.com');
-  assert.match(sent[0].html, /Continue with Google/);
+  await assert.rejects(auth.forgotPassword('hunter@example.com'), {
+    message: 'SOCIAL_ACCOUNT',
+    provider: 'Google',
+  });
+  assert.equal(sent.length, 0);
+});
+
+test('password reset for an Apple account: SOCIAL_ACCOUNT names Apple', async () => {
+  fake.models.auth_providers.rows[0].provider = 'APPLE';
+  await assert.rejects(auth.forgotPassword('hunter@example.com'), {
+    message: 'SOCIAL_ACCOUNT',
+    provider: 'Apple',
+  });
+  assert.equal(sent.length, 0);
+});
+
+test('password reset for an account with Google and Apple names both', async () => {
+  fake.models.auth_providers.rows[0].provider = 'GOOGLE';
+  fake.models.auth_providers.rows.push({ ...fake.models.auth_providers.rows[0], id: 99n, provider: 'APPLE' });
+  await assert.rejects(auth.forgotPassword('hunter@example.com'), {
+    message: 'SOCIAL_ACCOUNT',
+    provider: 'Google or Apple',
+  });
+  assert.equal(sent.length, 0);
 });
 
 test('email change: code to the new address, notice to the old one', async () => {
@@ -113,7 +132,7 @@ test('account deletion: codes, and the scheduled notice', async () => {
 });
 
 test('data export: the email carries a workbook ExcelJS can read back', async () => {
-  await dataExport.requestDataExport(1n);
+  const status = await dataExport.requestDataExport(1n);
   assertWellFormed(sent[0], 'hunter@example.com');
   assert.equal(sent[0].attachments.length, 1);
   const attachment = sent[0].attachments[0];
@@ -123,4 +142,25 @@ test('data export: the email carries a workbook ExcelJS can read back', async ()
   assert.ok(workbook.worksheets.length > 0);
   const text = JSON.stringify(workbook.worksheets.map((s) => s.getSheetValues()));
   assert.match(text, /hunter@example\.com/);
+  assert.equal(status.email, 'hu••••@example.com');
+  assert.ok(status.nextAvailableAt > new Date());
+});
+
+test('data export: once a day, and the status says when the next one is allowed', async () => {
+  const before = await dataExport.getDataExportStatus(1n);
+  assert.equal(before.email, 'hu••••@example.com');
+  assert.equal(before.lastRequestedAt, null);
+  assert.equal(before.nextAvailableAt, null);
+
+  await dataExport.requestDataExport(1n);
+  await assert.rejects(dataExport.requestDataExport(1n), { message: 'EXPORT_RATE_LIMITED' });
+  const after = await dataExport.getDataExportStatus(1n);
+  assert.ok(after.lastRequestedAt instanceof Date);
+  assert.ok(after.nextAvailableAt > new Date());
+  assert.equal(sent.length, 1);
+});
+
+test('maskEmail keeps the start and the domain', () => {
+  assert.equal(dataExport.maskEmail('shakthikumar.dev@gmail.com'), 'sh••••••••••••••@gmail.com');
+  assert.equal(dataExport.maskEmail('ab@x.com'), 'a•••@x.com');
 });

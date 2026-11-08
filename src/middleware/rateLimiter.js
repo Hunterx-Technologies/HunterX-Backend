@@ -1,11 +1,94 @@
 // src/middleware/rateLimiter.js — Rate limiting
 
-import rateLimit from 'express-rate-limit';
+import rateLimit, { MemoryStore } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
+import redis, { isRedisUp } from '../config/redis.js';
+import { verifyAccessToken } from '../utils/helpers.js';
+
+// Counters live in Redis when it's available, so limits hold across every
+// server instance (and survive a redeploy). If Redis is missing or down, the
+// limiter quietly counts in this instance's memory instead — requests are
+// never blocked or let through unlimited because of a Redis problem.
+class RedisWithMemoryFallback {
+  constructor(prefix) {
+    this.prefix = prefix;
+    this.memory = new MemoryStore();
+    this.redisStore = null; // created on first use once Redis is up
+    this.localKeys = false;
+  }
+
+  init(options) {
+    this.options = options;
+    this.memory.init(options);
+  }
+
+  redisOrNull() {
+    if (!redis || !isRedisUp()) return null;
+    if (!this.redisStore) {
+      this.redisStore = new RedisStore({ prefix: this.prefix, sendCommand: (...args) => redis.call(...args) });
+      this.redisStore.init(this.options);
+    }
+    return this.redisStore;
+  }
+
+  async get(key) {
+    const store = this.redisOrNull();
+    if (store) {
+      try { return await store.get(key); } catch { /* fall back */ }
+    }
+    return this.memory.get(key);
+  }
+
+  async increment(key) {
+    const store = this.redisOrNull();
+    if (store) {
+      try { return await store.increment(key); } catch { /* fall back */ }
+    }
+    return this.memory.increment(key);
+  }
+
+  async decrement(key) {
+    const store = this.redisOrNull();
+    if (store) {
+      try { return await store.decrement(key); } catch { /* fall back */ }
+    }
+    return this.memory.decrement(key);
+  }
+
+  async resetKey(key) {
+    const store = this.redisOrNull();
+    if (store) await store.resetKey(key).catch(() => {});
+    return this.memory.resetKey(key);
+  }
+
+  shutdown() {
+    this.memory.shutdown?.();
+  }
+}
+
+// Signed-in requests are counted per user, not per IP: mobile carriers put
+// many people behind one shared IP (CGNAT), and they'd otherwise share a
+// single bucket. The token's signature is checked, so a made-up token can't
+// be used to get a fresh bucket; anything else falls back to the IP.
+function userOrIpKey(req) {
+  const header = req.headers.authorization;
+  if (header && header.startsWith('Bearer ')) {
+    try {
+      const { userId } = verifyAccessToken(header.slice(7));
+      if (userId != null) return `user:${userId}`;
+    } catch {
+      // Expired or invalid — counted against the IP like any anonymous call.
+    }
+  }
+  return `ip:${req.ip}`;
+}
 
 // General — 1000 requests per 15 minutes in production, 5000 in development
 export const generalLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:generalLimiter:'),
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'development' ? 5000 : 1000,
+  keyGenerator: userOrIpKey,
   message: {
     success: false,
     message: 'Too many requests. Try again later.',
@@ -16,6 +99,7 @@ export const generalLimiter = rateLimit({
 
 // Auth — stricter — 150 requests per 15 minutes in production, 1000 in development
 export const authLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:authLimiter:'),
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'development' ? 1000 : 150,
   message: {
@@ -31,6 +115,7 @@ export const authLimiter = rateLimit({
 // revalidation on 3 tabs can be chatty, but 60/min comfortably covers
 // normal use without opening it up to a scraping risk.
 export const leaderboardLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:leaderboardLimiter:'),
   windowMs: 60 * 1000,
   max: 60,
   standardHeaders: true,
@@ -45,6 +130,7 @@ export const leaderboardLimiter = rateLimit({
 // Public referral-code lookup — 20/min per IP. Unauthenticated, so this
 // is what stops anyone enumerating codes (and inviter names).
 export const referralLookupLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:referralLookupLimiter:'),
   windowMs: 60 * 1000,
   max: 20,
   standardHeaders: true,
@@ -60,6 +146,7 @@ export const referralLookupLimiter = rateLimit({
 // idempotent anyway; this just keeps a stuck retry loop from hammering
 // the row locks.
 export const rewardLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:rewardLimiter:'),
   windowMs: 60 * 1000,
   max: 30,
   standardHeaders: true,
@@ -75,6 +162,7 @@ export const rewardLimiter = rateLimit({
 // Token refresh — 60 per 15 minutes per IP. A healthy client refreshes
 // about every 15 minutes per device.
 export const refreshLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:refreshLimiter:'),
   windowMs: 15 * 60 * 1000,
   max: process.env.NODE_ENV === 'development' ? 1000 : 60,
   standardHeaders: true,
@@ -88,6 +176,7 @@ export const refreshLimiter = rateLimit({
 
 // Public account-deletion endpoints (website) — 10/min per IP.
 export const accountDeletionLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:accountDeletionLimiter:'),
   windowMs: 60 * 1000,
   max: 10,
   standardHeaders: true,
@@ -101,6 +190,7 @@ export const accountDeletionLimiter = rateLimit({
 
 // Upload signatures — 30/min per user.
 export const uploadLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:uploadLimiter:'),
   windowMs: 60 * 1000,
   max: 30,
   standardHeaders: true,

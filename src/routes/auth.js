@@ -30,9 +30,10 @@ const router = Router();
 
 // ── POST /api/auth/send-otp ───────────────────────────────
 // OTP for email + password registration only
-// Google and Apple users skip this entirely. The response is the same
-// whether or not the email already has an account (that address gets a
-// "you already have an account" email instead of a code).
+// Google and Apple users skip this entirely. An email that already has an
+// account gets 409 ACCOUNT_EXISTS (no email sent) with how it signs in, or
+// 409 ACCOUNT_PENDING_DELETION_LOGIN_TO_RESTORE when it's waiting to be
+// deleted — the app sends that hunter to Login to restore it.
 
 router.post('/send-otp', authLimiter, async (req, res, next) => {
   try {
@@ -52,9 +53,23 @@ router.post('/send-otp', authLimiter, async (req, res, next) => {
   } catch (err) {
     if (err.message === 'OTP_COOLDOWN')
       return error(res, 'Please wait a minute before requesting another code.', 429, 'OTP_COOLDOWN');
+    if (err.message === 'ACCOUNT_PENDING_DELETION_LOGIN_TO_RESTORE')
+      return error(res, 'This account is scheduled for deletion. Log in to restore it.', 409, 'ACCOUNT_PENDING_DELETION_LOGIN_TO_RESTORE');
+    if (err.message === 'ACCOUNT_EXISTS')
+      return error(res, accountExistsMessage(err.providers), 409, 'ACCOUNT_EXISTS');
     next(err);
   }
 });
+
+// "An account with this email already exists…", naming how it signs in.
+function accountExistsMessage(providers = []) {
+  if (providers.includes('EMAIL')) return 'An account with this email already exists. Log in instead.';
+  const names = [];
+  if (providers.includes('GOOGLE')) names.push('Google');
+  if (providers.includes('APPLE')) names.push('Apple');
+  const via = names.join(' or ') || 'Google or Apple';
+  return `An account with this email already exists. Use Continue with ${via} to log in.`;
+}
 
 // ── POST /api/auth/verify-otp ──────────────────────────────
 
@@ -358,10 +373,10 @@ router.post('/change-password', authLimiter, verifyToken, async (req, res, next)
 });
 
 // ── POST /api/auth/forgot-password ───────────────────────
-// Sends a reset link if the email belongs to a password account (or a
-// "sign in with Google/Apple" note for social accounts). The response is
-// the same whether or not the account exists, so this can't be used to
-// check which emails are registered.
+// Sends a reset link if the email belongs to an account with a password.
+// No account → 404 ACCOUNT_NOT_FOUND. Google/Apple-only account (no
+// password to reset) → 400 SOCIAL_ACCOUNT. Login already reveals both, and
+// authLimiter rate-limits probing.
 // Body: { email }
 
 router.post('/forgot-password', authLimiter, async (req, res, next) => {
@@ -376,9 +391,15 @@ router.post('/forgot-password', authLimiter, async (req, res, next) => {
     await authService.forgotPassword(email);
 
     return success(res, null,
-      'If an account exists for this email, we have sent instructions to reset your Secret Key. Check your spam folder if it does not arrive within 2 minutes.');
+      'We have sent instructions to reset your Secret Key to this email. Check your spam folder if it does not arrive within 2 minutes.');
 
   } catch (err) {
+    if (err.message === 'ACCOUNT_NOT_FOUND')
+      return error(res, 'No HunterX account is registered with this email.', 404, 'ACCOUNT_NOT_FOUND');
+    if (err.message === 'SOCIAL_ACCOUNT')
+      return error(res,
+        `This account signs in with ${err.provider}, so it has no password to reset. Use Continue with ${err.provider} to log in.`,
+        400, 'SOCIAL_ACCOUNT');
     next(err);
   }
 });

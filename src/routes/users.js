@@ -230,20 +230,36 @@ router.delete('/me', verifyToken, async (req, res, next) => {
   }
 });
 
+// ── GET /api/users/me/data-export ─────────────────────────
+// "My Data" row in the app: masked email the export goes to, when the
+// last one was requested, and when another is allowed (null = now).
+// Response data: { email, lastRequestedAt, nextAvailableAt }
+router.get('/me/data-export', verifyToken, async (req, res, next) => {
+  try {
+    const status = await dataExportService.getDataExportStatus(req.user.id);
+    return success(res, status, 'Data export status');
+  } catch (err) {
+    if (err.message === 'USER_NOT_FOUND')
+      return error(res, 'User not found', 404);
+    next(err);
+  }
+});
+
 // ── POST /api/users/me/data-export ────────────────────────
 // "Download My Data" — GDPR data portability / App Store 5.1.1.
-// No request body; gathers the caller's data and emails it as a
-// JSON attachment. Rate-limited to 1 request per user per 24h.
+// No request body; gathers the caller's data and emails it as an Excel
+// attachment. Rate-limited to 1 request per user per 24h.
+// Response data: { email, lastRequestedAt, nextAvailableAt }
 router.post('/me/data-export', verifyToken, async (req, res, next) => {
   try {
-    await dataExportService.requestDataExport(req.user.id);
-    return success(res, null, 'Your data export has been sent to your registered email address.');
+    const status = await dataExportService.requestDataExport(req.user.id);
+    return success(res, status, `We've emailed your data to ${status.email}.`);
   } catch (err) {
     if (err.message === 'USER_NOT_FOUND')
       return error(res, 'User not found', 404);
     if (err.message === 'EXPORT_RATE_LIMITED') {
       const hours = Math.ceil(err.retryAfterMs / (60 * 60 * 1000));
-      return error(res, `You can request another data export in about ${hours} hour${hours === 1 ? '' : 's'}.`, 429);
+      return error(res, `You can request another data export in about ${hours} hour${hours === 1 ? '' : 's'}.`, 429, 'EXPORT_RATE_LIMITED');
     }
     if (err.message === 'EXPORT_EMAIL_FAILED')
       return error(res, 'Failed to send your data export email. Please try again later.', 502);

@@ -11,6 +11,14 @@ import { info, logError } from '../utils/logger.js';
 
 const RATE_LIMIT_WINDOW_MS = 24 * 60 * 60 * 1000; // 1 request per user per 24h
 
+/** "shakthi@gmail.com" → "sh•••••@gmail.com" — enough to recognise, not to read. */
+export function maskEmail(email) {
+  if (!email || !email.includes('@')) return email ?? null;
+  const [local, domain] = email.split('@');
+  const keep = local.length <= 2 ? 1 : 2;
+  return `${local.slice(0, keep)}${'•'.repeat(Math.max(local.length - keep, 3))}@${domain}`;
+}
+
 // ─────────────────────────────────────────────────────────────
 // RATE LIMIT — one export per user per 24h, backed by
 // data_export_requests (which also serves as the audit trail)
@@ -371,6 +379,30 @@ function buildEmailHtml() {
 // PUBLIC ENTRY POINT
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * When the signed-in user last exported, and when they can again — for
+ * the "My Data" row in the app (Profile → System Settings).
+ */
+export async function getDataExportStatus(userId) {
+  const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
+  const [user, last] = await Promise.all([
+    prisma.users.findUnique({ where: { id: bUserId }, select: { email: true } }),
+    prisma.data_export_requests.findFirst({
+      where:   { user_id: bUserId },
+      orderBy: { requested_at: 'desc' },
+      select:  { requested_at: true },
+    }),
+  ]);
+  if (!user) throw new Error('USER_NOT_FOUND');
+  const lastRequestedAt = last?.requested_at ?? null;
+  const nextAt = lastRequestedAt ? new Date(lastRequestedAt.getTime() + RATE_LIMIT_WINDOW_MS) : null;
+  return {
+    email: maskEmail(user.email),
+    lastRequestedAt,
+    nextAvailableAt: nextAt && nextAt > new Date() ? nextAt : null,
+  };
+}
+
 export async function requestDataExport(userId) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
 
@@ -410,5 +442,9 @@ export async function requestDataExport(userId) {
 
   info(`Data export sent — user_id=${bUserId} email=${exportData.profile.email}`);
 
-  return { email: exportData.profile.email };
+  return {
+    email: maskEmail(exportData.profile.email),
+    lastRequestedAt: exportedAt,
+    nextAvailableAt: new Date(exportedAt.getTime() + RATE_LIMIT_WINDOW_MS),
+  };
 }

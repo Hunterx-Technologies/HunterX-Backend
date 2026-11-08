@@ -20,17 +20,17 @@ import { getISTDateOnly, calculateStepsGoal } from '../utils/helpers.js';
 import { info, logError } from '../utils/logger.js';
 
 export async function syncUserAgesForBirthdays(today) {
-  const usersWithDob = await prisma.users.findMany({
-    where: {
-      date_of_birth: { not: null },
-    },
-    select: {
-      id: true,
-      date_of_birth: true,
-      age: true,
-      bmi: true,
-    },
-  });
+  // Only users whose stored age no longer matches their birthday — usually
+  // just today's birthdays, but also anyone missed by an earlier run — so
+  // this stays small however many users there are. The loop below
+  // recomputes and double-checks each one exactly as before.
+  const todayKey = today.toISOString().slice(0, 10);
+  const usersWithDob = await prisma.$queryRaw`
+    SELECT id, date_of_birth, age, bmi
+    FROM users
+    WHERE date_of_birth IS NOT NULL
+      AND (age IS NULL OR age <> date_part('year', age(${todayKey}::date, date_of_birth))::int)
+  `;
 
   let updatedCount = 0;
 
@@ -69,6 +69,9 @@ export async function syncUserAgesForBirthdays(today) {
     info(`Daily birthday age sync completed: updated ${updatedCount} user(s)`);
   }
 }
+
+// Users assigned in parallel by the nightly job.
+const ASSIGN_CONCURRENCY = 4;
 
 export async function runNightlyTaskAssignment() {
   const today = getISTDateOnly();
@@ -131,15 +134,22 @@ export async function runNightlyTaskAssignment() {
   let failedCount   = 0;
   const shared      = await loadSharedTasks(today);
 
-  for (const user of users) {
-    try {
-      const { assigned } = await assignDailyTasks(user.id, today, shared);
-      assignedTotal += assigned;
-    } catch (err) {
-      failedCount += 1;
-      logError(`Nightly task assignment failed for user ${user.id}: ${err.message}`);
+  // A few users at a time: each assignment is independent and idempotent,
+  // and the cap leaves most of the DB pool free for app traffic.
+  let next = 0;
+  const worker = async () => {
+    while (next < users.length) {
+      const user = users[next++];
+      try {
+        const { assigned } = await assignDailyTasks(user.id, today, shared);
+        assignedTotal += assigned;
+      } catch (err) {
+        failedCount += 1;
+        logError(`Nightly task assignment failed for user ${user.id}: ${err.message}`);
+      }
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(ASSIGN_CONCURRENCY, users.length) }, worker));
 
   info(
     `Nightly task assignment done — ${users.length} active users, ` +

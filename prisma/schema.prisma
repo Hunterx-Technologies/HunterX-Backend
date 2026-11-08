@@ -108,8 +108,8 @@ model discovery_matches {
   messages                                    messages[]
 
   @@unique([user_a_id, user_b_id])
-  @@index([user_a_id], map: "idx_matches_user_a")
   @@index([user_b_id], map: "idx_matches_user_b")
+  @@index([unmatched_by], map: "idx_matches_unmatched_by")
 }
 
 model discovery_swipes {
@@ -123,7 +123,6 @@ model discovery_swipes {
 
   @@unique([swiper_id, swiped_id])
   @@index([swiped_id], map: "idx_swipes_swiped")
-  @@index([swiper_id], map: "idx_swipes_swiper")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -146,7 +145,6 @@ model dragon_stages {
   user_dragon_evolutions user_dragon_evolutions[]
   users                  users[]
 
-  @@index([stage_number], map: "idx_dragon_stage_number")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -184,7 +182,6 @@ model health_metrics {
   users          users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, metric_date, source])
-  @@index([user_id, metric_date], map: "idx_health_user_date")
 }
 
 // One row per user per calendar day — daily summaries synced from the
@@ -210,7 +207,6 @@ model health_metrics_daily {
   users          users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, date], map: "unique_user_date")
-  @@index([user_id, date], map: "idx_health_metrics_daily_user_date")
 }
 
 model leaderboard {
@@ -259,6 +255,7 @@ model messages {
   users             users             @relation(fields: [sender_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
 
   @@index([match_id, sent_at], map: "idx_messages_match")
+  @@index([sender_id], map: "idx_messages_sender")
 }
 
 model notifications {
@@ -293,6 +290,7 @@ model notifications {
   @@index([sent_at], map: "idx_notifications_sent")
   @@index([user_id, is_read], map: "idx_notifications_user")
   @@index([push_status, deliver_after], map: "idx_notifications_push_queue")
+  @@index([quote_id], map: "idx_notifications_quote", where: raw("(quote_id IS NOT NULL)"))
 }
 
 // Last ranks seen by the daily leaderboard digest push
@@ -532,7 +530,7 @@ model task_admin_targets {
   users      users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([task_id, user_id])
-  @@index([task_id], map: "idx_task_admin_targets_task")
+  @@index([user_id], map: "idx_task_admin_targets_user")
 }
 
 model tasks {
@@ -609,6 +607,7 @@ model user_badges {
 
   @@unique([user_id, badge_id])
   @@index([user_id], map: "idx_user_badges_unseen", where: raw("(seen_at IS NULL)"))
+  @@index([badge_id], map: "idx_user_badges_badge")
 }
 
 model user_discovery_interests {
@@ -632,7 +631,6 @@ model user_dragon_evolutions {
   users              users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, stage_number])
-  @@index([user_id], map: "idx_dragon_evolutions_user")
 }
 
 // One row per device (Expo push token). A token moving to another account
@@ -659,7 +657,6 @@ model user_onboarding_answers {
   users       users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, question_id])
-  @@index([user_id], map: "idx_onboarding_answers_user")
 }
 
 model user_progression {
@@ -718,6 +715,8 @@ model user_rewards {
   @@index([expires_at], map: "idx_rewards_expires", where: raw("(status = 'ACTIVE'::reward_status)"))
   @@index([user_id, status], map: "idx_rewards_user_status")
   @@index([coupon_id], map: "idx_rewards_coupon")
+  @@index([trigger_id], map: "idx_user_rewards_trigger")
+  @@index([pool_id], map: "idx_user_rewards_pool")
 }
 
 model user_streak_milestones {
@@ -730,7 +729,6 @@ model user_streak_milestones {
   users             users             @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, milestone_id])
-  @@index([user_id], map: "idx_streak_milestones_user")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -829,10 +827,7 @@ model users {
 
   streak_events                                           streak_events[]
   level_up_events                                         level_up_events[]
-  @@index([email], map: "idx_users_email")
-  @@index([hunter_id], map: "idx_users_hunter_id")
   @@index([last_latitude, last_longitude], map: "idx_users_location", where: raw("(location_visible = true)"))
-  @@index([referral_code], map: "idx_users_referral_code")
   @@index([referred_by], map: "idx_users_referred_by")
   @@index([delete_at], map: "idx_users_delete_at", where: raw("(delete_at IS NOT NULL)"))
 }
@@ -853,6 +848,7 @@ model admin_user_actions {
   admin      users?                 @relation("admin_user_actions_admin", fields: [admin_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
 
   @@index([user_id, created_at(sort: Desc)], map: "idx_admin_user_actions_user_created")
+  @@index([admin_id], map: "idx_admin_user_actions_admin")
 }
 
 model xp_transactions {
@@ -867,6 +863,7 @@ model xp_transactions {
 
   @@index([created_at], map: "idx_xp_created_at")
   @@index([user_id], map: "idx_xp_user_id")
+  @@index([task_id], map: "idx_xp_transactions_task")
 }
 
 /// One-time codes bound to an account (email change, website deletion / cancellation). Only the SHA-256 of the code is stored.

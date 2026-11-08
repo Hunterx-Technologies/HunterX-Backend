@@ -102,45 +102,54 @@ export async function getTodayTasks(userId, overrideGender = null) {
     await assignDailyTasks(bUserId, todayDate);
   }
 
-  // Daily: whatever was assigned to this user for today.
-  const dailySchedule = await prisma.task_schedule.findMany({
-    where: {
-      user_id:     bUserId,
-      active_date: todayDate,
-      tasks:       { is_active: true, task_type: { in: DAILY_TYPES } },
-    },
-    include: { tasks: true },
-  });
-
-  // Weekly + monthly: assigned every day of the task's window (or the
-  // user's access window, if paid), so today's row is enough.
-  const periodSchedule = await prisma.task_schedule.findMany({
-    where: {
-      user_id:     bUserId,
-      active_date: todayDate,
-      tasks:       { is_active: true, task_type: { in: ['WEEKLY', 'MONTHLY'] } },
-    },
-    include: { tasks: true },
-  });
-
-  // A paid task the user has COMPLETED is closed for them — hidden even
-  // though today's task_schedule row still exists.
-  const completedPaid = await getCompletedPaidTaskIds(bUserId);
+  // These three reads are independent of each other (today's rows are
+  // already assigned above) — run them together.
+  const [dailySchedule, periodSchedule, completedPaid] = await Promise.all([
+    // Daily: whatever was assigned to this user for today.
+    prisma.task_schedule.findMany({
+      where: {
+        user_id:     bUserId,
+        active_date: todayDate,
+        tasks:       { is_active: true, task_type: { in: DAILY_TYPES } },
+      },
+      include: { tasks: true },
+    }),
+    // Weekly + monthly: assigned every day of the task's window (or the
+    // user's access window, if paid), so today's row is enough.
+    prisma.task_schedule.findMany({
+      where: {
+        user_id:     bUserId,
+        active_date: todayDate,
+        tasks:       { is_active: true, task_type: { in: ['WEEKLY', 'MONTHLY'] } },
+      },
+      include: { tasks: true },
+    }),
+    // A paid task the user has COMPLETED is closed for them — hidden even
+    // though today's task_schedule row still exists.
+    getCompletedPaidTaskIds(bUserId),
+  ]);
   const eligible = [...dailySchedule, ...periodSchedule]
     .map(s => s.tasks)
     .filter(t => !completedPaid.has(t.id));
 
-  const periodByTask = new Map();
-  for (const task of eligible) periodByTask.set(task.id, await getTaskPeriod(bUserId, task, todayDate));
+  // Only paid weekly/monthly tasks hit the database here; resolve them together.
+  const periods = await Promise.all(eligible.map(task => getTaskPeriod(bUserId, task, todayDate)));
+  const periodByTask = new Map(eligible.map((task, i) => [task.id, periods[i]]));
 
   const periodKeys = [...new Set([...periodByTask.values()].map(p => p.start.getTime()))];
-  const completions = await prisma.task_completions.findMany({
-    where: {
-      user_id:       bUserId,
-      task_id:       { in: eligible.map(t => t.id) },
-      schedule_date: { in: periodKeys.map(t => new Date(t)) },
-    },
-  });
+  // The completions, the locked (for-sale) tasks and the streak status don't
+  // depend on each other either.
+  const [completions, lockedTasks, streak] = await Promise.all([
+    prisma.task_completions.findMany({
+      where: {
+        user_id:       bUserId,
+        task_id:       { in: eligible.map(t => t.id) },
+        schedule_date: { in: periodKeys.map(t => new Date(t)) },
+      },
+    }),
+    getLockedTasks(bUserId, todayDate),
+    getStreakRiskStatus(bUserId),
+  ]);
   const completionMap = new Map(
     completions.map(c => [`${c.task_id}_${dateKey(c.schedule_date)}`, c])
   );
@@ -203,14 +212,12 @@ export async function getTodayTasks(userId, overrideGender = null) {
   // Paid tasks (any type) on sale that this user hasn't bought — shown with
   // a buy button until end_date, not completable (no task_schedule row)
   // and not in XP totals. Buying unlocks access from that day to end_date.
-  const locked = (await getLockedTasks(bUserId, todayDate)).map(task => ({
+  const locked = lockedTasks.map(task => ({
     ...serialize(task),
     status:        'LOCKED',
     price:         Number(task.price),
     currency:      task.currency,
   }));
-
-  const streak = await getStreakRiskStatus(bUserId);
 
   return {
     date:               dateKey(todayDate),
@@ -709,6 +716,9 @@ function formatDateLabel(completionDate) {
   return `${compMidnight.getUTCDate()} ${months[compMidnight.getUTCMonth()]}`;
 }
 
+// Statuses shown in the profile's Activities log.
+const ACTIVITY_LOG_STATUSES = ['COMPLETED', 'PARTIAL', 'SKIPPED'];
+
 export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
 
@@ -737,22 +747,23 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
 
   if (!user) throw new Error('USER_NOT_FOUND');
 
-  // Total count of completed quests
-  const totalCompletions = await prisma.task_completions.count({
-    where: {
-      user_id: bUserId,
-      status: 'COMPLETED',
-    },
-  });
+  // The log lists every quest the hunter acted on — completed, partly done
+  // or skipped. Photo-proof states (IN_REVIEW / RESUBMIT / REJECTED) aren't
+  // a result yet and stay out. The summary card still counts completions.
+  const logWhere = { user_id: bUserId, status: { in: ACTIVITY_LOG_STATUSES } };
+  const [totalCompletions, totalLogs] = await Promise.all([
+    prisma.task_completions.count({ where: { user_id: bUserId, status: 'COMPLETED' } }),
+    prisma.task_completions.count({ where: logWhere }),
+  ]);
 
-  // 2. Fetch paginated completed task logs
+  // 2. Fetch paginated task logs, newest day first. Skipped rows have no
+  // completed_at, and Postgres sorts NULLs first in DESC — so order by the
+  // day, then by time within it with skips last.
   const rawLogs = await prisma.task_completions.findMany({
-    where: {
-      user_id: bUserId,
-      status: 'COMPLETED',
-    },
+    where: logWhere,
     orderBy: [
-      { completed_at: 'desc' },
+      { schedule_date: 'desc' },
+      { completed_at: { sort: 'desc', nulls: 'last' } },
       { id: 'desc' },
     ],
     skip,
@@ -779,8 +790,9 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
     return {
       id: log.id,
       task_id: log.task_id,
-      title: log.tasks?.title || 'Completed Task',
-      xp_earned: log.xp_earned,
+      title: log.tasks?.title || 'Quest',
+      status: log.status.toLowerCase(), // 'completed' | 'partial' | 'skipped'
+      xp_earned: log.xp_earned ?? 0,
       schedule_date: log.schedule_date ? log.schedule_date.toISOString().slice(0, 10) : null,
       completed_at: log.completed_at || log.created_at,
       day_number: dayNumber,
@@ -788,7 +800,7 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
     };
   });
 
-  const totalPages = Math.ceil(totalCompletions / limit) || 0;
+  const totalPages = Math.ceil(totalLogs / limit) || 0;
 
   return {
     summary: {
@@ -801,7 +813,7 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
     pagination: {
       page,
       limit,
-      total_count: totalCompletions,
+      total_count: totalLogs,
       total_pages: totalPages,
       has_next_page: page < totalPages,
     },

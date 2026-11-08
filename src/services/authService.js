@@ -34,6 +34,7 @@ import {
   isValidEmail,
   isStrongPassword,
 } from '../utils/helpers.js';
+import { getLevelRows } from './levelsCache.js';
 
 // Expo/React Native apps get Google ID tokens issued for different
 // client IDs per platform (web/iOS/Android), so verifyIdToken() must
@@ -437,44 +438,28 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
 // SEND OTP FOR EMAIL VERIFICATION
 // ─────────────────────────────────────────────────────────────
 
-// Sent instead of a code when the address already has an account, so
-// send-otp answers the same either way and can't be used to find out
-// which emails are registered — only the inbox owner learns it.
-function sendAccountExistsEmail(user) {
-  const pending = !!user.delete_at;
-  return sendMail({
-    to:      user.email,
-    subject: pending ? 'Your HunterX account is scheduled for deletion' : 'You already have a HunterX account',
-    html: brandedEmail({
-      heading: pending ? 'Your account is waiting to be deleted' : 'You already have an account',
-      paragraphs: pending
-        ? ['Someone tried to create a new HunterX account with this email. It already belongs to an account that is <strong style="color:#ffffff;">scheduled for deletion</strong>.',
-           'Log in to the app to see it, and tap <strong style="color:#ffffff;">Keep my account</strong> if you want to keep it.']
-        : ['Someone tried to create a new HunterX account with this email, but it already has one.',
-           'Open the app and log in instead. Forgot your password? Use <strong style="color:#ffffff;">Forgot password</strong> on the login screen.'],
-      note: 'If this wasn\'t you, you can ignore this email — nothing has changed.',
-    }),
-  });
-}
-
 export async function sendOtp(rawEmail) {
   const email = normalizeEmail(rawEmail);
 
-  // One code a minute, ten a day per address — counted the same whether or
-  // not the address has an account.
-  if (!(await allowCodeEmail('signup', email))) throw new Error('OTP_COOLDOWN');
-
-  // Step 1 — An address that already has an account gets a notice instead
-  // of a code. The response is identical.
+  // Step 1 — An address that already has an account is told so on the
+  // Signup screen (no email is sent), like login and forgot-password do;
+  // authLimiter rate-limits probing. err.providers names how the account
+  // signs in, for the message. An account waiting to be deleted is sent to
+  // Login, where signing in restores it.
   const existing = await findUserByEmail(email);
   if (existing) {
-    try {
-      await sendAccountExistsEmail(existing);
-    } catch (err) {
-      logError(`Account-exists notice to ${email} failed: ${err.message || err}`);
-    }
-    return true;
+    if (existing.delete_at) throw new Error('ACCOUNT_PENDING_DELETION_LOGIN_TO_RESTORE');
+    const providers = await prisma.auth_providers.findMany({
+      where:  { user_id: existing.id },
+      select: { provider: true },
+    });
+    const err = new Error('ACCOUNT_EXISTS');
+    err.providers = providers.map((p) => p.provider);
+    throw err;
   }
+
+  // One code a minute, ten a day per address.
+  if (!(await allowCodeEmail('signup', email))) throw new Error('OTP_COOLDOWN');
 
   // Step 2 — Generate 6 digit OTP
   const otp = generateOtp();
@@ -799,7 +784,6 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
     });
     if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
     await markEmailVerifiedIfMatches(user, email);
-    await storeAppleRefreshToken(existingProvider.id, authorizationCode);
     const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
   }
@@ -970,38 +954,34 @@ export async function refreshAccessToken(refreshToken) {
 export async function forgotPassword(rawEmail) {
   const email = normalizeEmail(rawEmail);
 
-  // Every outcome below looks identical to the caller (the route always
-  // answers "if an account exists..."), so this endpoint can't be used to
-  // probe which emails have accounts. Emails are sent in the background so
-  // response time doesn't give it away either.
+  // Errors the app shows on the Forgot Password screen:
+  // - ACCOUNT_NOT_FOUND: no account uses this email (login reveals this too).
+  // - SOCIAL_ACCOUNT: the account signs in only with Google/Apple, so it has
+  //   no password to reset; err.provider says which, for the message.
+  // Accounts with a password (even ones also linked to Google/Apple) get a
+  // reset link, sent in the background.
   const user = await findUserByEmail(email);
-  if (!user) return;
+  if (!user) throw new Error('ACCOUNT_NOT_FOUND');
 
-  // One email per 10-minute window, whatever kind of email it is —
-  // reset_token_expiry doubles as the cooldown clock. Silently dropped:
-  // the earlier email is still valid.
-  if (user.reset_token_expiry && user.reset_token_expiry > new Date()) return;
-
-  const resetExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-  // Google/Apple-only accounts have no password to reset — tell them how
-  // they sign in instead. reset_token stays null, so no reset link can
-  // ever match; only the cooldown clock is set.
   const providers = await prisma.auth_providers.findMany({
     where:  { user_id: user.id },
     select: { provider: true },
   });
   if (!providers.some(p => p.provider === 'EMAIL')) {
-    await prisma.users.update({
-      where: { id: user.id },
-      data:  { reset_token: null, reset_token_expiry: resetExpiry },
-    });
-    const via = providers.some(p => p.provider === 'APPLE') ? 'Apple' : 'Google';
-    sendSocialAccountEmail(email, via).catch((err) =>
-      logError(`Social-account reset notice to ${email} failed: ${err.message || err}`)
-    );
-    return;
+    const err = new Error('SOCIAL_ACCOUNT');
+    // Every way this account can sign in — one account can have both.
+    const names = [];
+    if (providers.some(p => p.provider === 'GOOGLE')) names.push('Google');
+    if (providers.some(p => p.provider === 'APPLE')) names.push('Apple');
+    err.provider = names.length ? names.join(' or ') : 'Google';
+    throw err;
   }
+
+  // One email per 10-minute window — reset_token_expiry doubles as the
+  // cooldown clock. Silently dropped: the earlier link is still valid.
+  if (user.reset_token_expiry && user.reset_token_expiry > new Date()) return;
+
+  const resetExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
   const resetToken  = generateResetToken();
   await prisma.users.update({
@@ -1081,52 +1061,6 @@ export async function forgotPassword(rawEmail) {
       </html>
     `,
   }).catch((err) => logError(`Password reset email to ${email} failed: ${err.message || err}`));
-}
-
-// Sent instead of a reset link when the account signs in with Google or
-// Apple — there's no password to reset.
-function sendSocialAccountEmail(email, via) {
-  return mailTransporter.sendMail({
-    from:    process.env.EMAIL_FROM || process.env.GMAIL_USER,
-    to:      email,
-    subject: 'Signing in to HunterX',
-    html: `
-      <!DOCTYPE html>
-      <html>
-      <body style="margin:0;padding:0;background-color:#0a0a0a;font-family:Arial,sans-serif;">
-        <table width="100%" cellpadding="0" cellspacing="0">
-          <tr>
-            <td align="center" style="padding:40px 20px;">
-              <table width="480" cellpadding="0" cellspacing="0" style="background-color:#111111;border-radius:8px;border:1px solid #222222;">
-                <tr>
-                  <td style="background-color:#000000;padding:32px;text-align:center;border-bottom:1px solid #222222;">
-                    <h1 style="margin:0;color:#ffffff;font-size:24px;font-style:italic;letter-spacing:4px;">HUNTERX</h1>
-                    <p style="margin:8px 0 0;color:#555555;font-size:12px;letter-spacing:2px;text-transform:uppercase;">The system awaits</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:40px 32px;text-align:center;">
-                    <h2 style="margin:0 0 16px;color:#ffffff;font-size:24px;font-weight:bold;">No password to reset</h2>
-                    <p style="margin:0 0 16px;color:#888888;font-size:14px;line-height:1.6;">
-                      Your HunterX account signs in with <strong style="color:#ffffff;">${via}</strong>, so it doesn't have a password.<br>
-                      Open the app and tap <strong style="color:#ffffff;">Continue with ${via}</strong> to get back in.
-                    </p>
-                    <p style="margin:0;color:#333333;font-size:12px;">If you did not request this, ignore this email.</p>
-                  </td>
-                </tr>
-                <tr>
-                  <td style="padding:20px 32px;text-align:center;border-top:1px solid #222222;">
-                    <p style="margin:0;color:#333333;font-size:11px;">HunterX by Gymgasm · Do not reply to this email</p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
-    `,
-  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1293,17 +1227,27 @@ export async function getCurrentUser(userId) {
   const flatUser = { ...rest, ...deletionStatus(user) };
   flatUser.gender        = GENDER_LABELS[user.gender] ?? user.gender;
   flatUser.auth_provider = auth_providers?.[0]?.provider || null;
-  flatUser.week_status   = await getWeekStatus(bUserId);
-  // Display only — referrals carry no reward.
-  flatUser.accepted_invites_count = await countAcceptedInvites(bUserId);
+
+  // These lookups don't depend on each other — run them together.
+  const currentLvlNum = flatUser.user_progression?.current_level || 1;
+  const nextLvlNum    = currentLvlNum + 1;
+  const [weekStatus, acceptedInvites, levelRows, rawBadges] = await Promise.all([
+    getWeekStatus(bUserId),
+    // Display only — referrals carry no reward.
+    countAcceptedInvites(bUserId),
+    flatUser.user_progression ? getLevelRows([currentLvlNum, nextLvlNum]) : Promise.resolve([]),
+    prisma.user_badges.findMany({
+      where: { user_id: bUserId },
+      orderBy: { earned_at: 'asc' },
+      include: {
+        badges: true,
+      },
+    }),
+  ]);
+  flatUser.week_status = weekStatus;
+  flatUser.accepted_invites_count = acceptedInvites;
 
   if (flatUser.user_progression) {
-    const currentLvlNum = flatUser.user_progression.current_level || 1;
-    const nextLvlNum    = currentLvlNum + 1;
-
-    const levelRows = await prisma.levels.findMany({
-      where: { level_number: { in: [currentLvlNum, nextLvlNum] } },
-    });
 
     const currentLevelRow = levelRows.find(l => l.level_number === currentLvlNum);
     const nextLevelRow    = levelRows.find(l => l.level_number === nextLvlNum);
@@ -1330,14 +1274,6 @@ export async function getCurrentUser(userId) {
     'Void Ascendant': 200,
     'Eternal Hunter': 365,
   };
-
-  const rawBadges = await prisma.user_badges.findMany({
-    where: { user_id: bUserId },
-    orderBy: { earned_at: 'asc' },
-    include: {
-      badges: true,
-    },
-  });
 
   flatUser.badges = rawBadges.map((ub) => {
     const milestoneDays = STREAK_BADGE_DAYS_MAP[ub.badges.name] ?? null;
