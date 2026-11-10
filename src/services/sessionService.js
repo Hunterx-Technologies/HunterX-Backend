@@ -6,7 +6,8 @@
 //   rotateSession  — POST /auth/refresh: the presented token is revoked and
 //                    replaced. Presenting an already-revoked token again
 //                    (a stolen copy replayed after the owner refreshed)
-//                    revokes the whole family, signing out both copies.
+//                    revokes the whole family, signing out both copies —
+//                    unless it's within seconds of the rotation (below).
 //   revokeSession  — POST /auth/logout: the token's family.
 //   revokeAllSessions — password change / reset: every family.
 //
@@ -18,9 +19,14 @@ import crypto from 'crypto';
 import prisma from '../config/prisma.js';
 import { generateTokens, verifyRefreshToken } from '../utils/helpers.js';
 
-// A token rotated this recently and presented again is treated as the
-// client retrying a refresh whose response it lost (spotty network), not
-// as theft: refused, but the family is left alone.
+// A token rotated this recently and presented again is treated as the same
+// client refreshing twice at once, not as theft: it gets its own new token
+// in the same family. That happens whenever the access token expires — the
+// admin panel's proxy and its Server Actions, or a few parallel page
+// requests, each refresh with the one cookie they share, and only one can
+// rotate it first. Refusing the others signed the admin out mid-save. A
+// retry whose response was lost (spotty network) is covered the same way.
+// Past the window, or once the family is signed out, reuse is still refused.
 const REUSE_GRACE_MS = 30 * 1000;
 
 function refreshTtlMs() {
@@ -90,8 +96,14 @@ export async function rotateSession(refreshToken) {
           where: { family_id: row.family_id, revoked_at: null },
           data:  { revoked_at: new Date() },
         });
+        throw new Error('TOKEN_REVOKED');
       }
-      throw new Error('TOKEN_REVOKED');
+      // Concurrent refresh: only while the family is still signed in (a
+      // logout or a theft revocation revokes every token in it).
+      const live = await tx.refresh_tokens.count({ where: { family_id: row.family_id, revoked_at: null } });
+      if (live === 0) throw new Error('TOKEN_REVOKED');
+      const sibling = await mint(user, row.family_id, tx);
+      return { user, accessToken: sibling.accessToken, refreshToken: sibling.refreshToken };
     }
 
     const next = await mint(user, row.family_id, tx);

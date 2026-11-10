@@ -23,9 +23,30 @@ test('rotation revokes the presented token and issues a working one', async () =
   const first = await sessions.issueSession(user);
   const second = await sessions.rotateSession(first.refreshToken);
   assert.ok(second.refreshToken && second.refreshToken !== first.refreshToken);
-  await assert.rejects(sessions.rotateSession(first.refreshToken), /TOKEN_REVOKED/);
+  assert.ok(fake.models.refresh_tokens.rows.find((r) => r.revoked_at), 'the presented token is revoked');
   const third = await sessions.rotateSession(second.refreshToken);
   assert.ok(third.accessToken);
+});
+
+test('two refreshes racing with one token both succeed, in the same family', async () => {
+  // The admin panel's proxy and a Server Action (or parallel page requests)
+  // all refresh with the same cookie once the access token expires.
+  const first = await sessions.issueSession(user);
+  const a = await sessions.rotateSession(first.refreshToken);
+  const b = await sessions.rotateSession(first.refreshToken);
+  assert.ok(a.refreshToken && b.refreshToken && a.refreshToken !== b.refreshToken);
+  const families = new Set(fake.models.refresh_tokens.rows.map((r) => r.family_id));
+  assert.equal(families.size, 1);
+  // Both new tokens keep working.
+  assert.ok((await sessions.rotateSession(a.refreshToken)).accessToken);
+  assert.ok((await sessions.rotateSession(b.refreshToken)).accessToken);
+});
+
+test('a just-rotated token is refused once the session is logged out', async () => {
+  const first = await sessions.issueSession(user);
+  const second = await sessions.rotateSession(first.refreshToken);
+  await sessions.revokeSession(second.refreshToken);
+  await assert.rejects(sessions.rotateSession(first.refreshToken), /TOKEN_REVOKED/);
 });
 
 test('replaying a token rotated long ago revokes the whole family', async () => {
