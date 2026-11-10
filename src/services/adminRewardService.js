@@ -348,9 +348,27 @@ export async function updateCoupon(couponId, body = {}, image = null) {
 // Switches a reward on or off. Off = it grants no new cards; cards users
 // already hold, and its coupons' settings, are kept for when it's back on.
 export async function setTriggerActive(triggerId, isActive, kind = null) {
-  if (typeof isActive !== 'boolean') throw invalid('is_active must be true or false');
+  return updateTrigger(triggerId, { is_active: isActive }, kind);
+}
+
+// PATCH body: { is_active?, description? }. description renames a special
+// (TASK) reward — streak / level / birthday titles come from their value.
+// Hunters' cards show the coupon, not this name, so a rename is admin-side.
+export async function updateTrigger(triggerId, body = {}, kind = null) {
+  const data = {};
+  if (body.is_active !== undefined) {
+    if (typeof body.is_active !== 'boolean') throw invalid('is_active must be true or false');
+    data.is_active = body.is_active;
+  }
   const trigger = await findTrigger(prisma, triggerId, kind);
-  await prisma.reward_triggers.update({ where: { id: trigger.id }, data: { is_active: isActive } });
+  if (body.description !== undefined) {
+    if (trigger.kind !== 'TASK') throw invalid('Only special rewards can be renamed');
+    const name = optionalText(body.description, 'name', 120);
+    if (!name) throw invalid('Give the special reward a name, e.g. "Nike drop"');
+    data.description = name;
+  }
+  if (Object.keys(data).length === 0) throw invalid('Send is_active or description');
+  await prisma.reward_triggers.update({ where: { id: trigger.id }, data });
   return (await listTriggers(trigger.kind)).find((t) => t.id === String(trigger.id));
 }
 
