@@ -41,7 +41,8 @@ import prisma from '../config/prisma.js';
 import { parseDateOnly, getISTDateOnly } from '../utils/helpers.js';
 import { uploadCompressedImage, deleteImages, ownPublicIdFromUrl } from './imageUploadService.js';
 import { announceTaskChange } from './questNotificationService.js';
-import { logError } from '../utils/logger.js';
+import { syncTaskForToday } from './taskAssignmentService.js';
+import { info, logError } from '../utils/logger.js';
 
 const TASK_IMAGE_FOLDER = 'hunterx/tasks';
 
@@ -52,6 +53,18 @@ function announceInBackground(saved, existing = null) {
   announceTaskChange(saved, existing).catch((err) =>
     logError(`Quest announcement failed for task ${saved.id}: ${err.message}`)
   );
+}
+
+// Today's lists follow the saved task straight away (taskAssignmentService
+// trigger D) — before the push goes out, so a "New quest" tap finds it.
+// Never fails the save: the nightly cron still catches up tomorrow.
+async function syncToday(saved) {
+  try {
+    const { added, removed } = await syncTaskForToday(saved.id);
+    if (added || removed) info(`Task ${saved.id}: today's lists +${added} / -${removed}`);
+  } catch (err) {
+    logError(`Today's list sync failed for task ${saved.id}: ${err.message}`);
+  }
 }
 
 const CREATABLE_TYPES    = ['DAILY_ADMIN', 'WEEKLY', 'MONTHLY'];
@@ -369,6 +382,7 @@ export async function createTask(adminId, body, files = {}) {
   // Optional special reward: completing the task grants a card from it.
   if (input.special_reward_id !== undefined) data.special_reward_id = await resolveSpecialReward(input.special_reward_id);
   const saved = await writeWithImages(data, files, d => prisma.tasks.create({ data: d }));
+  await syncToday(saved);
   announceInBackground(saved);
   return saved;
 }
@@ -383,7 +397,9 @@ export async function updateTask(taskId, body, files = {}) {
   if (!CREATABLE_TYPES.includes(existing.task_type)) {
     const keys = Object.keys(body ?? {}).filter((k) => body[k] !== undefined);
     if (keys.length !== 1 || keys[0] !== 'is_active' || typeof body.is_active !== 'boolean') throw new Error('TASK_NOT_EDITABLE');
-    return prisma.tasks.update({ where: { id: existing.id }, data: { is_active: body.is_active, updated_at: new Date() } });
+    const toggled = await prisma.tasks.update({ where: { id: existing.id }, data: { is_active: body.is_active, updated_at: new Date() } });
+    await syncToday(toggled);
+    return toggled;
   }
 
   const changes = Object.fromEntries(
@@ -460,6 +476,7 @@ export async function updateTask(taskId, body, files = {}) {
   data.updated_at = new Date();
 
   const saved = await writeWithImages(data, files, d => prisma.tasks.update({ where: { id: existing.id }, data: d }), existing);
+  await syncToday(saved);
   announceInBackground(saved, existing);
   return saved;
 }

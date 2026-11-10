@@ -56,6 +56,16 @@ function dateKey(date) {
   return date.toISOString().slice(0, 10);
 }
 
+// Quest list order (the app shows lists as sent): highest XP first; equal
+// XP by title, then id, so the order never shifts between refreshes.
+export function sortByXpDesc(tasks) {
+  return [...tasks].sort((a, b) =>
+    (b.xp_reward ?? 0) - (a.xp_reward ?? 0) ||
+    String(a.title ?? '').localeCompare(String(b.title ?? '')) ||
+    (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+  );
+}
+
 // Convention: a task with target_value = null pulls its target from a
 // user-specific calculated goal instead of a fixed value on the task row,
 // keyed off the task's tag (see prisma/seed.js).
@@ -198,7 +208,8 @@ export async function getTodayTasks(userId, overrideGender = null) {
     };
   }
 
-  const daily  = eligible.filter(t => DAILY_TYPES.includes(t.task_type)).map(serialize);
+  // Each list is shown in the order sent: highest XP first.
+  const daily  = sortByXpDesc(eligible.filter(t => DAILY_TYPES.includes(t.task_type))).map(serialize);
   // period_start..period_end: the current 7 / 30-day block the task can be
   // completed once in.
   const withPeriod = task => ({
@@ -206,13 +217,13 @@ export async function getTodayTasks(userId, overrideGender = null) {
     period_start: dateKey(periodByTask.get(task.id).start),
     period_end:   dateKey(periodByTask.get(task.id).end),
   });
-  const weekly  = eligible.filter(t => t.task_type === 'WEEKLY').map(withPeriod);
-  const monthly = eligible.filter(t => t.task_type === 'MONTHLY').map(withPeriod);
+  const weekly  = sortByXpDesc(eligible.filter(t => t.task_type === 'WEEKLY')).map(withPeriod);
+  const monthly = sortByXpDesc(eligible.filter(t => t.task_type === 'MONTHLY')).map(withPeriod);
 
   // Paid tasks (any type) on sale that this user hasn't bought — shown with
   // a buy button until end_date, not completable (no task_schedule row)
   // and not in XP totals. Buying unlocks access from that day to end_date.
-  const locked = lockedTasks.map(task => ({
+  const locked = sortByXpDesc(lockedTasks).map(task => ({
     ...serialize(task),
     status:        'LOCKED',
     price:         Number(task.price),

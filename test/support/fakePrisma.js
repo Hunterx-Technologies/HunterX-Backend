@@ -39,7 +39,7 @@ function applyData(row, data) {
   return row;
 }
 
-function model(rows, { idKey = 'id', autoId = true } = {}) {
+export function model(rows, { idKey = 'id', autoId = true } = {}) {
   let nextId = 1n + BigInt(rows.filter((r) => typeof r[idKey] === 'bigint').length);
   const uniqueWhere = (where) => rows.find((r) => matches(r, where)) ?? null;
   // Reads return copies, as Prisma does — later writes don't show through.
@@ -53,7 +53,7 @@ function model(rows, { idKey = 'id', autoId = true } = {}) {
       if (sortKey) found = [...found].sort((a, b) => (dir === 'desc' ? b[sortKey] - a[sortKey] : a[sortKey] - b[sortKey]));
       return copy(found[0]);
     },
-    findMany: async ({ where = {}, take } = {}) => rows.filter((r) => matches(r, where)).slice(0, take ?? Infinity).map(copy),
+    findMany: async ({ where = {}, skip = 0, take } = {}) => rows.filter((r) => matches(r, where)).slice(skip, skip + (take ?? Infinity)).map(copy),
     count: async ({ where = {} } = {}) => rows.filter((r) => matches(r, where)).length,
     create: async ({ data }) => {
       const row = { created_at: new Date(), ...data };
