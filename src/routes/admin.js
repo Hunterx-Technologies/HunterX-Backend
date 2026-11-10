@@ -9,6 +9,7 @@ import * as adminTaskService from '../services/adminTaskService.js';
 import * as feedbackService  from '../services/feedbackService.js';
 import * as adminUserService from '../services/adminUserService.js';
 import * as broadcastService from '../services/broadcastService.js';
+import * as broadcastScheduleService from '../services/broadcastScheduleService.js';
 import * as adminRewardService from '../services/adminRewardService.js';
 import * as taskProofService from '../services/taskProofService.js';
 import * as dashboardService from '../services/adminDashboardService.js';
@@ -53,8 +54,8 @@ function coerceMultipartTaskBody(body) {
 // ── POST /api/admin/notifications/broadcast ───────────────
 // Send an announcement (push + inbox) to an audience. See broadcastService.js.
 // Body: { title (≤65), body (≤240), url?: '/rewards',
-//         audience: 'all' | 'inactive' | 'users',
-//         inactive_days?: 1–365 (audience=inactive), user_ids?: [...] (audience=users),
+//         audience: 'all' | 'inactive',
+//         inactive_days?: 1–365 (audience=inactive),
 //         dry_run?: true → recipient counts only, nothing sent }
 // Returns { dry_run, broadcast_id?, recipients, reachable_by_push }.
 router.post('/notifications/broadcast', verifyToken, verifyAdmin, async (req, res, next) => {
@@ -70,24 +71,90 @@ router.post('/notifications/broadcast', verifyToken, verifyAdmin, async (req, re
       INVALID_URL:           "url must be an app route like '/rewards'",
       INVALID_AUDIENCE:      `audience must be one of: ${broadcastService.BROADCAST_AUDIENCES.join(', ')}`,
       INVALID_INACTIVE_DAYS: 'inactive_days must be a whole number from 1 to 365',
-      INVALID_USER_IDS:      'user_ids must be a non-empty array of up to 5000 user ids',
     };
     if (badRequest[err.message]) return error(res, badRequest[err.message], 400);
     next(err);
   }
 });
 
-// ── GET /api/admin/notifications/broadcasts?limit=20 ──────
+// ── GET /api/admin/notifications/broadcasts?page=1&limit=20 ──
 // Past broadcasts, newest first, with recipients / pushed / pending /
 // not_pushed / read counts.
 router.get('/notifications/broadcasts', verifyToken, verifyAdmin, async (req, res, next) => {
   try {
-    const broadcasts = await broadcastService.listBroadcasts({ limit: req.query.limit });
-    return success(res, { broadcasts }, 'Broadcasts fetched successfully');
+    const { broadcasts, pagination } = await broadcastService.listBroadcasts({ page: req.query.page, limit: req.query.limit });
+    return success(res, { broadcasts, pagination }, 'Broadcasts fetched successfully');
   } catch (err) {
     next(err);
   }
 });
+
+// ── Scheduled / recurring broadcasts ──────────────────────
+// See broadcastScheduleService.js. send_date + send_time is the wall clock
+// every hunter receives it at in their own timezone.
+// Body (create + edit): the broadcast fields above (title, body, url?,
+//   audience, inactive_days?) plus send_date 'YYYY-MM-DD', send_time 'HH:MM',
+//   recurrence 'NONE' | 'DAILY' | 'WEEKLY' | 'MONTHLY'.
+const SCHEDULE_ERRORS = {
+  TITLE_REQUIRED:           [400, 'title is required'],
+  TITLE_TOO_LONG:           [400, 'title cannot exceed 65 characters'],
+  BODY_REQUIRED:            [400, 'body is required'],
+  BODY_TOO_LONG:            [400, 'body cannot exceed 240 characters'],
+  INVALID_URL:              [400, "url must be an app route like '/rewards'"],
+  INVALID_AUDIENCE:         [400, `audience must be one of: ${broadcastService.BROADCAST_AUDIENCES.join(', ')}`],
+  INVALID_INACTIVE_DAYS:    [400, 'inactive_days must be a whole number from 1 to 365'],
+  INVALID_RECURRENCE:       [400, 'recurrence must be one of: NONE, DAILY, WEEKLY, MONTHLY'],
+  INVALID_SEND_DATE:        [400, 'send_date must be a valid YYYY-MM-DD date'],
+  INVALID_SEND_TIME:        [400, 'send_time must be HH:MM (24-hour)'],
+  SEND_TIME_IN_PAST:        [400, 'The send date and time must be in the future'],
+  SCHEDULE_NOT_FOUND:       [404, 'Scheduled notification not found'],
+  SCHEDULE_NOT_EDITABLE:    [409, 'This notification is already sending or finished, so it can no longer be edited'],
+  SCHEDULE_NOT_CANCELLABLE: [409, 'This notification has already finished, so it can no longer be cancelled'],
+  SCHEDULE_NOT_ACTIVE:      [409, 'Only an active recurring notification can be paused'],
+  SCHEDULE_NOT_PAUSED:      [409, 'This notification is not paused'],
+  NOT_RECURRING:            [409, 'Only recurring notifications can be paused or resumed'],
+  SCHEDULE_CHANGED:         [409, 'This notification changed while you were editing it. Refresh and try again'],
+};
+
+function scheduleRoute(handler, okMessage, okStatus = 200) {
+  return async (req, res, next) => {
+    try {
+      const schedule = await handler(req);
+      return success(res, { schedule }, okMessage, okStatus);
+    } catch (err) {
+      const known = SCHEDULE_ERRORS[err.message];
+      if (known) return error(res, known[1], known[0], err.message);
+      next(err);
+    }
+  };
+}
+
+// ?scope=active (default: scheduled, paused, sending, failed) | all, &page=1&limit=10
+router.get('/notifications/schedules', verifyToken, verifyAdmin, async (req, res, next) => {
+  try {
+    const { schedules, pagination } = await broadcastScheduleService.listSchedules({
+      scope: req.query.scope, page: req.query.page, limit: req.query.limit,
+    });
+    return success(res, { schedules, pagination }, 'Scheduled notifications fetched successfully');
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/notifications/schedules', verifyToken, verifyAdmin,
+  scheduleRoute((req) => broadcastScheduleService.createSchedule(req.user.id, req.body), 'Notification scheduled', 201));
+
+router.patch('/notifications/schedules/:id', verifyToken, verifyAdmin,
+  scheduleRoute((req) => broadcastScheduleService.updateSchedule(req.params.id, req.body), 'Scheduled notification updated'));
+
+router.post('/notifications/schedules/:id/pause', verifyToken, verifyAdmin,
+  scheduleRoute((req) => broadcastScheduleService.pauseSchedule(req.params.id), 'Recurring notification paused'));
+
+router.post('/notifications/schedules/:id/resume', verifyToken, verifyAdmin,
+  scheduleRoute((req) => broadcastScheduleService.resumeSchedule(req.params.id), 'Recurring notification resumed'));
+
+router.post('/notifications/schedules/:id/cancel', verifyToken, verifyAdmin,
+  scheduleRoute((req) => broadcastScheduleService.cancelSchedule(req.params.id), 'Scheduled notification cancelled'));
 
 // 400 messages shared by task create + edit (adminTaskService throws the keys).
 const TASK_ERRORS = {
@@ -633,10 +700,16 @@ const DASHBOARD_WIDGETS = {
   'needs-attention':   dashboardService.getNeedsAttention,
 };
 
+// The list widgets (transactions, top-referrers, referral-activity,
+// coupon-activity, needs-attention) take ?page=&limit=&sort= (coupon-activity
+// also ?partner=) and return { items, pagination, sort }.
+const DASHBOARD_LISTS = new Set(['transactions', 'top-referrers', 'referral-activity', 'coupon-activity', 'needs-attention']);
+
 for (const [path, load] of Object.entries(DASHBOARD_WIDGETS)) {
   router.get(`/dashboard/${path}`, verifyToken, verifyAdmin, async (req, res, next) => {
     try {
-      return success(res, await load(), 'Dashboard data fetched');
+      const data = DASHBOARD_LISTS.has(path) ? await load(req.query) : await load();
+      return success(res, data, 'Dashboard data fetched');
     } catch (err) {
       next(err);
     }

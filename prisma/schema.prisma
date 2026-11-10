@@ -293,6 +293,59 @@ model notifications {
   @@index([quote_id], map: "idx_notifications_quote", where: raw("(quote_id IS NOT NULL)"))
 }
 
+// Admin-scheduled announcements (broadcastScheduleService.js). A one-time
+// schedule goes SCHEDULED → SENDING → SENT (then is deleted a week later);
+// a recurring one stays SCHEDULED, next_run_at advancing after each run,
+// until it is PAUSED or CANCELLED. start_date + send_time is a wall clock
+// each hunter receives it at in their OWN timezone; next_run_at / run_for
+// hold that wall clock with no zone (utils/broadcastSchedule.js).
+model broadcast_schedules {
+  id            BigInt                    @id @default(autoincrement())
+  title         String                    @db.VarChar(255)
+  body          String
+  url           String?                   @db.VarChar(100)
+  audience      String                    @db.VarChar(20)
+  inactive_days Int?
+  recurrence    broadcast_recurrence      @default(NONE)
+  start_date    DateTime                  @db.Date
+  send_time     String                    @db.VarChar(5)
+  next_run_at   DateTime?                 @db.Timestamp(6)
+  status        broadcast_schedule_status @default(SCHEDULED)
+  run_count     Int                       @default(0)
+  last_run_at   DateTime?                 @db.Timestamp(6)
+  completed_at  DateTime?                 @db.Timestamp(6) // SENT / CANCELLED at — starts the cleanup clock
+  last_error    String?                   @db.VarChar(500)
+  created_by    BigInt?
+  created_at    DateTime                  @default(now()) @db.Timestamp(6)
+  updated_at    DateTime                  @default(now()) @db.Timestamp(6)
+  runs          broadcast_schedule_runs[]
+
+  @@index([status, next_run_at], map: "idx_broadcast_schedules_due")
+}
+
+// One row per occurrence of a schedule — the delivery log. Outlives its
+// schedule (schedule_id → NULL on cleanup) so history stays auditable;
+// broadcast_id links to the notifications rows (dedupe_key broadcast:<id>).
+// UNIQUE (schedule_id, run_for) is what stops an occurrence sending twice.
+model broadcast_schedule_runs {
+  id                BigInt               @id @default(autoincrement())
+  schedule_id       BigInt?
+  run_for           DateTime             @db.Timestamp(6)
+  broadcast_id      String               @unique @db.VarChar(36)
+  title             String               @db.VarChar(255)
+  status            broadcast_run_status @default(QUEUING)
+  attempts          Int                  @default(0)
+  recipients        Int?
+  reachable_by_push Int?
+  error             String?              @db.VarChar(500)
+  created_at        DateTime             @default(now()) @db.Timestamp(6)
+  queued_at         DateTime?            @db.Timestamp(6)
+  schedule          broadcast_schedules? @relation(fields: [schedule_id], references: [id], onDelete: SetNull, onUpdate: NoAction)
+
+  @@unique([schedule_id, run_for], map: "uq_broadcast_runs_schedule_run_for")
+  @@index([status], map: "idx_broadcast_runs_status")
+}
+
 // Last ranks seen by the daily leaderboard digest push
 // (scheduledNotificationJobs.js#leaderboardDigest) — diffed against the
 // current ranks to say "you climbed" / "X passed you". null = unranked.
@@ -944,6 +997,29 @@ enum completion_status {
 enum push_platform {
   IOS
   ANDROID
+}
+
+enum broadcast_recurrence {
+  NONE
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum broadcast_schedule_status {
+  SCHEDULED
+  PAUSED
+  SENDING
+  SENT
+  CANCELLED
+  FAILED
+}
+
+enum broadcast_run_status {
+  QUEUING
+  QUEUED
+  SKIPPED
+  FAILED
 }
 
 enum push_status {

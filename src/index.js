@@ -23,6 +23,7 @@ import './cron/midnight.js';           // starts the nightly task-assignment cro
 import './cron/leaderboardNightly.js'; // starts the nightly leaderboard rebuild cron
 import './cron/pushDispatcher.js';     // starts push outbox delivery + receipt checks
 import './cron/notificationScheduler.js'; // starts local-time scheduled notifications
+import './cron/broadcastScheduler.js'; // starts admin-scheduled / recurring broadcasts
 import './cron/accountDeletion.js';   // starts the hourly scheduled-deletion purge
 
 const app  = express();

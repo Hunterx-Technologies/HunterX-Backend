@@ -33,6 +33,7 @@ await import('../src/cron/midnight.js');
 await import('../src/cron/leaderboardNightly.js');
 await import('../src/cron/pushDispatcher.js');
 await import('../src/cron/notificationScheduler.js');
+await import('../src/cron/broadcastScheduler.js');
 await import('../src/cron/accountDeletion.js');
 
 const tasks = () => [...cron.getTasks().values()];
@@ -40,10 +41,10 @@ const byName = (name) => tasks().find((t) => t.name === name);
 
 after(() => tasks().forEach((t) => t.destroy()));
 
-test('all six jobs are registered once, on UTC', () => {
+test('all seven jobs are registered once, on UTC', () => {
   const names = tasks().map((t) => t.name).sort();
   assert.deepEqual(names, [
-    'Account housekeeping', 'Leaderboard nightly', 'Nightly task assignment',
+    'Account housekeeping', 'Broadcast scheduler', 'Leaderboard nightly', 'Nightly task assignment',
     'Notification scheduler', 'Push dispatch', 'Push receipt check',
   ]);
   assert.equal(CRON_TIMEZONE, 'UTC');

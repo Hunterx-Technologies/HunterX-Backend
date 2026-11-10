@@ -8,3 +8,5 @@ prisma/generated/
 .claude/
 .windsurf/
 skills-lock.json
+.env.uat
+.env.production

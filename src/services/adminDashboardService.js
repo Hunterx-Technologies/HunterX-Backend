@@ -14,8 +14,10 @@
 //     number of referral signups (every signup used a link) until a share
 //     event is recorded.
 
+import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
+import { pageInfo } from '../utils/pageInfo.js';
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -28,6 +30,33 @@ export const PLAN_MONTHLY_PRICE = {
 const PLAN_CHARGE = { monthly: 9.99, yearly: 79.99 };
 const PLATFORM_LABEL = { IOS: 'App Store', ANDROID: 'Google Play', WEB: 'Web' };
 const TRIAL_PLAN = 'trial';
+
+// ── paged lists ────────────────────────────────────────────
+// The list widgets (transactions, referrers, referral activity, coupon log,
+// needs attention) page and sort in the database: ?page=&limit=&sort=.
+// Each one is a SQL "source" with a column `at` (UTC timestamp) and `id`;
+// `sort` picks an ORDER BY from a whitelist, the first entry is the default.
+const LIST_DEFAULT_LIMIT = 5;
+const LIST_MAX_LIMIT = 50;
+
+// UTC timestamp column → ISO string, in SQL, so no driver timezone guessing.
+const isoSql = (col) => Prisma.sql`to_char(${col}, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+const nameSql = (u) => Prisma.sql`COALESCE(NULLIF(BTRIM(${Prisma.raw(u)}.name), ''), ${Prisma.raw(u)}.hunter_id, 'Unknown')`;
+
+function listArgs(query = {}, sorts) {
+  const limit = Math.max(1, Math.min(LIST_MAX_LIMIT, parseInt(query.limit) || LIST_DEFAULT_LIMIT));
+  const page = Math.max(1, parseInt(query.page) || 1);
+  const sort = Object.hasOwn(sorts, query.sort) ? query.sort : Object.keys(sorts)[0];
+  return { page, limit, sort, order: sorts[sort] };
+}
+
+async function pagedRows(source, { page, limit, order }) {
+  const [[{ n }], rows] = await Promise.all([
+    prisma.$queryRaw`SELECT COUNT(*)::int AS n FROM (${source}) AS src`,
+    prisma.$queryRaw`SELECT * FROM (${source}) AS src ORDER BY ${order} LIMIT ${limit} OFFSET ${(page - 1) * limit}`,
+  ]);
+  return { rows, pagination: pageInfo(page, limit, n) };
+}
 
 // ── date helpers ───────────────────────────────────────────
 const istDayStartUtc = (offsetDays = 0) => new Date(getISTDateOnly(offsetDays).getTime() - IST_OFFSET_MS);
@@ -170,47 +199,42 @@ export async function getMrrTrend(days = 90) {
   return points;
 }
 
-// Subscription charges + one-off task purchases, newest first.
-export async function getRecentTransactions(limit = 10) {
-  const [subs, purchases] = await Promise.all([
-    prisma.subscriptions.findMany({
-      where: { plan: { not: TRIAL_PLAN } },
-      orderBy: { started_at: 'desc' },
-      take: limit,
-      select: { id: true, plan: true, status: true, platform: true, started_at: true, users: { select: { name: true, hunter_id: true } } },
-    }),
-    prisma.task_purchases.findMany({
-      orderBy: { created_at: 'desc' },
-      take: limit,
-      select: {
-        id: true, amount: true, currency: true, status: true, payment_provider: true, paid_at: true, created_at: true,
-        users: { select: { name: true, hunter_id: true } },
-        tasks: { select: { title: true } },
-      },
-    }),
-  ]);
+// Subscription charges + one-off task purchases.
+// sort: newest | oldest | amount_desc | amount_asc | user
+const TRANSACTION_SORTS = {
+  newest:      Prisma.sql`at DESC NULLS LAST, id DESC`,
+  oldest:      Prisma.sql`at ASC NULLS LAST, id ASC`,
+  amount_desc: Prisma.sql`amount DESC, at DESC NULLS LAST, id DESC`,
+  amount_asc:  Prisma.sql`amount ASC, at DESC NULLS LAST, id DESC`,
+  user:        Prisma.sql`LOWER(user_name) ASC, at DESC NULLS LAST, id DESC`,
+};
 
-  const rows = [
-    ...subs.map((s) => ({
-      id: `sub_${s.id}`,
-      userName: displayName(s.users),
-      plan: `${titleCase(s.plan)} subscription`,
-      amount: PLAN_CHARGE[s.plan] ?? PLAN_CHARGE.monthly,
-      status: 'paid',
-      date: s.started_at.toISOString(),
-      method: PLATFORM_LABEL[s.platform] ?? s.platform,
-    })),
-    ...purchases.map((p) => ({
-      id: `pur_${p.id}`,
-      userName: displayName(p.users),
-      plan: p.tasks?.title ?? 'Task purchase',
-      amount: Number(p.amount),
-      status: p.status.toLowerCase(),
-      date: (p.paid_at ?? p.created_at ?? new Date()).toISOString(),
-      method: p.payment_provider ?? '—',
-    })),
-  ];
-  return rows.sort((a, b) => b.date.localeCompare(a.date)).slice(0, limit);
+export async function getRecentTransactions(query = {}) {
+  const args = listArgs(query, TRANSACTION_SORTS);
+  const source = Prisma.sql`
+    SELECT 'sub_' || s.id AS id, ${nameSql('u')} AS user_name, 'sub' AS kind, s.plan AS label,
+           (CASE WHEN s.plan = 'yearly' THEN ${PLAN_CHARGE.yearly} ELSE ${PLAN_CHARGE.monthly} END)::numeric AS amount,
+           'paid' AS status, s.platform::text AS method, s.started_at AS at
+    FROM subscriptions s JOIN users u ON u.id = s.user_id
+    WHERE s.plan <> ${TRIAL_PLAN}
+    UNION ALL
+    SELECT 'pur_' || p.id, ${nameSql('u')}, 'pur', COALESCE(t.title, 'Task purchase'),
+           p.amount, LOWER(p.status::text), COALESCE(p.payment_provider, '—'), COALESCE(p.paid_at, p.created_at)
+    FROM task_purchases p JOIN users u ON u.id = p.user_id LEFT JOIN tasks t ON t.id = p.task_id`;
+  const { rows, pagination } = await pagedRows(
+    Prisma.sql`SELECT *, ${isoSql(Prisma.raw('at'))} AS at_iso FROM (${source}) AS tx`,
+    args,
+  );
+  const items = rows.map((r) => ({
+    id: r.id,
+    userName: r.user_name,
+    plan: r.kind === 'sub' ? `${titleCase(r.label)} subscription` : r.label,
+    amount: Number(r.amount),
+    status: r.status,
+    date: r.at_iso ?? new Date().toISOString(),
+    method: r.kind === 'sub' ? (PLATFORM_LABEL[r.method] ?? r.method) : r.method,
+  }));
+  return { items, pagination, sort: args.sort };
 }
 
 // ── Referrals ─────────────────────────────────────────────
@@ -237,52 +261,64 @@ export async function getReferralOverview() {
   };
 }
 
-export async function getTopReferrers(limit = 10) {
-  const [referrals, paid] = await Promise.all([
-    prisma.referrals.findMany({
-      select: { referred_id: true, users_referrals_referrer_idTousers: { select: { id: true, name: true, hunter_id: true } } },
-    }),
-    paidUserIds(),
-  ]);
-  const byReferrer = new Map();
-  for (const r of referrals) {
-    const u = r.users_referrals_referrer_idTousers;
-    const key = String(u.id);
-    const row = byReferrer.get(key) ?? { userId: key, userName: displayName(u), linksSent: 0, signups: 0, paidConversions: 0 };
-    row.linksSent += 1;
-    row.signups += 1;
-    if (paid.has(String(r.referred_id))) row.paidConversions += 1;
-    byReferrer.set(key, row);
-  }
-  return [...byReferrer.values()]
-    .sort((a, b) => b.signups - a.signups || b.paidConversions - a.paidConversions)
-    .slice(0, limit);
+const PAID_USERS_CTE = Prisma.sql`SELECT DISTINCT user_id FROM subscriptions WHERE plan <> ${TRIAL_PLAN}`;
+
+// sort: paid | signups | name. "Links sent" isn't tracked, so it equals signups.
+const REFERRER_SORTS = {
+  paid:    Prisma.sql`paid_conversions DESC, signups DESC, LOWER(user_name) ASC, id ASC`,
+  signups: Prisma.sql`signups DESC, paid_conversions DESC, LOWER(user_name) ASC, id ASC`,
+  name:    Prisma.sql`LOWER(user_name) ASC, id ASC`,
+};
+
+export async function getTopReferrers(query = {}) {
+  const args = listArgs(query, REFERRER_SORTS);
+  const source = Prisma.sql`
+    SELECT r.referrer_id AS id, ${nameSql('u')} AS user_name,
+           COUNT(*)::int AS signups, COUNT(paid.user_id)::int AS paid_conversions
+    FROM referrals r
+    JOIN users u ON u.id = r.referrer_id
+    LEFT JOIN (${PAID_USERS_CTE}) paid ON paid.user_id = r.referred_id
+    GROUP BY r.referrer_id, u.name, u.hunter_id`;
+  const { rows, pagination } = await pagedRows(source, args);
+  const items = rows.map((r) => ({
+    userId: String(r.id),
+    userName: r.user_name,
+    linksSent: r.signups,
+    signups: r.signups,
+    paidConversions: r.paid_conversions,
+  }));
+  return { items, pagination, sort: args.sort };
 }
 
-export async function getRecentReferralActivity(limit = 10) {
-  const [referrals, paid] = await Promise.all([
-    prisma.referrals.findMany({
-      orderBy: { created_at: 'desc' },
-      take: limit,
-      select: {
-        id: true, created_at: true, referred_id: true,
-        users_referrals_referrer_idTousers: { select: { name: true, hunter_id: true } },
-        users_referrals_referred_idTousers: { select: { name: true, hunter_id: true, onboarding_done: true } },
-      },
-    }),
-    paidUserIds(),
-  ]);
-  return referrals.map((r) => {
-    const referee = r.users_referrals_referred_idTousers;
-    return {
-      id: String(r.id),
-      referrerName: displayName(r.users_referrals_referrer_idTousers),
-      refereeName: displayName(referee),
-      // converted = paying; signed_up = finished onboarding; pending = account only
-      status: paid.has(String(r.referred_id)) ? 'converted' : referee.onboarding_done ? 'signed_up' : 'pending',
-      date: (r.created_at ?? new Date()).toISOString(),
-    };
-  });
+// sort: newest | oldest | referrer
+const REFERRAL_ACTIVITY_SORTS = {
+  newest:   Prisma.sql`at DESC NULLS LAST, id DESC`,
+  oldest:   Prisma.sql`at ASC NULLS LAST, id ASC`,
+  referrer: Prisma.sql`LOWER(referrer_name) ASC, at DESC NULLS LAST, id DESC`,
+};
+
+export async function getRecentReferralActivity(query = {}) {
+  const args = listArgs(query, REFERRAL_ACTIVITY_SORTS);
+  // converted = paying; signed_up = finished onboarding; pending = account only
+  const source = Prisma.sql`
+    SELECT r.id, ${nameSql('ref')} AS referrer_name, ${nameSql('ee')} AS referee_name,
+           CASE WHEN paid.user_id IS NOT NULL THEN 'converted'
+                WHEN ee.onboarding_done THEN 'signed_up'
+                ELSE 'pending' END AS status,
+           r.created_at AS at, ${isoSql(Prisma.raw('r.created_at'))} AS at_iso
+    FROM referrals r
+    JOIN users ref ON ref.id = r.referrer_id
+    JOIN users ee  ON ee.id  = r.referred_id
+    LEFT JOIN (${PAID_USERS_CTE}) paid ON paid.user_id = r.referred_id`;
+  const { rows, pagination } = await pagedRows(source, args);
+  const items = rows.map((r) => ({
+    id: String(r.id),
+    referrerName: r.referrer_name,
+    refereeName: r.referee_name,
+    status: r.status,
+    date: r.at_iso ?? new Date().toISOString(),
+  }));
+  return { items, pagination, sort: args.sort };
 }
 
 // ── Rewards & Coupons ─────────────────────────────────────
@@ -327,31 +363,59 @@ export async function getCouponOverview() {
   };
 }
 
-export async function getCouponActivityLog(limit = 25) {
-  const now = new Date();
-  const rewards = await prisma.user_rewards.findMany({
-    orderBy: { assigned_at: 'desc' },
-    take: 200,
-    select: {
-      id: true, status: true, coupon_code: true, reward_text: true, assigned_at: true, claimed_at: true, expires_at: true,
-      users: { select: { name: true, hunter_id: true } },
-      reward_coupons: { select: { title: true, product_name: true } },
-      reward_pool: { select: { reward_partners: { select: { name: true } } } },
-    },
-  });
+// One row per event on a card: issued, redeemed, expired (same states as
+// couponState()). sort: newest | oldest | partner | user. ?partner= filters.
+const COUPON_SORTS = {
+  newest:  Prisma.sql`at DESC NULLS LAST, id DESC`,
+  oldest:  Prisma.sql`at ASC NULLS LAST, id ASC`,
+  partner: Prisma.sql`LOWER(partner) ASC, at DESC NULLS LAST, id DESC`,
+  user:    Prisma.sql`LOWER(user_name) ASC, at DESC NULLS LAST, id DESC`,
+};
 
-  const events = [];
-  for (const r of rewards) {
-    const base = {
-      code: r.coupon_code ?? '—',
-      partner: r.reward_pool?.reward_partners?.name ?? r.reward_coupons?.product_name ?? r.reward_coupons?.title ?? r.reward_text ?? 'HunterX',
-      userName: displayName(r.users),
-    };
-    if (r.assigned_at) events.push({ ...base, id: `${r.id}_issued`, action: 'issued', date: r.assigned_at.toISOString() });
-    if (r.status === 'CLAIMED' && r.claimed_at) events.push({ ...base, id: `${r.id}_redeemed`, action: 'redeemed', date: r.claimed_at.toISOString() });
-    if (couponState(r, now) === 'expired' && r.expires_at) events.push({ ...base, id: `${r.id}_expired`, action: 'expired', date: r.expires_at.toISOString() });
-  }
-  return events.sort((a, b) => b.date.localeCompare(a.date)).slice(0, limit);
+function couponCards(now) {
+  return Prisma.sql`
+    SELECT ur.id, COALESCE(ur.coupon_code, '—') AS code,
+           COALESCE(pt.name, rc.product_name, rc.title, ur.reward_text, 'HunterX') AS partner,
+           ${nameSql('u')} AS user_name, ur.status::text AS status,
+           ur.assigned_at, ur.claimed_at, ur.expires_at,
+           (ur.status::text <> 'CLAIMED'
+             AND (ur.status::text = 'EXPIRED' OR (ur.expires_at IS NOT NULL AND ur.expires_at <= ${sqlUtcTimestamp(now)}::timestamp))) AS is_expired
+    FROM user_rewards ur
+    JOIN users u ON u.id = ur.user_id
+    LEFT JOIN reward_pool rp     ON rp.id = ur.pool_id
+    LEFT JOIN reward_partners pt ON pt.id = rp.partner_id
+    LEFT JOIN reward_coupons rc  ON rc.id = ur.coupon_id`;
+}
+
+export async function getCouponActivityLog(query = {}) {
+  const args = listArgs(query, COUPON_SORTS);
+  const now = new Date();
+  const cards = couponCards(now);
+  const partner = typeof query.partner === 'string' && query.partner && query.partner !== 'all' ? query.partner : null;
+  const events = Prisma.sql`
+    SELECT id || '_issued' AS id, code, partner, user_name, 'issued' AS action, assigned_at AS at FROM cards WHERE assigned_at IS NOT NULL
+    UNION ALL
+    SELECT id || '_redeemed', code, partner, user_name, 'redeemed', claimed_at FROM cards WHERE status = 'CLAIMED' AND claimed_at IS NOT NULL
+    UNION ALL
+    SELECT id || '_expired', code, partner, user_name, 'expired', expires_at FROM cards WHERE is_expired AND expires_at IS NOT NULL`;
+  const source = Prisma.sql`
+    WITH cards AS (${cards}), events AS (${events})
+    SELECT *, ${isoSql(Prisma.raw('at'))} AS at_iso FROM events
+    ${partner ? Prisma.sql`WHERE partner = ${partner}` : Prisma.empty}`;
+
+  const [{ rows, pagination }, partnerRows] = await Promise.all([
+    pagedRows(source, args),
+    prisma.$queryRaw`WITH cards AS (${cards}) SELECT DISTINCT partner FROM cards ORDER BY partner`,
+  ]);
+  const items = rows.map((r) => ({
+    id: r.id,
+    code: r.code,
+    partner: r.partner,
+    userName: r.user_name,
+    action: r.action,
+    date: r.at_iso ?? new Date().toISOString(),
+  }));
+  return { items, pagination, sort: args.sort, partners: partnerRows.map((p) => p.partner) };
 }
 
 // ── Engagement Health ─────────────────────────────────────
@@ -428,69 +492,65 @@ export async function getStreakDropoff(maxDays = 14) {
 }
 
 // ── Needs Attention ───────────────────────────────────────
-export async function getNeedsAttention() {
-  const failedSince = new Date(Date.now() - 30 * DAY_MS);
-  const [reviews, feedback, failed, banned] = await Promise.all([
-    prisma.task_completions.findMany({
-      where: { status: 'IN_REVIEW' },
-      orderBy: { proof_submitted_at: 'desc' },
-      take: 20,
-      select: { id: true, proof_urls: true, proof_submitted_at: true, created_at: true, users: { select: { name: true, hunter_id: true } }, tasks: { select: { title: true } } },
-    }),
-    prisma.feedback.findMany({
-      where: OPEN_FEEDBACK,
-      orderBy: { created_at: 'desc' },
-      take: 20,
-      select: { id: true, category: true, message: true, created_at: true, users: { select: { name: true, hunter_id: true } } },
-    }),
-    prisma.task_purchases.findMany({
-      where: { status: 'FAILED', created_at: { gte: failedSince } },
-      orderBy: { created_at: 'desc' },
-      take: 20,
-      select: { id: true, amount: true, currency: true, payment_provider: true, created_at: true, users: { select: { name: true, hunter_id: true } }, tasks: { select: { title: true } } },
-    }),
-    prisma.users.findMany({
-      where: { is_banned: true },
-      orderBy: { banned_at: 'desc' },
-      take: 20,
-      select: { id: true, name: true, hunter_id: true, ban_reason: true, banned_at: true, created_at: true },
-    }),
-  ]);
+// Proofs to review, open feedback, failed payments (last 30 days), bans.
+// sort: newest | oldest | type (failed payments → reviews → feedback → bans).
+const ATTENTION_SORTS = {
+  newest: Prisma.sql`at DESC NULLS LAST, id DESC`,
+  oldest: Prisma.sql`at ASC NULLS LAST, id ASC`,
+  type:   Prisma.sql`priority ASC, at DESC NULLS LAST, id DESC`,
+};
 
-  const iso = (d) => (d ?? new Date()).toISOString();
-  const items = [
-    ...reviews.map((r) => ({
-      id: `att_review_${r.id}`,
-      type: 'gps_review',
-      title: `Proof to review — ${r.tasks?.title ?? 'Task'}`,
-      description: `${displayName(r.users)} sent ${r.proof_urls.length} photo${r.proof_urls.length === 1 ? '' : 's'}`,
-      timestamp: iso(r.proof_submitted_at ?? r.created_at),
-      href: '/tasks/review',
-    })),
-    ...feedback.map((f) => ({
-      id: `att_fbk_${f.id}`,
-      type: 'feedback_ticket',
-      title: `${titleCase(f.category.replace(/_/g, ' '))} #${f.id}`,
-      description: `${displayName(f.users)}: ${f.message.length > 80 ? `${f.message.slice(0, 80)}…` : f.message}`,
-      timestamp: iso(f.created_at),
-      href: '/feedback',
-    })),
-    ...failed.map((p) => ({
-      id: `att_txn_${p.id}`,
-      type: 'failed_payment',
-      title: `Payment failed — ${displayName(p.users)}`,
-      description: `${p.tasks?.title ?? 'Task purchase'} · ${p.currency} ${Number(p.amount)} via ${p.payment_provider ?? 'unknown'}`,
-      timestamp: iso(p.created_at),
-      href: '/subscriptions',
-    })),
-    ...banned.map((u) => ({
-      id: `att_ban_${u.id}`,
-      type: 'banned_user',
-      title: `Account banned — ${displayName(u)}`,
-      description: u.ban_reason ?? 'No reason on file',
-      timestamp: iso(u.banned_at ?? u.created_at),
-      href: `/users/${u.id}`,
-    })),
-  ];
-  return items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+export async function getNeedsAttention(query = {}) {
+  const args = listArgs(query, ATTENTION_SORTS);
+  const failedSince = sqlUtcTimestamp(new Date(Date.now() - 30 * DAY_MS));
+  const source = Prisma.sql`
+    SELECT *, ${isoSql(Prisma.raw('at'))} AS at_iso FROM (
+      SELECT 'att_review_' || c.id AS id, 'gps_review' AS type, 1 AS priority, c.id AS ref_id,
+             ${nameSql('u')} AS user_name, t.title AS t1, NULL::text AS t2, NULL::text AS t3,
+             cardinality(c.proof_urls)::numeric AS n, COALESCE(c.proof_submitted_at, c.created_at) AS at
+      FROM task_completions c JOIN users u ON u.id = c.user_id LEFT JOIN tasks t ON t.id = c.task_id
+      WHERE c.status = 'IN_REVIEW'
+      UNION ALL
+      SELECT 'att_fbk_' || f.id, 'feedback_ticket', 2, f.id,
+             ${nameSql('u')}, f.category, f.message, NULL, NULL, f.created_at
+      FROM feedback f LEFT JOIN users u ON u.id = f.user_id
+      WHERE f.status IN ('received', 'in_review')
+      UNION ALL
+      SELECT 'att_txn_' || p.id, 'failed_payment', 0, p.id,
+             ${nameSql('u')}, t.title, p.currency, p.payment_provider, p.amount, p.created_at
+      FROM task_purchases p JOIN users u ON u.id = p.user_id LEFT JOIN tasks t ON t.id = p.task_id
+      WHERE p.status = 'FAILED' AND p.created_at >= ${failedSince}::timestamp
+      UNION ALL
+      SELECT 'att_ban_' || u.id, 'banned_user', 3, u.id,
+             ${nameSql('u')}, u.ban_reason, NULL, NULL, NULL, COALESCE(u.banned_at, u.created_at)
+      FROM users u WHERE u.is_banned
+    ) AS att`;
+  const { rows, pagination } = await pagedRows(source, args);
+
+  const items = rows.map((r) => {
+    const base = { id: r.id, type: r.type, timestamp: r.at_iso ?? new Date().toISOString() };
+    switch (r.type) {
+      case 'gps_review': {
+        const n = Number(r.n ?? 0);
+        return { ...base, title: `Proof to review — ${r.t1 ?? 'Task'}`, description: `${r.user_name} sent ${n} photo${n === 1 ? '' : 's'}`, href: '/tasks/review' };
+      }
+      case 'feedback_ticket':
+        return {
+          ...base,
+          title: `${titleCase(r.t1.replace(/_/g, ' '))} #${r.ref_id}`,
+          description: `${r.user_name}: ${r.t2.length > 80 ? `${r.t2.slice(0, 80)}…` : r.t2}`,
+          href: '/feedback',
+        };
+      case 'failed_payment':
+        return {
+          ...base,
+          title: `Payment failed — ${r.user_name}`,
+          description: `${r.t1 ?? 'Task purchase'} · ${r.t2} ${Number(r.n)} via ${r.t3 ?? 'unknown'}`,
+          href: '/subscriptions',
+        };
+      default:
+        return { ...base, title: `Account banned — ${r.user_name}`, description: r.t1 ?? 'No reason on file', href: `/users/${r.ref_id}` };
+    }
+  });
+  return { items, pagination, sort: args.sort };
 }
