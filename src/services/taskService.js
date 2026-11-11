@@ -222,7 +222,8 @@ export async function getTodayTasks(userId, overrideGender = null) {
 
   // Paid tasks (any type) on sale that this user hasn't bought — shown with
   // a buy button until end_date, not completable (no task_schedule row)
-  // and not in XP totals. Buying unlocks access from that day to end_date.
+  // and not in XP totals. Buying unlocks one full period (1 / 7 / 30 days)
+  // from that day, even past end_date.
   const locked = sortByXpDesc(lockedTasks).map(task => ({
     ...serialize(task),
     status:        'LOCKED',

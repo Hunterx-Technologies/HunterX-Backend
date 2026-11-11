@@ -93,7 +93,8 @@ export async function runNightlyTaskAssignment() {
     logError(`Birthday scratch cards failed: ${err.message}`);
   }
 
-  // Paid tasks whose end_date has passed stop being offered/assigned.
+  // Paid tasks whose sale (end_date) is over and whose last buyer's access
+  // has ended are switched off.
   try {
     const deactivated = await deactivateExpiredPaidTasks(today);
     if (deactivated > 0) info(`Deactivated ${deactivated} expired paid task(s)`);

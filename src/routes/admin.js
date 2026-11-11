@@ -228,8 +228,10 @@ router.get('/tasks', verifyToken, verifyAdmin, async (req, res, next) => {
 //                                       // reviewed (GET/POST /tasks/review-queue) before XP is paid
 //   is_paid?: boolean,                 // default false
 //   price?: number,                    // INR, required when is_paid (e.g. 199 or 199.50)
-//                                       // Paid: shown locked start_date..end_date; a buyer gets access
-//                                       // from the day they pay to end_date; deactivated after end_date
+//                                       // Paid: on sale (shown locked) start_date..end_date; a buyer gets
+//                                       // 1 / 7 / 30 days (DAILY_ADMIN / WEEKLY / MONTHLY) from the day they
+//                                       // pay, even past end_date; deactivated once the sale is over and
+//                                       // the last buyer's access has ended
 //
 // Every task is shown every day from start_date to end_date. WEEKLY /
 // MONTHLY tasks can be completed once per 7 / 30-day period within that.
@@ -335,7 +337,7 @@ router.delete('/tasks/:id', verifyToken, verifyAdmin, async (req, res, next) => 
 //   - Moving a one-time free task's start_date without an end_date
 //     re-derives end_date (1 / 7 / 30 days).
 //   - Paid tasks: existing buyers are never affected — their access_end
-//     and amount paid are fixed. A later end_date extends the offer (and
+//     and amount paid are fixed. A later end_date extends the sale (and
 //     reactivates it if the nightly cron already switched it off); a new
 //     price applies to new buyers only.
 //   - Paid -> free is refused once anyone has bought it.

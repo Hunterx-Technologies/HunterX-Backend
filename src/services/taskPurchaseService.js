@@ -2,10 +2,13 @@
 //
 // A paid task (tasks.is_paid) is shown locked to every user while it's on
 // sale (tasks.start_date .. tasks.end_date). Buying it gives that user
-// their own access window — access_start = the IST day they paid,
-// access_end = tasks.end_date — and only then does taskAssignmentService
-// assign it to them. Once end_date passes the nightly cron deactivates
-// the task (deactivateExpiredPaidTasks).
+// their own access window of one full period from the IST day they paid
+// — 1 day for DAILY_ADMIN, 7 for WEEKLY, 30 for MONTHLY (accessEndFor) —
+// whatever day of the sale they bought on, so a late buyer gets the same
+// time as an early one. Only then does taskAssignmentService assign it to
+// them. tasks.end_date only ends the sale: access can run past it, and the
+// nightly cron deactivates the task once the sale is over and the last
+// buyer's access has ended (deactivateExpiredPaidTasks).
 //
 // access_end is fixed at purchase time: an admin edit moving end_date
 // (adminTaskService.updateTask) only extends the offer for users who haven't bought it. A buyer
@@ -22,6 +25,18 @@ import { assignDailyTasks } from './taskAssignmentService.js';
 import { createNotification } from './notificationService.js';
 import { formatDay } from './questNotificationService.js';
 import { logError } from '../utils/logger.js';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// Days of access a purchase buys: one full period of the task's type, so a
+// WEEKLY / MONTHLY buyer's access is exactly one 7 / 30-day period
+// (taskService.getTaskPeriod anchors periods on access_start).
+export const ACCESS_DAYS = { DAILY_ADMIN: 1, WEEKLY: 7, MONTHLY: 30 };
+
+// Last day (inclusive) of access for a purchase of `task` paid on `accessStart`.
+export function accessEndFor(task, accessStart) {
+  const days = ACCESS_DAYS[task.task_type] ?? 1;
+  return new Date(accessStart.getTime() + (days - 1) * DAY_MS);
+}
 
 function onSaleOn(task, date) {
   return task.is_paid && task.is_active &&
@@ -115,16 +130,17 @@ export async function createPendingPurchase(userId, taskId, { provider = null } 
 export async function markPurchasePaid(purchaseId, { paymentRef = null } = {}) {
   const purchase = await prisma.task_purchases.findUnique({
     where:   { id: BigInt(purchaseId) },
-    include: { tasks: { select: { title: true, end_date: true, is_active: true } } },
+    include: { tasks: { select: { title: true, task_type: true, end_date: true, is_active: true } } },
   });
   if (!purchase) throw new Error('PURCHASE_NOT_FOUND');
   if (purchase.status === 'PAID') return purchase;
   if (purchase.status !== 'PENDING') throw new Error('PURCHASE_NOT_PENDING');
 
   const accessStart = getISTDateOnly();
-  const accessEnd = purchase.tasks.end_date;
-  if (!purchase.tasks.is_active || !accessEnd || accessEnd.getTime() < accessStart.getTime())
+  const saleEnd = purchase.tasks.end_date;
+  if (!purchase.tasks.is_active || !saleEnd || saleEnd.getTime() < accessStart.getTime())
     throw new Error('TASK_NOT_ON_SALE'); // offer ended between checkout and payment
+  const accessEnd = accessEndFor(purchase.tasks, accessStart);
 
   const paid = await prisma.task_purchases.update({
     where: { id: purchase.id },
@@ -169,11 +185,18 @@ export async function getLockedTasks(bUserId, date = getISTDateOnly()) {
   });
 }
 
-// Nightly: a paid task stops being offered (and every buyer's access ends)
-// after its end_date, so flip it inactive.
+// Nightly: a paid task whose sale has ended (end_date passed) is flipped
+// inactive once no buyer still has access. Until then it stays active so
+// buyers keep it for their full period — the sale itself already stops at
+// end_date (onSaleOn / getLockedTasks check the date, not is_active).
 export async function deactivateExpiredPaidTasks(today = getISTDateOnly()) {
   const { count } = await prisma.tasks.updateMany({
-    where: { is_paid: true, is_active: true, end_date: { lt: today } },
+    where: {
+      is_paid:   true,
+      is_active: true,
+      end_date:  { lt: today },
+      task_purchases: { none: { status: 'PAID', completed_at: null, access_end: { gte: today } } },
+    },
     data:  { is_active: false, updated_at: new Date() },
   });
   return count;

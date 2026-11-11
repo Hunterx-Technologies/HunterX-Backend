@@ -549,9 +549,10 @@ model task_schedule {
 
 // One row per purchase attempt of a paid task. Only status = PAID rows
 // with access_start <= date <= access_end unlock the task for that user
-// (see taskAssignmentService.js). The access window runs from the day the
-// user paid to tasks.end_date as it was then — extending the task later
-// only extends the offer for users who haven't bought it.
+// (see taskAssignmentService.js). The access window is one full period of
+// the task's type from the day the user paid — 1 / 7 / 30 days for
+// DAILY_ADMIN / WEEKLY / MONTHLY — and may run past tasks.end_date, which
+// only ends the sale (taskPurchaseService.accessEndFor).
 model task_purchases {
   id               BigInt               @id @default(autoincrement())
   user_id          BigInt
@@ -607,7 +608,7 @@ model tasks {
   is_routine         Boolean              @default(false)
   recurrence_days    Int[]                @default([])
   start_date         DateTime?            @db.Date // admin-created DAILY_ADMIN/WEEKLY tasks: first date this task is assignable (can be future-dated)
-  end_date           DateTime?            @db.Date // last date this task is assignable — is_recurring=false: same as start_date (DAILY_ADMIN), start_date+6 (WEEKLY) or start_date+29 (MONTHLY) unless admin-set; is_recurring=true: admin-set or null (no end). For paid tasks start..end is when the locked offer is shown; a buyer's access runs from their purchase day to end_date, and the nightly cron deactivates the task once end_date has passed
+  end_date           DateTime?            @db.Date // last date this task is assignable — is_recurring=false: same as start_date (DAILY_ADMIN), start_date+6 (WEEKLY) or start_date+29 (MONTHLY) unless admin-set; is_recurring=true: admin-set or null (no end). For paid tasks start..end is when the locked offer is on sale; a buyer gets one full period (1 / 7 / 30 days) from their purchase day, even past end_date, and the nightly cron deactivates the task once end_date has passed and no buyer still has access
   is_paid            Boolean              @default(false)
   price              Decimal?             @db.Decimal(10, 2) // required when is_paid
   currency           String               @default("INR") @db.VarChar(3)

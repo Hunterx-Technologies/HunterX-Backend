@@ -15,10 +15,12 @@
 // automatically once `date` falls inside [start_date, end_date].
 //
 // Paid tasks (is_paid=true; price, start_date and end_date required): the
-// task is shown locked to everyone from start_date to end_date. A buyer's
-// access runs from the day they pay to end_date (see
+// task is on sale (shown locked) to everyone from start_date to end_date.
+// A buyer gets one full period from the day they pay — 1 / 7 / 30 days for
+// DAILY_ADMIN / WEEKLY / MONTHLY — even past end_date (see
 // taskPurchaseService.js), and only buyers have it assigned. The nightly
-// cron deactivates a paid task once end_date has passed.
+// cron deactivates a paid task once end_date has passed and no buyer
+// still has access.
 //
 // Editing (updateTask) runs the same rules over the existing task merged
 // with the fields sent. For a paid task, edits never touch existing
@@ -153,7 +155,7 @@ function buildTaskData(input, existing = null) {
   }
 
   // ── Date window. start_date is always required. end_date is required for
-  // paid tasks (it ends the offer and every buyer's access); for free ones
+  // paid tasks (it ends the offer; buyers keep a full period from purchase); for free ones
   // it's optional — one-time tasks derive it, recurring tasks have no end.
   const today = getISTDateOnly();
   if (!start_date) throw new Error('START_DATE_REQUIRED');
