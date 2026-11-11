@@ -36,8 +36,13 @@
 // a paid recurring one stays a locked offer that only buyers get. See
 // routineTaskService.js.
 //
-// DAILY_FIXED is not creatable or editable here — the built-in routine
-// tasks (sleep, water, protein, steps) are seed-managed (prisma/seed.js).
+// DAILY_FIXED (the built-in routine tasks: sleep, water, protein, steps) is
+// created by prisma/seed.js and can't be created or deleted here. Only what
+// hunters see can be edited — title, description, XP, partial XP, images —
+// and it can be switched on/off. Type, tag, target and schedule stay as the
+// seed set them: the app's tracking (steps, water, protein goals) and the
+// seed's lookup (by tag) depend on them. The seed never overwrites these
+// editable fields on later runs.
 
 import prisma from '../config/prisma.js';
 import { parseDateOnly, getISTDateOnly } from '../utils/helpers.js';
@@ -389,20 +394,61 @@ export async function createTask(adminId, body, files = {}) {
   return saved;
 }
 
+// Fields of a built-in (DAILY_FIXED) task an admin may change.
+const BUILT_IN_EDITABLE = new Set([
+  'title', 'description', 'xp_reward', 'allows_partial',
+  'image_url', 'image_url_male', 'image_url_female', 'is_active',
+]);
+
+// Built-in tasks: only the display fields and XP. Anything else sent
+// (tag, type, target, dates, price, proof, special reward) is refused, so
+// a save never silently drops a change the admin thought they made.
+async function updateBuiltInTask(existing, body, files) {
+  const changes = Object.fromEntries(Object.entries(body ?? {}).filter(([, v]) => v !== undefined));
+  if (Object.keys(changes).some((k) => !BUILT_IN_EDITABLE.has(k))) throw new Error('TASK_FIELD_LOCKED');
+
+  const data = {};
+  if ('is_active' in changes) {
+    if (typeof changes.is_active !== 'boolean') throw new Error('INVALID_IS_ACTIVE');
+    data.is_active = changes.is_active;
+  }
+  if ('title' in changes) {
+    if (typeof changes.title !== 'string' || !changes.title.trim()) throw new Error('TITLE_REQUIRED');
+    data.title = changes.title.trim();
+  }
+  if ('description' in changes) data.description = changes.description ? String(changes.description) : null;
+
+  const xpReward      = 'xp_reward' in changes ? changes.xp_reward : existing.xp_reward;
+  const allowsPartial = 'allows_partial' in changes ? changes.allows_partial : existing.allows_partial;
+  if ('xp_reward' in changes || 'allows_partial' in changes) {
+    if (!Number.isInteger(xpReward) || xpReward <= 0) throw new Error('INVALID_XP_REWARD');
+    // Same cap as admin daily tasks, so built-ins stay in the XP economy.
+    if (xpReward > XP_CAP.DAILY_ADMIN) throw new Error('XP_REWARD_EXCEEDS_CAP');
+    if (typeof allowsPartial !== 'boolean') throw new Error('INVALID_ALLOWS_PARTIAL');
+    const xpPartial = allowsPartial ? Math.floor(xpReward / 2) : 0;
+    if (allowsPartial && xpPartial < 1) throw new Error('XP_REWARD_TOO_LOW_FOR_PARTIAL');
+    Object.assign(data, { xp_reward: xpReward, allows_partial: allowsPartial, xp_partial: xpPartial });
+  }
+
+  // Images: same fallbacks as buildTaskData (image_url mirrors the male one).
+  const male = changes.image_url_male ?? changes.image_url;
+  if (male !== undefined) Object.assign(data, { image_url_male: male || null, image_url: male || null });
+  if ('image_url_female' in changes) data.image_url_female = changes.image_url_female || null;
+
+  if (Object.keys(data).length === 0 && !files.image_male && !files.image_female) return existing;
+  data.updated_at = new Date();
+
+  const saved = await writeWithImages(data, files, d => prisma.tasks.update({ where: { id: existing.id }, data: d }), existing);
+  await syncToday(saved);
+  return saved;
+}
+
 // Partial update: any field left out keeps its current value; the merged
 // result must pass the same rules as createTask. Also accepts is_active.
 export async function updateTask(taskId, body, files = {}) {
   const existing = await prisma.tasks.findUnique({ where: { id: BigInt(taskId) } });
   if (!existing) throw new Error('TASK_NOT_FOUND');
-  // Built-in daily tasks (DAILY_FIXED, seed-managed) can only be switched
-  // on or off — nothing else about them is editable.
-  if (!CREATABLE_TYPES.includes(existing.task_type)) {
-    const keys = Object.keys(body ?? {}).filter((k) => body[k] !== undefined);
-    if (keys.length !== 1 || keys[0] !== 'is_active' || typeof body.is_active !== 'boolean') throw new Error('TASK_NOT_EDITABLE');
-    const toggled = await prisma.tasks.update({ where: { id: existing.id }, data: { is_active: body.is_active, updated_at: new Date() } });
-    await syncToday(toggled);
-    return toggled;
-  }
+  if (!CREATABLE_TYPES.includes(existing.task_type)) return updateBuiltInTask(existing, body, files);
 
   const changes = Object.fromEntries(
     Object.entries(body ?? {}).filter(([, v]) => v !== undefined)

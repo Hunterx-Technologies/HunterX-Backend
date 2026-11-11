@@ -112,22 +112,32 @@ const DAILY_TASKS = [
   },
 ];
 
-// tasks.title has no DB-level unique constraint (it's also used by
-// arbitrary future admin-created tasks), so this can't be a literal
-// Prisma .upsert(). Same idempotent find-then-create/update pattern the
-// old script used, upgraded to also update fields on re-run instead of
-// just skipping.
+// Fields the admin panel can edit on a built-in task (adminTaskService.js
+// #BUILT_IN_EDITABLE, plus the derived xp_partial). The seed sets them only
+// when it creates the task, so a deploy never undoes an admin's edit or
+// switches a deactivated built-in back on.
+const ADMIN_EDITABLE = [
+  'title', 'description', 'xp_reward', 'xp_partial', 'allows_partial',
+  'image_url', 'image_url_male', 'image_url_female', 'is_active',
+];
+
+// tasks has no natural unique key, so this can't be a literal Prisma
+// .upsert(). A built-in is found by its tag (unique among DAILY_FIXED
+// tasks and not editable in the admin panel), falling back to its title
+// for databases seeded before tags were set; the rest is find-then-
+// create/update, safe to re-run on every deploy.
 async function seedDailyTasks() {
   for (const { renamedFrom, ...task } of DAILY_TASKS) {
-    const existing = await prisma.tasks.findFirst({
-      where: renamedFrom
-        ? { title: { in: [task.title, renamedFrom] } }
-        : { title: task.title },
-    });
+    const existing =
+      (await prisma.tasks.findFirst({ where: { task_type: 'DAILY_FIXED', tag: task.tag } })) ??
+      (await prisma.tasks.findFirst({
+        where: { task_type: 'DAILY_FIXED', title: { in: renamedFrom ? [task.title, renamedFrom] : [task.title] } },
+      }));
 
     if (existing) {
-      await prisma.tasks.update({ where: { id: existing.id }, data: task });
-      console.log(`UPDATED "${task.title}" (id=${existing.id})`);
+      const managed = Object.fromEntries(Object.entries(task).filter(([k]) => !ADMIN_EDITABLE.includes(k)));
+      await prisma.tasks.update({ where: { id: existing.id }, data: managed });
+      console.log(`UPDATED "${existing.title}" (id=${existing.id}, tag=${task.tag})`);
     } else {
       const created = await prisma.tasks.create({ data: task });
       console.log(`ADDED   "${created.title}" (id=${created.id})`);

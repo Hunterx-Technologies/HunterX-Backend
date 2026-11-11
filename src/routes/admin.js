@@ -185,6 +185,7 @@ const TASK_ERRORS = {
   END_DATE_IN_PAST:              'end_date cannot be in the past',
   TASK_HAS_BUYERS:               'This task has buyers, so it cannot be changed from paid to free',
   TASK_NOT_EDITABLE:             'Built-in routine tasks (DAILY_FIXED) are seed-managed and cannot be edited here',
+  TASK_FIELD_LOCKED:             'Built-in daily tasks: only title, description, XP, partial completion and images can be changed',
 };
 
 // ── GET /api/admin/tasks ──────────────────────────────────
