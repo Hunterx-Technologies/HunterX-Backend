@@ -254,8 +254,10 @@ router.post('/tasks', verifyToken, verifyAdmin, handleTaskImages, async (req, re
 
 // ── Proof review queue ────────────────────────────────────
 // See taskProofService.js. Admin-only.
-// GET  /api/admin/tasks/review-queue?status=IN_REVIEW|RESUBMIT|REJECTED|COMPLETED&cursor=
+// GET  /api/admin/tasks/review-queue?status=IN_REVIEW|RESUBMIT|REJECTED|COMPLETED&cursor=&deletion=PENDING
 //      → { items, next_cursor, counts: { in_review, resubmit, rejected, completed } }
+//      Each item carries user_delete_at / user_deletion_days_left; APPROVE
+//      is refused (409 USER_PENDING_DELETION) while those are set.
 //      IN_REVIEW is the queue (oldest first); the others are past decisions.
 // POST /api/admin/tasks/review-queue/:id/decision
 //      { decision: 'APPROVE' | 'RESUBMIT' | 'REJECT', note? } — note (≤300)
@@ -268,13 +270,16 @@ const REVIEW_ERRORS = {
   NOTE_TOO_LONG:         [400, 'The reason must be 300 characters or fewer'],
   REVIEW_NOT_FOUND:      [404, 'Submission not found'],
   REVIEW_NOT_PENDING:    [409, 'This submission has already been reviewed'],
+  USER_PENDING_DELETION: [409, 'This hunter\'s account is scheduled for deletion, so no XP can be awarded. The proof stays in review until they keep their account.'],
+  INVALID_DELETION_FILTER: [400, 'deletion must be PENDING'],
 };
 
 router.get('/tasks/review-queue', verifyToken, verifyAdmin, async (req, res, next) => {
   try {
     const result = await taskProofService.listReviewQueue({
-      status: req.query.status ? String(req.query.status).toUpperCase() : 'IN_REVIEW',
-      cursor: req.query.cursor,
+      status:   req.query.status ? String(req.query.status).toUpperCase() : 'IN_REVIEW',
+      cursor:   req.query.cursor,
+      deletion: req.query.deletion,
     });
     return success(res, result, 'Review queue fetched');
   } catch (err) {
@@ -413,7 +418,8 @@ router.get('/users/ranks', verifyToken, verifyAdmin, async (req, res, next) => {
 // Header: Authorization: Bearer <access_token>  (role must be ADMIN)
 // Query: search?, rank?, level? ("1-10"), status? (ACTIVE|BANNED),
 //        date_preset? (7d|30d|90d|all), start_date?, end_date? (YYYY-MM-DD),
-//        sort_by? (signup_date|name|level|streak), page?, limit? (max 100)
+//        sort_by? (signup_date|name|level|streak), deletion? (PENDING),
+//        page?, limit? (max 100). Rows carry delete_at / deletion_days_left.
 router.get('/users', verifyToken, verifyAdmin, async (req, res, next) => {
   try {
     const data = await adminUserService.listUsers(req.query);
@@ -428,6 +434,7 @@ router.get('/users', verifyToken, verifyAdmin, async (req, res, next) => {
       INVALID_START_DATE:       'start_date must be a valid YYYY-MM-DD date',
       INVALID_END_DATE:         'end_date must be a valid YYYY-MM-DD date',
       START_AFTER_END_DATE:     'start_date cannot be after end_date',
+      INVALID_DELETION_FILTER:  'deletion must be PENDING',
     };
     if (badRequest[err.message]) return error(res, badRequest[err.message], 400);
     next(err);

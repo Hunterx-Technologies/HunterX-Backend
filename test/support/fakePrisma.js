@@ -100,6 +100,8 @@ export function createFakePrisma(seed = {}) {
     user_progression: model(seed.user_progression ?? []),
     streak_events:  model(seed.streak_events ?? []),
     user_rewards:   model(seed.user_rewards ?? []),
+    task_completions: model(seed.task_completions ?? []),
+    xp_transactions: model(seed.xp_transactions ?? []),
   };
   const empty = model([]);
 

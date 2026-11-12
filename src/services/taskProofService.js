@@ -16,6 +16,7 @@ import prisma from '../config/prisma.js';
 import { payCompletion } from './taskService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import { createNotification } from './notificationService.js';
+import { pendingDeletionFields } from './adminUserService.js';
 
 export const REVIEW_STATUSES = ['IN_REVIEW', 'RESUBMIT', 'REJECTED', 'COMPLETED'];
 const DECISIONS = { APPROVE: 'COMPLETED', RESUBMIT: 'RESUBMIT', REJECT: 'REJECTED' };
@@ -41,20 +42,25 @@ function serialize(c) {
     reviewed_at:        c.reviewed_at,
     review_note:        c.review_note,
     xp_earned:          c.xp_earned,
+    // Approving is refused while the hunter's account waits to be deleted.
+    user_delete_at:          pendingDeletionFields(c.users.delete_at).delete_at,
+    user_deletion_days_left: pendingDeletionFields(c.users.delete_at).deletion_days_left,
   };
 }
 
 const INCLUDE = {
   tasks: { select: { title: true, task_type: true, xp_reward: true, proof_count: true } },
-  users: { select: { name: true, hunter_id: true, avatar_id: true } },
+  users: { select: { name: true, hunter_id: true, avatar_id: true, delete_at: true } },
 };
 
 // status IN_REVIEW (the queue, oldest first) or a decided one — RESUBMIT,
 // REJECTED, COMPLETED (approved proofs only) — newest decision first.
 // Keyset-paged by id. Returns { items, next_cursor, counts }.
-export async function listReviewQueue({ status = 'IN_REVIEW', cursor } = {}) {
+// deletion: 'PENDING' narrows the list to hunters waiting to be deleted.
+export async function listReviewQueue({ status = 'IN_REVIEW', cursor, deletion } = {}) {
   if (!REVIEW_STATUSES.includes(status)) throw new Error('INVALID_REVIEW_STATUS');
   if (cursor !== undefined && cursor !== '' && !/^\d+$/.test(String(cursor))) throw new Error('INVALID_CURSOR');
+  if (deletion && String(deletion).toUpperCase() !== 'PENDING') throw new Error('INVALID_DELETION_FILTER');
 
   const pending = status === 'IN_REVIEW';
   // Approved proofs only — not every COMPLETED task.
@@ -63,6 +69,7 @@ export async function listReviewQueue({ status = 'IN_REVIEW', cursor } = {}) {
     status,
     ...proofOnly,
     ...(cursor ? { id: pending ? { gt: BigInt(cursor) } : { lt: BigInt(cursor) } } : {}),
+    ...(deletion ? { users: { delete_at: { not: null } } } : {}),
   };
 
   const [rows, ...counts] = await Promise.all([
@@ -104,6 +111,13 @@ export async function reviewProof(adminId, completionId, { decision, note } = {}
     await tx.$queryRaw`SELECT 1 FROM user_progression WHERE user_id = ${bUserId} FOR UPDATE`;
     const c = await tx.task_completions.findUnique({ where: { id: bId }, include: { tasks: true } });
     if (c.status !== 'IN_REVIEW') throw new Error('REVIEW_NOT_PENDING');
+    // Pending deletion: no XP or rewards. Approval waits (the proof stays
+    // IN_REVIEW) until the hunter keeps the account; asking for new photos
+    // or rejecting pays nothing, so those still go through.
+    if (status === 'COMPLETED') {
+      const owner = await tx.users.findUnique({ where: { id: bUserId }, select: { delete_at: true } });
+      if (owner?.delete_at) throw new Error('USER_PENDING_DELETION');
+    }
     const task = c.tasks;
 
     const saved = await tx.task_completions.update({

@@ -15,6 +15,14 @@ import { info, logError } from '../utils/logger.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import { createNotification } from './notificationService.js';
 
+// Scheduled account deletion, for admin screens: when, and whole days left
+// (the app's banner rounds the same way). Nulls when nothing is scheduled.
+export function pendingDeletionFields(deleteAt) {
+  if (!deleteAt) return { delete_at: null, deletion_days_left: null };
+  const at = new Date(deleteAt);
+  return { delete_at: at.toISOString(), deletion_days_left: Math.max(0, Math.ceil((at.getTime() - Date.now()) / 86_400_000)) };
+}
+
 // Tells the user about an admin action on their account. The action is
 // already committed, so a push failure is only logged.
 async function notifyAccountUpdate(userId, event, title, body, extra = {}) {
@@ -161,6 +169,7 @@ export async function listUsers(query = {}) {
     start_date:  startDate,
     end_date:    endDate,
     sort_by:     sortBy = 'signup_date',
+    deletion,
   } = query;
 
   const page  = Math.max(1, parseInt(query.page, 10) || 1);
@@ -181,6 +190,12 @@ export async function listUsers(query = {}) {
     const normalized = status.toUpperCase();
     if (!STATUSES.includes(normalized)) throw new Error('INVALID_STATUS');
     where.is_banned = normalized === 'BANNED';
+  }
+
+  // deletion=PENDING: only accounts waiting to be deleted.
+  if (deletion) {
+    if (String(deletion).toUpperCase() !== 'PENDING') throw new Error('INVALID_DELETION_FILTER');
+    where.delete_at = { not: null };
   }
 
   // Both `rank` and `level` narrow user_progression.current_level — when
@@ -228,6 +243,7 @@ export async function listUsers(query = {}) {
         email:      true,
         is_banned:  true,
         created_at: true,
+        delete_at:  true,
         avatars:    { select: { image_url: true } },
         auth_providers: { select: { provider: true } },
         user_progression: {
@@ -255,6 +271,7 @@ export async function listUsers(query = {}) {
     status:          u.is_banned ? 'BANNED' : 'ACTIVE',
     signup_date:     u.created_at,
     auth_providers:  u.auth_providers.map((p) => p.provider),
+    ...pendingDeletionFields(u.delete_at),
   }));
 
   return {
@@ -314,6 +331,7 @@ export async function getUserDetail(id) {
       bmi:          true,
       dragon_stage: true,
       created_at:   true,
+      delete_at:    true,
       avatars:        { select: { image_url: true } },
       auth_providers: { select: { provider: true } },
       user_progression: {
@@ -443,6 +461,7 @@ export async function getUserDetail(id) {
     banned_at:      user.banned_at,
     signup_date:    user.created_at,
     auth_providers: user.auth_providers.map((p) => p.provider),
+    ...pendingDeletionFields(user.delete_at),
 
     activity_log: activityLog,
 
