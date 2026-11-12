@@ -8,7 +8,7 @@
 // foreign key. The leaderboard's Redis copy is dropped after commit.
 
 import prisma from '../config/prisma.js';
-import { removeLeaderboardMember } from './leaderboardService.js';
+import { removeLeaderboardMember, syncLeaderboardMember } from './leaderboardService.js';
 import crypto from 'crypto';
 import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpService.js';
 import { revokeAllSessions } from './sessionService.js';
@@ -172,6 +172,8 @@ async function schedule(user) {
     },
   });
   info(`Account ${user.id} scheduled for deletion on ${deleteAt.toISOString()}`);
+  // Off the leaderboards while pending (computeEligibility).
+  await syncLeaderboardMember(user.id);
   const day = formatDeletionDate(deleteAt);
   mailHunter(user, 'Your HunterX account will be deleted', 'Your account is scheduled for deletion', [
     `Your HunterX account and its data will be permanently deleted on ${strong(day)}.`,
@@ -198,6 +200,7 @@ async function unschedule(user, { via = 'app' } = {}) {
     await shiftStreakPastPause(tx, user.id, pausedAt);
     await extendRewardsPastPause(tx, user.id, pausedAt);
   });
+  await syncLeaderboardMember(user.id); // back on the leaderboards
   info(`Account ${user.id} deletion cancelled (${via})`);
   mailHunter(user, 'Your HunterX account will not be deleted', 'Your account is safe', [
     'You cancelled the deletion of your HunterX account. Your XP, streaks and rewards stay right where they are.',

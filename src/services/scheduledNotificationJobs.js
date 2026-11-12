@@ -603,7 +603,7 @@ async function computeRanks(userId, settings) {
   if (friendIds.length === 0) return { xp, globalRank, friendsRank: null, closestAhead: null };
 
   const ahead = await prisma.users.findMany({
-    where:   { id: { in: friendIds }, is_banned: false, ...VISIBLE_FILTER, ...aheadOf(userId, xp) },
+    where:   { id: { in: friendIds }, is_banned: false, delete_at: null, ...VISIBLE_FILTER, ...aheadOf(userId, xp) },
     orderBy: [{ user_progression: { total_xp: 'asc' } }, { id: 'desc' }],
     select:  { name: true, user_progression: { select: { total_xp: true } } },
   });

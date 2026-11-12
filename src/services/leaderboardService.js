@@ -77,8 +77,10 @@ export function buildAvatarThumbUrl(imageUrl) {
 // Eligibility
 // ─────────────────────────────────────────────────────────────
 
-function computeEligibility({ onboarding_done, is_banned, role, leaderboard_visible, total_xp }) {
-  const global = Boolean(onboarding_done) && !is_banned && role === 'USER' && Boolean(leaderboard_visible) && total_xp > 0;
+// Accounts waiting to be deleted (delete_at set) are left out until they
+// keep the account — accountDeletionService.js resyncs them both ways.
+export function computeEligibility({ onboarding_done, is_banned, role, leaderboard_visible, total_xp, delete_at }) {
+  const global = Boolean(onboarding_done) && !is_banned && !delete_at && role === 'USER' && Boolean(leaderboard_visible) && total_xp > 0;
   return { global };
 }
 
@@ -90,6 +92,7 @@ async function loadFullMemberRow(bUserId) {
       name: true,
       onboarding_done: true,
       is_banned: true,
+      delete_at: true,
       role: true,
       avatars: { select: { image_url: true } },
       user_settings: { select: { leaderboard_visible: true } },
@@ -100,7 +103,7 @@ async function loadFullMemberRow(bUserId) {
 
 const KNOWN_VALUE_KEYS = [
   'name', 'onboarding_done', 'is_banned', 'role',
-  'leaderboard_visible', 'total_xp',
+  'leaderboard_visible', 'total_xp', 'delete_at',
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -135,6 +138,7 @@ export async function syncLeaderboardMember(userId, knownValues = {}) {
       eligibility = computeEligibility({
         onboarding_done: row.onboarding_done,
         is_banned: row.is_banned,
+        delete_at: row.delete_at,
         role: row.role,
         leaderboard_visible: row.user_settings?.leaderboard_visible ?? true,
         total_xp: totalXp,
@@ -433,6 +437,7 @@ export function eligibilityWhere() {
   return {
     onboarding_done: true,
     is_banned: false,
+    delete_at: null,
     role: 'USER',
     ...VISIBLE_FILTER,
     user_progression: { total_xp: { gt: 0 } },
@@ -532,7 +537,7 @@ async function getFriendsLeaderboard({ meId, meSnapshot, cursorStr, limit }) {
   if (meRow?.referred_by) friendIds.add(meRow.referred_by);
   for (const r of referredRows) friendIds.add(r.referred_id);
 
-  const visibilityFilter = { OR: [{ id: meId }, { is_banned: false, ...VISIBLE_FILTER }] };
+  const visibilityFilter = { OR: [{ id: meId }, { is_banned: false, delete_at: null, ...VISIBLE_FILTER }] };
 
   if (!cursorStr) {
     const totalRanked = await prisma.users.count({

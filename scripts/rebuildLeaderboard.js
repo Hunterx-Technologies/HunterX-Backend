@@ -74,6 +74,7 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
           name: true,
           onboarding_done: true,
           is_banned: true,
+          delete_at: true,
           role: true,
           avatars: { select: { image_url: true } },
           user_settings: { select: { leaderboard_visible: true } },
@@ -87,7 +88,8 @@ export async function rebuildLeaderboard({ batchSize = BATCH_SIZE } = {}) {
       for (const row of rows) {
         const totalXp = row.user_progression?.total_xp ?? 0;
         const visible = row.user_settings?.leaderboard_visible ?? true;
-        const eligible = Boolean(row.onboarding_done) && !row.is_banned && row.role === 'USER' && visible && totalXp > 0;
+        // Same rule as leaderboardService.js#computeEligibility.
+        const eligible = Boolean(row.onboarding_done) && !row.is_banned && !row.delete_at && row.role === 'USER' && visible && totalXp > 0;
 
         if (eligible) {
           const score = encodeScore(totalXp, row.id);
