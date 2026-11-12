@@ -94,6 +94,7 @@ export function createFakePrisma(seed = {}) {
     data_export_requests: model(seed.data_export_requests ?? []),
     notifications:  model(seed.notifications ?? []),
     user_settings:  model(seed.user_settings ?? [], { idKey: 'user_id', autoId: false }),
+    pending_media_cleanup: model(seed.pending_media_cleanup ?? []),
   };
   const empty = model([]);
 

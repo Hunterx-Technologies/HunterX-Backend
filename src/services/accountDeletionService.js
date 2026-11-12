@@ -19,6 +19,7 @@ import { brandedEmail } from '../utils/emailTemplates.js';
 import { sendMail } from '../utils/mailer.js';
 import { createNotification } from './notificationService.js';
 import { info, logError } from '../utils/logger.js';
+import { cleanupUserMedia } from './userMediaCleanupService.js';
 
 export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
@@ -52,9 +53,16 @@ export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
     // notifications, push tokens, settings, feedback, ratings, purchases,
     // health data, ...) cascades from the users row.
     await tx.users.delete({ where: { id: bUserId } });
+
+    // Cloudinary uploads are removed after commit; this row (no FK, so it
+    // outlives the user) makes sure that's retried if it fails or the
+    // process dies first — see userMediaCleanupService.js.
+    await tx.pending_media_cleanup.deleteMany({ where: { user_id: bUserId } });
+    await tx.pending_media_cleanup.create({ data: { user_id: bUserId } });
   });
 
   await removeLeaderboardMember(bUserId);
+  await cleanupUserMedia(bUserId);
 
   // Sign in with Apple (Guideline 5.1.1(v)): unlink the Apple ID. After the
   // commit so an Apple outage can't block the deletion; failures are logged.
