@@ -18,7 +18,7 @@
 
 import { randomUUID } from 'node:crypto';
 import prisma from '../config/prisma.js';
-import { getNotificationTypeConfig } from '../config/notificationTypes.js';
+import { getNotificationTypeConfig, PENDING_DELETION_TYPES } from '../config/notificationTypes.js';
 import { sendPushMessages, getPushReceipts, getTokensForUsers, removeTokens } from './pushService.js';
 import { info, logError } from '../utils/logger.js';
 
@@ -88,6 +88,26 @@ async function claimDueNotifications(now) {
   });
 }
 
+async function withoutPendingDeletionPushes(notifications) {
+  const userIds = [...new Set(notifications.map((n) => n.user_id))];
+  const pending = await prisma.users.findMany({
+    where:  { id: { in: userIds }, delete_at: { not: null } },
+    select: { id: true },
+  });
+  if (pending.length === 0) return notifications;
+
+  const pendingIds = new Set(pending.map((u) => String(u.id)));
+  const held = notifications.filter((n) => pendingIds.has(String(n.user_id)) && !PENDING_DELETION_TYPES.has(n.type));
+  if (held.length === 0) return notifications;
+
+  await prisma.notifications.updateMany({
+    where: { id: { in: held.map((n) => n.id) } },
+    data:  { push_status: 'SKIPPED', push_claim: null, push_error: 'pending_deletion' },
+  });
+  const heldIds = new Set(held.map((n) => n.id));
+  return notifications.filter((n) => !heldIds.has(n.id));
+}
+
 export async function runPushDispatch() {
   const now = new Date();
 
@@ -104,8 +124,15 @@ export async function runPushDispatch() {
   });
 
   // 3. Claim.
-  const notifications = await claimDueNotifications(now);
-  if (notifications.length === 0) return { sent: 0, failed: 0, skipped: 0 };
+  const claimed = await claimDueNotifications(now);
+  if (claimed.length === 0) return { sent: 0, failed: 0, skipped: 0 };
+
+  // 3b. Accounts waiting to be deleted only get the deletion pushes — a
+  // quest reminder for locked quests would just confuse. The row stays in
+  // the inbox; only the push is skipped. Checked here, at send time, so
+  // pushes queued before the deletion was scheduled are held back too.
+  const notifications = await withoutPendingDeletionPushes(claimed);
+  if (notifications.length === 0) return { sent: 0, failed: 0, skipped: claimed.length };
 
   // 4. Fan out to devices.
   const tokens = await getTokensForUsers([...new Set(notifications.map((n) => n.user_id))]);
@@ -200,7 +227,7 @@ export async function runPushDispatch() {
     await removeTokens(deadTokens);
   }
 
-  const summary = { sent: sentIds.length, failed, skipped: noDevice.length };
+  const summary = { sent: sentIds.length, failed, skipped: noDevice.length + (claimed.length - notifications.length) };
   info(`Push dispatch: ${JSON.stringify(summary)} (${messages.length} message(s), ${deadTokens.length} dead token(s) pruned)`);
   return summary;
 }

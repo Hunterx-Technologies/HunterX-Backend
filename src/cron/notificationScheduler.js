@@ -41,6 +41,8 @@ export async function runNotificationScheduler(now = new Date()) {
   const users = await prisma.users.findMany({
     where: {
       is_banned:        false,
+      // Accounts waiting to be deleted get no retention pushes.
+      delete_at:        null,
       user_push_tokens: { some: {} },
     },
     select: { id: true, onboarding_done: true, created_at: true, user_settings: true },

@@ -92,6 +92,8 @@ export function createFakePrisma(seed = {}) {
     email_otps:     model(seed.email_otps ?? []),
     refresh_tokens: model(seed.refresh_tokens ?? [], { idKey: 'jti', autoId: false }),
     data_export_requests: model(seed.data_export_requests ?? []),
+    notifications:  model(seed.notifications ?? []),
+    user_settings:  model(seed.user_settings ?? [], { idKey: 'user_id', autoId: false }),
   };
   const empty = model([]);
 

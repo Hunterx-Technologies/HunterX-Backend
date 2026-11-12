@@ -1092,6 +1092,8 @@ enum notification_type {
   DAY_COMPLETE
   ACCOUNT_UPDATE
   TASK_REVIEW
+  ACCOUNT_DELETION
+  ACCOUNT_DELETION_REMINDER
 }
 
 enum reward_status {

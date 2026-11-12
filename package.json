@@ -14,6 +14,7 @@
     "seed": "node prisma/seed.js",
     "rebuild:leaderboard": "node scripts/rebuildLeaderboard.js",
     "push:test": "node scripts/send-test-push.js",
+    "push:test:deletion": "node scripts/send-deletion-test-pushes.js",
     "test": "node --test --experimental-test-module-mocks --test-concurrency=1 --test-timeout=30000 \"test/**/*.test.js\""
   },
   "prisma": {

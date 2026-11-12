@@ -17,6 +17,7 @@ import { normalizeEmail, sha256 } from '../utils/helpers.js';
 import { allowCodeEmail } from '../utils/throttle.js';
 import { brandedEmail } from '../utils/emailTemplates.js';
 import { sendMail } from '../utils/mailer.js';
+import { createNotification } from './notificationService.js';
 import { info, logError } from '../utils/logger.js';
 
 export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
@@ -77,7 +78,65 @@ export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
 // ─────────────────────────────────────────────────────────────
 
 export const DELETION_GRACE_DAYS = 30;
+// Reminders (push + email): once the deletion is DELETION_REMINDER_DAYS
+// away, then a final "last day" one within DELETION_LAST_DAY_DAYS of it.
+export const DELETION_REMINDER_DAYS = 3;
+export const DELETION_LAST_DAY_DAYS = 1;
 const LINK_TTL_MS = 10 * 60 * 1000;
+const DAY_MS = 86_400_000;
+const PROFILE_URL = '/(tabs)/profile';
+
+// "12 December 2026" — the IST calendar day, like the rest of the app.
+export function formatDeletionDate(date) {
+  return new Date(date).toLocaleDateString('en-IN', {
+    day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata',
+  });
+}
+
+const strong = (text) => `<strong style="color:#ffffff;">${text}</strong>`;
+
+const daysText = (n) => `${n} day${n === 1 ? '' : 's'}`;
+
+// Push copy — shared with scripts/send-deletion-test-pushes.js so device
+// tests show exactly what hunters will see.
+export const DELETION_PUSH = {
+  scheduled: (day) => ({
+    type:  'ACCOUNT_DELETION',
+    title: '⚠️ Account deletion scheduled',
+    body:  `Your HunterX account will be permanently deleted on ${day}. Changed your mind? Tap to keep it.`,
+  }),
+  reminder: (daysLeft, day) => ({
+    type:  'ACCOUNT_DELETION_REMINDER',
+    title: `⏳ ${daysText(daysLeft)} until your account is deleted`,
+    body:  `On ${day} your XP, streaks and rewards are gone for good. Tap Keep my account to stay, Hunter.`,
+  }),
+  lastDay: () => ({
+    type:  'ACCOUNT_DELETION_REMINDER',
+    title: '🚨 Last day to keep your account',
+    body:  'Within 24 hours your HunterX account and all your XP, streaks and rewards are deleted forever. Tap now to keep it, Hunter.',
+  }),
+  cancelled: () => ({
+    type:  'ACCOUNT_DELETION',
+    title: '✅ Your account is safe',
+    body:  'Deletion cancelled. Your XP, streaks and rewards stay right where they are.',
+  }),
+};
+
+// Pushes about the deletion never block or fail the deletion itself.
+async function notifyHunter(userId, { type, title, body }, event, options) {
+  try {
+    return await createNotification(prisma, userId, type, title, body, { event, url: PROFILE_URL }, options);
+  } catch (err) {
+    logError(`${event} push for ${userId} failed: ${err.message || err}`);
+    return null;
+  }
+}
+
+function mailHunter(user, subject, heading, paragraphs, event) {
+  if (!user.email) return Promise.resolve();
+  return sendMail({ to: user.email, subject, html: brandedEmail({ heading, paragraphs }) })
+    .catch((err) => logError(`${event} email for ${user.id} failed: ${err.message || err}`));
+}
 
 function websiteUrl() {
   return (process.env.WEBSITE_URL || process.env.APP_URL || '').replace(/\/+$/, '');
@@ -103,29 +162,85 @@ async function schedule(user) {
     },
   });
   info(`Account ${user.id} scheduled for deletion on ${deleteAt.toISOString()}`);
-  if (user.email) {
-    sendMail({
-      to:      user.email,
-      subject: 'Your HunterX account will be deleted',
-      html: brandedEmail({
-        heading:    'Your account is scheduled for deletion',
-        paragraphs: [
-          `Your HunterX account and its data will be permanently deleted on <strong style="color:#ffffff;">${deleteAt.toDateString()}</strong>.`,
-          'Changed your mind? Log in to the app and tap <strong style="color:#ffffff;">Keep my account</strong> any time before then.',
-        ],
-      }),
-    }).catch((err) => logError(`Deletion-scheduled notice for ${user.id} failed: ${err.message || err}`));
-  }
+  const day = formatDeletionDate(deleteAt);
+  mailHunter(user, 'Your HunterX account will be deleted', 'Your account is scheduled for deletion', [
+    `Your HunterX account and its data will be permanently deleted on ${strong(day)}.`,
+    `Changed your mind? Log in to the app and tap ${strong('Keep my account')} any time before then.`,
+  ], 'Deletion-scheduled');
+  await notifyHunter(user.id, DELETION_PUSH.scheduled(day), 'DELETION_SCHEDULED');
   return deleteAt;
 }
 
-async function unschedule(user) {
+// via: 'app' (Keep my account — the hunter is in the app and sees a toast,
+// so no push) or 'website' (cancel code — pushed so the phone confirms it).
+async function unschedule(user, { via = 'app' } = {}) {
   if (!user.delete_at) throw new Error('NO_PENDING_DELETION');
   await prisma.users.update({
     where: { id: user.id },
     data:  { deletion_requested_at: null, delete_at: null, deletion_token_hash: null, deletion_token_expiry: null },
   });
-  info(`Account ${user.id} deletion cancelled`);
+  info(`Account ${user.id} deletion cancelled (${via})`);
+  mailHunter(user, 'Your HunterX account will not be deleted', 'Your account is safe', [
+    'You cancelled the deletion of your HunterX account. Your XP, streaks and rewards stay right where they are.',
+    'If this wasn’t you, contact customercare@hunterx.co.in.',
+  ], 'Deletion-cancelled');
+  if (via === 'website') {
+    await notifyHunter(user.id, DELETION_PUSH.cancelled(), 'DELETION_CANCELLED');
+  }
+}
+
+/**
+ * Hourly (cron/accountDeletion.js): push + email reminders per scheduled
+ * deletion — "N days left" once it is DELETION_REMINDER_DAYS away, then
+ * "last day" once it is within DELETION_LAST_DAY_DAYS. The notification
+ * row's dedupe key (per stage and delete_at) keeps each to one, across runs
+ * and instances; cancelling and deleting again gets a new date and so new
+ * reminders. If the job missed the 3-day window, only the last-day one goes.
+ * The last-day one goes ~24h ahead, so quiet hours (≤ 9h) never push it
+ * past the deletion.
+ */
+export async function sendDeletionReminders(now = new Date()) {
+  const due = await prisma.users.findMany({
+    where:  {
+      delete_at: { gt: now, lte: new Date(now.getTime() + DELETION_REMINDER_DAYS * DAY_MS) },
+      role:      { not: 'ADMIN' },
+    },
+    select: { id: true, email: true, delete_at: true },
+    take:   500,
+  });
+
+  let sent = 0;
+  for (const user of due) {
+    const deleteAt = new Date(user.delete_at);
+    const msLeft   = deleteAt.getTime() - now.getTime();
+    const lastDay  = msLeft <= DELETION_LAST_DAY_DAYS * DAY_MS;
+    const daysLeft = Math.max(1, Math.ceil(msLeft / DAY_MS));
+    const inDays   = daysText(daysLeft);
+    const day      = formatDeletionDate(deleteAt);
+    const stage    = lastDay ? 'last_day' : `${DELETION_REMINDER_DAYS}d`;
+
+    const notification = await notifyHunter(
+      user.id,
+      lastDay ? DELETION_PUSH.lastDay() : DELETION_PUSH.reminder(daysLeft, day),
+      lastDay ? 'DELETION_LAST_DAY' : 'DELETION_REMINDER',
+      { dedupeKey: `deletion_reminder:${stage}:${deleteAt.toISOString()}`, expiresAt: deleteAt },
+    );
+    // null = this stage was already sent (dedupe) — the email rides on the same row.
+    if (!notification) continue;
+    sent += 1;
+    if (lastDay) {
+      await mailHunter(user, 'Last day to keep your HunterX account', 'Last day to keep your account', [
+        `Your HunterX account and all its data will be permanently deleted on ${strong(day)}. After that it can't be recovered.`,
+        `Want to keep it? Log in to the app and tap ${strong('Keep my account')} now.`,
+      ], 'Deletion-last-day');
+    } else {
+      await mailHunter(user, `Your HunterX account will be deleted in ${inDays}`, `${inDays} left`, [
+        `Your HunterX account and its data will be permanently deleted on ${strong(day)}.`,
+        `Want to keep it? Log in to the app and tap ${strong('Keep my account')} before then.`,
+      ], 'Deletion-reminder');
+    }
+  }
+  return sent;
 }
 
 /** App: a one-time (10-minute) website link that confirms deletion. */
@@ -207,7 +322,7 @@ export async function confirmDeletionByCode(rawEmail, otp) {
 export async function cancelDeletionByCode(rawEmail, otp) {
   const user = await userForCode(rawEmail);
   await consumeAccountOtp(user.id, OTP_PURPOSES.CANCEL_DELETION, otp);
-  await unschedule(user);
+  await unschedule(user, { via: 'website' });
 }
 
 /** Hourly: deletes every account whose grace period is over. */

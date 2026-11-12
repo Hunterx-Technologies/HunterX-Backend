@@ -36,7 +36,16 @@ export const NOTIFICATION_TYPES = {
   ACCOUNT_UPDATE:     { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: false },
   // Proof review outcome (approved / new proof needed / rejected) — transactional.
   TASK_REVIEW:        { setting: null,                         channel: 'system',    url: '/(tabs)',         capped: false, quietHours: true },
+  // Account deletion (accountDeletionService.js) — transactional. Scheduled /
+  // cancelled is sent straight away (the hunter just acted); the 3-day
+  // reminder comes from the hourly job, so it waits out quiet hours.
+  ACCOUNT_DELETION:          { setting: null, channel: 'system', url: '/(tabs)/profile', capped: false, quietHours: false },
+  ACCOUNT_DELETION_REMINDER: { setting: null, channel: 'system', url: '/(tabs)/profile', capped: false, quietHours: true },
 };
+
+// The only types still pushed while an account waits to be deleted —
+// everything else (reminders, streaks, broadcasts…) is held back.
+export const PENDING_DELETION_TYPES = new Set(['ACCOUNT_DELETION', 'ACCOUNT_DELETION_REMINDER']);
 
 const FALLBACK = { setting: null, channel: 'system', url: '/(tabs)', capped: false, quietHours: true };
 
