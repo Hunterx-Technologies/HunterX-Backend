@@ -12,6 +12,21 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Real Postgres for the tests that need one (test/*.db.test.js); also
+    # proves every migration applies cleanly from scratch.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: hunterx_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/hunterx_test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -23,6 +38,10 @@ jobs:
         run: npx prisma validate && npx prisma generate
       - name: Syntax check
         run: find src scripts prisma -name '*.js' -print0 | xargs -0 -n1 node --check
+      - name: Migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ env.TEST_DATABASE_URL }}
       - name: Tests
         run: npm test
       # Fails on critical advisories in production dependencies.
