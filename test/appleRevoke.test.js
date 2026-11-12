@@ -33,6 +33,12 @@ mock.module(new URL('../src/utils/mailer.js', import.meta.url).href, {
   namedExports: { sendMail: async () => ({}), mailTransporter: {} },
 });
 
+// No uploads here (Cloudinary cleanup is covered by mediaCleanup.test.js).
+const noMedia = async () => ({ partial: false, resources: [] });
+mock.module(new URL('../src/config/cloudinary.js', import.meta.url).href, {
+  defaultExport: { api: { delete_resources_by_prefix: noMedia, resources: noMedia, delete_folder: noMedia }, uploader: {}, utils: {} },
+});
+
 const appleTokens = await import('../src/services/appleTokenService.js');
 const deletion = await import('../src/services/accountDeletionService.js');
 
