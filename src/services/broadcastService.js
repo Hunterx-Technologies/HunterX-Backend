@@ -50,7 +50,8 @@ export function validateBroadcast({ title, body, url, audience, inactive_days })
 }
 
 function audienceWhere({ audience, days }) {
-  const where = { onboarding_done: true, is_banned: false, role: 'USER' };
+  // Accounts waiting to be deleted get no broadcasts (not even in the inbox).
+  const where = { onboarding_done: true, is_banned: false, delete_at: null, role: 'USER' };
   if (audience === 'inactive') {
     const cutoff = getISTDateOnly(-days);
     where.OR = [
