@@ -38,6 +38,8 @@ router.post('/delete/cancel', verifyToken, async (req, res, next) => {
       return error(res, 'User not found', 404, 'ACCOUNT_NOT_FOUND');
     if (err.message === 'NO_PENDING_DELETION')
       return error(res, 'Your account is not scheduled for deletion.', 409, 'NO_PENDING_DELETION');
+    if (err.message === 'DELETION_ALREADY_DUE')
+      return error(res, 'Your account\'s deletion date has passed, so it can no longer be kept.', 409, 'DELETION_ALREADY_DUE');
     next(err);
   }
 });

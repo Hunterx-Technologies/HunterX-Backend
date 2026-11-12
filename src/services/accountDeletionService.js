@@ -11,7 +11,6 @@ import prisma from '../config/prisma.js';
 import { removeLeaderboardMember, syncLeaderboardMember } from './leaderboardService.js';
 import crypto from 'crypto';
 import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpService.js';
-import { revokeAllSessions } from './sessionService.js';
 import { revokeAppleRefreshToken } from './appleTokenService.js';
 import { normalizeEmail, sha256 } from '../utils/helpers.js';
 import { allowCodeEmail } from '../utils/throttle.js';
@@ -23,7 +22,10 @@ import { cleanupUserMedia } from './userMediaCleanupService.js';
 import { shiftStreakPastPause } from './streakService.js';
 import { extendRewardsPastPause } from './rewardService.js';
 
-export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
+// onlyIfDueBy (the hourly purge): delete only if delete_at is still set and
+// <= that time, checked under the row lock inside the transaction, so a
+// "Keep my account" that lands first wins. Throws NOT_DUE then.
+export async function deleteUserAccount(userId, { allowAdmin = false, onlyIfDueBy = null } = {}) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
 
   const user = await prisma.users.findUnique({
@@ -40,6 +42,15 @@ export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
   });
 
   await prisma.$transaction(async (tx) => {
+    if (onlyIfDueBy) {
+      // Locks the row (as an UPDATE) and re-checks the date in one step.
+      const { count } = await tx.users.updateMany({
+        where: { id: bUserId, delete_at: { lte: onlyIfDueBy } },
+        data:  { deletion_token_hash: null },
+      });
+      if (count === 0) throw new Error('NOT_DUE');
+    }
+
     // NoAction relations pointing at this user.
     await tx.users.updateMany({ where: { referred_by: bUserId }, data: { referred_by: null } });
     await tx.tasks.updateMany({ where: { created_by: bUserId }, data: { created_by: null } });
@@ -187,15 +198,21 @@ async function schedule(user) {
 // so no push) or 'website' (cancel code — pushed so the phone confirms it).
 async function unschedule(user, { via = 'app' } = {}) {
   if (!user.delete_at) throw new Error('NO_PENDING_DELETION');
+  const now = new Date();
+  // Past the date: the purge owns it now (it runs hourly), so no restore
+  // and no "your account is safe".
+  if (new Date(user.delete_at) <= now) throw new Error('DELETION_ALREADY_DUE');
   // When the pause began. delete_at is always request + grace, so it
   // stands in if the request time is missing (rows from before it existed).
   const pausedAt = user.deletion_requested_at
     ?? new Date(new Date(user.delete_at).getTime() - DELETION_GRACE_DAYS * DAY_MS);
   await prisma.$transaction(async (tx) => {
-    await tx.users.update({
-      where: { id: user.id },
+    // Conditional, so a purge that already locked the row wins cleanly.
+    const { count } = await tx.users.updateMany({
+      where: { id: user.id, delete_at: { gt: now } },
       data:  { deletion_requested_at: null, delete_at: null, deletion_token_hash: null, deletion_token_expiry: null },
     });
+    if (count === 0) throw new Error('DELETION_ALREADY_DUE');
     // Streak and reward clocks were frozen while pending: give the time back.
     await shiftStreakPastPause(tx, user.id, pausedAt);
     await extendRewardsPastPause(tx, user.id, pausedAt);
@@ -307,7 +324,8 @@ export async function requestDeletionCode(rawEmail, purpose) {
   if (!(await allowCodeEmail(`deletion-${purpose}`, email))) throw new Error('OTP_COOLDOWN');
   const user = await findByEmail(email);
   if (!user || user.role === 'ADMIN') return;
-  if (purpose === 'cancel' && !user.delete_at) return;
+  // Nothing to cancel, or already past the date (it can't be kept then).
+  if (purpose === 'cancel' && (!user.delete_at || new Date(user.delete_at) <= new Date())) return;
 
   const otpPurpose = purpose === 'cancel' ? OTP_PURPOSES.CANCEL_DELETION : OTP_PURPOSES.DELETE_ACCOUNT;
   const code = await createAccountOtp(user.id, otpPurpose, email);
@@ -357,10 +375,15 @@ export async function purgeDueAccounts() {
   let deleted = 0;
   for (const { id } of due) {
     try {
-      await revokeAllSessions(id);
-      await deleteUserAccount(id);
+      // Re-checked inside the delete transaction; refresh tokens cascade
+      // with the users row, so a cancel that wins keeps its sessions.
+      await deleteUserAccount(id, { onlyIfDueBy: new Date() });
       deleted += 1;
     } catch (err) {
+      if (err.message === 'NOT_DUE') {
+        info(`Scheduled deletion of account ${id} skipped: it was kept`);
+        continue;
+      }
       logError(`Scheduled deletion of account ${id} failed: ${err.message || err}`);
     }
   }

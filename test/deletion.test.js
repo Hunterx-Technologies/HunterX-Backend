@@ -14,6 +14,12 @@ mock.module(new URL('../src/utils/mailer.js', import.meta.url).href, {
   namedExports: { sendMail: async (msg) => { sent.push(msg); return {}; }, mailTransporter: {} },
 });
 
+// No uploads in these tests (Cloudinary cleanup is covered by mediaCleanup.test.js).
+const noMedia = async () => ({ partial: false, resources: [] });
+mock.module(new URL('../src/config/cloudinary.js', import.meta.url).href, {
+  defaultExport: { api: { delete_resources_by_prefix: noMedia, resources: noMedia, delete_folder: noMedia }, uploader: {}, utils: {} },
+});
+
 const deletion = await import('../src/services/accountDeletionService.js');
 
 beforeEach(() => {
@@ -173,4 +179,33 @@ test('if the 3-day window was missed, only the last-day reminder goes', async ()
 test('admins cannot be scheduled for deletion', async () => {
   fake.models.users.rows[0].role = 'ADMIN';
   await assert.rejects(deletion.createDeletionLink(1n), /CANNOT_DELETE_ADMIN/);
+});
+
+// ── Purge vs. "Keep my account" ───────────────────────────
+
+test('the purge deletes only accounts still due, re-checked at delete time', async () => {
+  const user = fake.models.users.rows[0];
+  user.delete_at = new Date(Date.now() - 1000);
+  fake.models.users.rows.push({ id: 2n, email: 'kept@example.com', role: 'USER', delete_at: null });
+
+  // A cancel that commits between the purge's scan and its delete wins.
+  await assert.rejects(deletion.deleteUserAccount(2n, { onlyIfDueBy: new Date() }), /NOT_DUE/);
+  assert.ok(fake.models.users.rows.some((u) => u.id === 2n));
+
+  assert.equal(await deletion.purgeDueAccounts(), 1);
+  assert.deepEqual(fake.models.users.rows.map((u) => u.id), [2n]);
+});
+
+test('once the date has passed, neither cancel path restores or says "safe"', async () => {
+  const user = fake.models.users.rows[0];
+  user.email = 'too-late@example.com';
+  user.delete_at = new Date(Date.now() - 1000);
+
+  await assert.rejects(deletion.cancelDeletion(1n), /DELETION_ALREADY_DUE/);
+  assert.ok(user.delete_at, 'still scheduled');
+
+  // The website can't even get a cancel code then.
+  await deletion.requestDeletionCode('too-late@example.com', 'cancel');
+  assert.equal(sent.length, 0, 'no code, no "your account is safe" email');
+  assert.equal(pushes().length, 0);
 });

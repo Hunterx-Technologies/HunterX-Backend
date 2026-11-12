@@ -51,6 +51,7 @@ const DELETION_ERRORS = {
   INVALID_TOKEN:         [400, 'Invalid link'],
   EXPIRED_TOKEN:         [410, 'This link has expired'],
   NO_PENDING_DELETION:   [409, 'No deletion is pending for this account'],
+  DELETION_ALREADY_DUE:  [409, 'This account\'s deletion date has passed, so it can no longer be kept'],
   CANNOT_DELETE_ADMIN:   [403, 'This account cannot be deleted here'],
 };
 
