@@ -18,9 +18,10 @@ export async function findActiveReferrer(rawCode, client = prisma) {
 
   const user = await client.users.findUnique({
     where:  { referral_code: code },
-    select: { id: true, name: true, is_banned: true },
+    select: { id: true, name: true, is_banned: true, delete_at: true },
   });
-  if (!user || user.is_banned) return null;
+  // A code whose owner is banned, or waiting to be deleted, attributes no one.
+  if (!user || user.is_banned || user.delete_at) return null;
   return user;
 }
 
@@ -42,9 +43,13 @@ export async function lookupReferralCode(rawCode) {
   return result;
 }
 
+// Invited hunters whose account is waiting to be deleted are left out of
+// the list and the count until they keep it.
+const INVITEE_ACTIVE = { users_referrals_referred_idTousers: { delete_at: null } };
+
 // Hunters who signed up with this user's code (display only).
 export function countAcceptedInvites(userId, client = prisma) {
-  return client.referrals.count({ where: { referrer_id: userId } });
+  return client.referrals.count({ where: { referrer_id: userId, ...INVITEE_ACTIVE } });
 }
 
 // Most recent first; the invite screen shows at most this many rows (the
@@ -60,7 +65,7 @@ export async function listInvitedFriends(userId) {
   const [count, rows] = await Promise.all([
     countAcceptedInvites(bUserId),
     prisma.referrals.findMany({
-      where:   { referrer_id: bUserId },
+      where:   { referrer_id: bUserId, ...INVITEE_ACTIVE },
       orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
       take:    INVITED_LIST_LIMIT,
       select: {
