@@ -217,10 +217,11 @@ router.put('/:taskId/reopen', verifyToken, blockPendingDeletion, async (req, res
 // user completes a daily task. DROP breaks the streak to 0
 // immediately instead of waiting for it to lazily reset on next
 // completion. Does nothing to XP either way.
+// Refused while the account waits to be deleted (the streak is frozen).
 // Header: Authorization: Bearer <access_token>
 // Body: { action: 'USE_LIVES' | 'DROP' }
 
-router.post('/streak/resolve', verifyToken, async (req, res, next) => {
+router.post('/streak/resolve', verifyToken, blockPendingDeletion, async (req, res, next) => {
   try {
     const { action } = req.body;
 
