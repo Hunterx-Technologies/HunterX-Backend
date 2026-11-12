@@ -854,6 +854,10 @@ model users {
   notifications                                           notifications[]
   referrals_referrals_referred_idTousers                  referrals[]                @relation("referrals_referred_idTousers")
   referrals_referrals_referrer_idTousers                  referrals[]                @relation("referrals_referrer_idTousers")
+  friendships_low                                         friendships[]              @relation("friendships_low")
+  friendships_high                                        friendships[]              @relation("friendships_high")
+  blocks_made                                             user_blocks[]              @relation("blocks_made")
+  blocks_received                                         user_blocks[]              @relation("blocks_received")
   subscriptions                                           subscriptions[]
   task_admin_targets                                      task_admin_targets[]
   task_completions                                        task_completions[]
@@ -943,6 +947,45 @@ model pending_media_cleanup {
   last_error String?   @db.VarChar(500)
   created_at DateTime  @default(now()) @db.Timestamp(6)
   updated_at DateTime  @default(now()) @db.Timestamp(6)
+}
+
+enum friendship_status {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+/// One row per pair of hunters (friendService.js), smaller id first (user_low < user_high). PENDING = a request from requested_by; ACCEPTED = friends; DECLINED = turned down (kept so it can't be re-sent straight away). source: REQUEST (leaderboard / pasted code), LINK (invite link opened by an existing hunter) or INVITE (signed up with the code). Deleted with either account.
+model friendships {
+  id           BigInt            @id @default(autoincrement())
+  user_low     BigInt
+  user_high    BigInt
+  requested_by BigInt
+  status       friendship_status @default(PENDING)
+  source       String            @default("REQUEST") @db.VarChar(16)
+  created_at   DateTime          @default(now()) @db.Timestamp(6)
+  updated_at   DateTime          @default(now()) @db.Timestamp(6)
+  accepted_at  DateTime?         @db.Timestamp(6)
+  low          users             @relation("friendships_low", fields: [user_low], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  high         users             @relation("friendships_high", fields: [user_high], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([user_low, user_high], map: "uq_friendships_pair")
+  @@index([user_low, status], map: "idx_friendships_low_status")
+  @@index([user_high, status], map: "idx_friendships_high_status")
+  @@index([requested_by, created_at], map: "idx_friendships_requested_by")
+}
+
+/// blocker_id blocked blocked_id: no requests either way and no friendship. Deleted with either account.
+model user_blocks {
+  id         BigInt   @id @default(autoincrement())
+  blocker_id BigInt
+  blocked_id BigInt
+  created_at DateTime @default(now()) @db.Timestamp(6)
+  blocker    users    @relation("blocks_made", fields: [blocker_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  blocked    users    @relation("blocks_received", fields: [blocked_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([blocker_id, blocked_id], map: "uq_user_blocks_pair")
+  @@index([blocked_id], map: "idx_user_blocks_blocked")
 }
 
 /// One row per issued refresh token. Rotation revokes the old row; replaying a revoked token revokes its family.
@@ -1104,6 +1147,8 @@ enum notification_type {
   TASK_REVIEW
   ACCOUNT_DELETION
   ACCOUNT_DELETION_REMINDER
+  FRIEND_REQUEST
+  FRIEND_ACCEPTED
 }
 
 enum reward_status {

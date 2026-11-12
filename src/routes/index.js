@@ -16,6 +16,7 @@ import rewardsRouter from './rewards.js';
 import publicRouter from './public.js';
 import referralsRouter from './referrals.js';
 import accountRouter from './account.js';
+import friendsRouter from './friends.js';
 
 const router = Router();
 
@@ -78,6 +79,9 @@ router.use('/referrals', referralsRouter);
 
 // Account deletion (one-time website link, "Keep my account")
 router.use('/account', accountRouter);
+
+// Friends between existing hunters: cards, requests, blocks
+router.use('/friends', friendsRouter);
 
 export default router;
 

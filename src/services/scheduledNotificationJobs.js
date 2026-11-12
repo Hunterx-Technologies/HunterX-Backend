@@ -15,7 +15,7 @@ import prisma from '../config/prisma.js';
 import { createNotification } from './notificationService.js';
 import { computeGap, reconcileStreakWithEvent } from './streakService.js';
 import { eligibilityWhere, VISIBLE_FILTER } from './leaderboardService.js';
-import { FRIENDS_REFERRAL_CAP } from '../config/leaderboardConfig.js';
+import { getFriendIds } from './friendService.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { getTaskPeriod } from './taskService.js';
 import { getLocalTime } from '../utils/timezone.js';
@@ -581,7 +581,7 @@ function aheadOf(userId, xp) {
 async function computeRanks(userId, settings) {
   const me = await prisma.users.findUnique({
     where:  { id: userId },
-    select: { referred_by: true, user_progression: { select: { total_xp: true } } },
+    select: { user_progression: { select: { total_xp: true } } },
   });
   const xp = me?.user_progression?.total_xp ?? 0;
   if (!me || settings.leaderboard_visible === false || xp <= 0) {
@@ -592,14 +592,8 @@ async function computeRanks(userId, settings) {
     where: { AND: [eligibilityWhere(), aheadOf(userId, xp)] },
   });
 
-  const referred = await prisma.referrals.findMany({
-    where:   { referrer_id: userId },
-    orderBy: { created_at: 'desc' },
-    take:    FRIENDS_REFERRAL_CAP,
-    select:  { referred_id: true },
-  });
-  const friendIds = referred.map((r) => r.referred_id);
-  if (me.referred_by) friendIds.push(me.referred_by);
+  // Same friends as the Friends leaderboard (friendService.js).
+  const friendIds = await getFriendIds(userId);
   if (friendIds.length === 0) return { xp, globalRank, friendsRank: null, closestAhead: null };
 
   const ahead = await prisma.users.findMany({

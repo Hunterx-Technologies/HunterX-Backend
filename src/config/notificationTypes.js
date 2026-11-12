@@ -25,6 +25,10 @@ export const NOTIFICATION_TYPES = {
   REWARD_READY:       { setting: 'notify_reward_ready',        channel: 'rewards',   url: '/rewards',        capped: false, quietHours: true },
   BROADCAST:          { setting: 'notify_announcements',       channel: 'system',    url: '/(tabs)',         capped: false, quietHours: true },
   FRIEND_JOINED:      { setting: 'notify_social',              channel: 'social',    url: '/(tabs)/leaderboard', capped: false, quietHours: true },
+  // Friend requests between existing hunters (friendService.js). Not capped:
+  // the sender is waiting on an answer, and requests are rate-limited.
+  FRIEND_REQUEST:     { setting: 'notify_social',              channel: 'social',    url: '/(tabs)/leaderboard?tab=friends', capped: false, quietHours: true },
+  FRIEND_ACCEPTED:    { setting: 'notify_social',              channel: 'social',    url: '/(tabs)/leaderboard?tab=friends', capped: false, quietHours: true },
   LEADERBOARD_UPDATE: { setting: 'notify_leaderboard',         channel: 'social',    url: '/(tabs)/leaderboard', capped: true,  quietHours: true },
   FEEDBACK_UPDATE:    { setting: null,                         channel: 'system',    url: '/feedback',       capped: false, quietHours: true },
   HEALTH_SYNC:        { setting: 'notify_task_reminders',      channel: 'system',    url: '/(tabs)/metrics', capped: true,  quietHours: true },

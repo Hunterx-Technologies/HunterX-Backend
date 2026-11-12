@@ -127,6 +127,37 @@ export const leaderboardLimiter = rateLimit({
   },
 });
 
+// Friends (cards, requests, blocks) — 60/min per user. Looking a hunter up
+// by invite code has its own, tighter limit below (friendCodeLimiter), so
+// codes can't be enumerated through the signed-in API either.
+export const friendsLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:friendsLimiter:'),
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator: (req) => req.user?.id?.toString() || req.ip,
+  message: {
+    success: false,
+    message: 'Too many requests. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many requests. Try again in a moment.' },
+  },
+});
+
+export const friendCodeLimiter = rateLimit({
+  store: new RedisWithMemoryFallback('rl:friendCodeLimiter:'),
+  windowMs: 60 * 1000,
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders:   false,
+  keyGenerator: (req) => req.user?.id?.toString() || req.ip,
+  message: {
+    success: false,
+    message: 'Too many code lookups. Try again in a moment.',
+    error:   { code: 'RATE_LIMITED', message: 'Too many code lookups. Try again in a moment.' },
+  },
+});
+
 // Public referral-code lookup — 20/min per IP. Unauthenticated, so this
 // is what stops anyone enumerating codes (and inviter names).
 export const referralLookupLimiter = rateLimit({

@@ -12,6 +12,7 @@ import { getWeekStatus }    from './taskService.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
 import { createNotification } from './notificationService.js';
 import { attachLateReferral, countAcceptedInvites, findActiveReferrer } from './referralService.js';
+import { linkInvitePair } from './friendService.js';
 import { selectAllRoutineTasks, setUserRoutineTasks } from './routineTaskService.js';
 import { issueSession, rotateSession, revokeAllSessions } from './sessionService.js';
 import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpService.js';
@@ -428,6 +429,8 @@ async function createBaseUser({ name, email, provider, providerId, passwordHash,
           referred_id: user.id,
         },
       });
+      // ...and they're friends from the start (Friends leaderboard).
+      await linkInvitePair(tx, referrer.id, user.id);
     }
 
     return user;

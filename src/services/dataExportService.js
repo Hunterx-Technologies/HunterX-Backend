@@ -88,6 +88,8 @@ async function gatherUserData(bUserId) {
     userRewards,
     referralsSent,
     dragonStage,
+    friendships,
+    blocks,
   ] = await Promise.all([
     prisma.user_onboarding_answers.findMany({
       where:   { user_id: bUserId },
@@ -131,6 +133,19 @@ async function gatherUserData(bUserId) {
     prisma.dragon_stages.findUnique({
       where:  { stage_number: profile.dragon_stage },
       select: { name: true },
+    }),
+    prisma.friendships.findMany({
+      where:   { OR: [{ user_low: bUserId }, { user_high: bUserId }] },
+      orderBy: { created_at: 'asc' },
+      include: {
+        low:  { select: { id: true, name: true, hunter_id: true } },
+        high: { select: { id: true, name: true, hunter_id: true } },
+      },
+    }),
+    prisma.user_blocks.findMany({
+      where:   { blocker_id: bUserId },
+      orderBy: { created_at: 'asc' },
+      include: { blocked: { select: { name: true, hunter_id: true } } },
     }),
   ]);
 
@@ -217,6 +232,27 @@ async function gatherUserData(bUserId) {
         || 'Unknown user',
       referred_on: fmtDateTime(r.created_at),
     })),
+
+    // Friends, requests (either way) and hunters I blocked.
+    friends: [
+      ...friendships.map((f) => {
+        const other = f.user_low === bUserId ? f.high : f.low;
+        const sentByMe = f.requested_by === bUserId;
+        const status = f.status === 'ACCEPTED' ? 'Friends'
+          : f.status === 'PENDING' ? (sentByMe ? 'Request sent' : 'Request received')
+          : (sentByMe ? 'Request declined' : 'Request you declined');
+        return {
+          hunter:  other?.name || other?.hunter_id || 'Unknown user',
+          status,
+          since:   fmtDateTime(f.accepted_at ?? f.created_at),
+        };
+      }),
+      ...blocks.map((b) => ({
+        hunter: b.blocked?.name || b.blocked?.hunter_id || 'Unknown user',
+        status: 'Blocked',
+        since:  fmtDateTime(b.created_at),
+      })),
+    ],
   };
 }
 
@@ -321,6 +357,13 @@ async function buildWorkbookBuffer(data) {
     { header: 'Date Referred', key: 'referred_on',    width: 20 },
   ], data.referrals);
 
+  // 9. Friends
+  addTableSheet(workbook, 'Friends', [
+    { header: 'Hunter', key: 'hunter', width: 30 },
+    { header: 'Status', key: 'status', width: 22 },
+    { header: 'Since',  key: 'since',  width: 20 },
+  ], data.friends);
+
   return workbook.xlsx.writeBuffer();
 }
 
@@ -352,7 +395,7 @@ function buildEmailHtml() {
                   <p style="margin:0 0 24px;color:#555555;font-size:14px;line-height:1.6;">
                     As requested, we've attached an Excel spreadsheet with everything HunterX
                     has on your account — your profile, tasks, XP, badges, progression,
-                    rewards and referrals, each on its own sheet.
+                    rewards, referrals and friends, each on its own sheet.
                   </p>
                   <p style="margin:0;color:#333333;font-size:12px;">
                     If you did not request this export, please secure your account and contact support.

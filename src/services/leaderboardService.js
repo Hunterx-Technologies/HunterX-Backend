@@ -13,9 +13,9 @@ import redis, { isRedisUp } from '../config/redis.js';
 import { logError, info } from '../utils/logger.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { computeGap } from './streakService.js';
+import { getFriendIds } from './friendService.js';
 import {
   XP_SHIFT,
-  FRIENDS_REFERRAL_CAP,
   REDIS_KEYS,
   DISPLAY_HASH_TTL_SECONDS,
 } from '../config/leaderboardConfig.js';
@@ -520,22 +520,8 @@ async function getFriendsLeaderboard({ meId, meSnapshot, cursorStr, limit }) {
     offset = cursor.offset;
   }
 
-  const [meRow, referredRows] = await Promise.all([
-    prisma.users.findUnique({
-      where: { id: meId },
-      select: { id: true, referred_by: true },
-    }),
-    prisma.referrals.findMany({
-      where: { referrer_id: meId },
-      orderBy: { created_at: 'desc' },
-      take: FRIENDS_REFERRAL_CAP,
-      select: { referred_id: true },
-    }),
-  ]);
-
-  const friendIds = new Set([meId]);
-  if (meRow?.referred_by) friendIds.add(meRow.referred_by);
-  for (const r of referredRows) friendIds.add(r.referred_id);
+  // Accepted friendships (friendService.js) — invite pairs are friends too.
+  const friendIds = new Set([meId, ...await getFriendIds(meId)]);
 
   const visibilityFilter = { OR: [{ id: meId }, { is_banned: false, delete_at: null, ...VISIBLE_FILTER }] };
 

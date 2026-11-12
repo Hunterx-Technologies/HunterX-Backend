@@ -8,6 +8,7 @@
 import prisma from '../config/prisma.js';
 import { normalizeReferralCode } from '../utils/helpers.js';
 import { buildAvatarThumbUrl, getLevelInfo } from './leaderboardService.js';
+import { linkInvitePair } from './friendService.js';
 
 // The account a code belongs to, if it can still refer anyone. Banned
 // accounts can't; deleted accounts are gone, so their codes don't resolve.
@@ -118,6 +119,7 @@ export async function attachLateReferral(userId, rawCode) {
     });
     if (claimed.count === 0) return false;
     await tx.referrals.create({ data: { referrer_id: referrer.id, referred_id: bUserId } });
+    await linkInvitePair(tx, referrer.id, bUserId);
     return true;
   });
 }
