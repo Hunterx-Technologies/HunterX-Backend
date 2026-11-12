@@ -357,7 +357,7 @@ export async function grantBirthdayCards(today) {
 
   const users = await prisma.$queryRaw`
     SELECT id FROM users
-    WHERE date_of_birth IS NOT NULL AND is_banned = false
+    WHERE date_of_birth IS NOT NULL AND is_banned = false AND delete_at IS NULL
       AND (dob_updated_at IS NULL OR dob_updated_at <= ${holdCutoff})
       AND (
         (EXTRACT(MONTH FROM date_of_birth) = ${month} AND EXTRACT(DAY FROM date_of_birth) = ${day})
@@ -398,9 +398,10 @@ export async function ensureBirthdayCard(userId) {
   const bUserId = BigInt(userId);
   const user = await prisma.users.findUnique({
     where:  { id: bUserId },
-    select: { date_of_birth: true, dob_updated_at: true, is_banned: true },
+    select: { date_of_birth: true, dob_updated_at: true, is_banned: true, delete_at: true },
   });
-  if (!user?.date_of_birth || user.is_banned) return null;
+  // No birthday card while the account waits to be deleted.
+  if (!user?.date_of_birth || user.is_banned || user.delete_at) return null;
 
   const today = getISTDateOnly();
   if (!isBirthdayOn(user.date_of_birth, today)) return null;
@@ -632,9 +633,14 @@ async function grantBadge(tx, userId, milestone) {
 const EXPIRED_PUSH_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
 
 export async function expireRewards(now = new Date()) {
+  // Accounts waiting to be deleted can't scratch or use cards, so their
+  // clocks are paused: skipped here, and extendRewardsPastPause moves the
+  // expiry on when they keep the account.
+  const pending = await prisma.users.findMany({ where: { delete_at: { not: null } }, select: { id: true } });
   const rewards = await prisma.user_rewards.findMany({
     where: {
       status: 'ACTIVE',
+      ...(pending.length ? { user_id: { notIn: pending.map((u) => u.id) } } : {}),
       OR: [
         { expires_at: { lt: now } },
         { expires_at: null, reward_pool: { expires_at: { lt: now } } },
@@ -665,6 +671,33 @@ export async function expireRewards(now = new Date()) {
     );
   }
   return expired;
+}
+
+/**
+ * "Keep my account": the user's cards were frozen from `pausedAt` (the
+ * deletion request) until `now`, so every ACTIVE card that was still valid
+ * then gets that time back — a card with 2 days left at the request has 2
+ * days left after restoring. Never past the coupon's own valid_until (the
+ * partner's code stops working then). Runs inside the caller's transaction.
+ * Returns the number of cards extended.
+ */
+export async function extendRewardsPastPause(tx, userId, pausedAt, now = new Date()) {
+  const pausedMs = now.getTime() - new Date(pausedAt).getTime();
+  if (!(pausedMs > 0)) return 0;
+
+  const cards = await tx.user_rewards.findMany({
+    where:  { user_id: userId, status: 'ACTIVE', expires_at: { gt: new Date(pausedAt) } },
+    select: { id: true, expires_at: true, reward_coupons: { select: { valid_until: true } } },
+  });
+  for (const card of cards) {
+    let expiresAt = new Date(card.expires_at.getTime() + pausedMs);
+    const hardEnd = card.reward_coupons?.valid_until;
+    if (hardEnd && expiresAt > hardEnd) expiresAt = hardEnd > card.expires_at ? hardEnd : card.expires_at;
+    if (expiresAt.getTime() !== card.expires_at.getTime()) {
+      await tx.user_rewards.update({ where: { id: card.id }, data: { expires_at: expiresAt } });
+    }
+  }
+  return cards.length;
 }
 
 // Push copy for a card's prize. An unscratched card is only ever "your

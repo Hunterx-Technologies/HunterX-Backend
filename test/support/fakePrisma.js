@@ -1,7 +1,7 @@
 // test/support/fakePrisma.js — A small in-memory stand-in for the Prisma
 // client, enough for the auth / session / deletion services under test.
 // Tables are plain arrays; `where` supports equality, null, { equals, mode },
-// { not }, { gt, gte, lt, lte }, { in } and OR. Models nobody seeded answer
+// { not }, { gt, gte, lt, lte }, { in }, { notIn } and OR. Models nobody seeded answer
 // like empty tables.
 
 function matchValue(actual, cond) {
@@ -20,6 +20,7 @@ function matchValue(actual, cond) {
   if ('lt' in cond && !(a != null && a < cmp(cond.lt))) return false;
   if ('lte' in cond && !(a != null && a <= cmp(cond.lte))) return false;
   if ('in' in cond && !cond.in.includes(actual)) return false;
+  if ('notIn' in cond && cond.notIn.includes(actual)) return false;
   return true;
 }
 

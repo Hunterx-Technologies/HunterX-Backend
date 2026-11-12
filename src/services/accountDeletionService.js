@@ -21,6 +21,7 @@ import { createNotification } from './notificationService.js';
 import { info, logError } from '../utils/logger.js';
 import { cleanupUserMedia } from './userMediaCleanupService.js';
 import { shiftStreakPastPause } from './streakService.js';
+import { extendRewardsPastPause } from './rewardService.js';
 
 export async function deleteUserAccount(userId, { allowAdmin = false } = {}) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
@@ -184,13 +185,18 @@ async function schedule(user) {
 // so no push) or 'website' (cancel code — pushed so the phone confirms it).
 async function unschedule(user, { via = 'app' } = {}) {
   if (!user.delete_at) throw new Error('NO_PENDING_DELETION');
+  // When the pause began. delete_at is always request + grace, so it
+  // stands in if the request time is missing (rows from before it existed).
+  const pausedAt = user.deletion_requested_at
+    ?? new Date(new Date(user.delete_at).getTime() - DELETION_GRACE_DAYS * DAY_MS);
   await prisma.$transaction(async (tx) => {
     await tx.users.update({
       where: { id: user.id },
       data:  { deletion_requested_at: null, delete_at: null, deletion_token_hash: null, deletion_token_expiry: null },
     });
-    // The streak was frozen while pending: carry it past the pause.
-    await shiftStreakPastPause(tx, user.id, user.deletion_requested_at);
+    // Streak and reward clocks were frozen while pending: give the time back.
+    await shiftStreakPastPause(tx, user.id, pausedAt);
+    await extendRewardsPastPause(tx, user.id, pausedAt);
   });
   info(`Account ${user.id} deletion cancelled (${via})`);
   mailHunter(user, 'Your HunterX account will not be deleted', 'Your account is safe', [
