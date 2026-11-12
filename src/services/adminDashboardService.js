@@ -13,11 +13,19 @@
 //   • Referral link shares — not tracked anywhere, so "links sent" is the
 //     number of referral signups (every signup used a link) until a share
 //     event is recorded.
+//
+// Date filter: every widget takes ?range= or ?from=&to= (utils/dashboardRange.js,
+// default last 7 days). Counts cover events inside the range; "as of"
+// numbers (MRR, active subscribers, total users) are taken at the range's end;
+// % changes compare with the same-length period just before. Two widgets
+// ignore it because the data has no history: Users by Rank (only current
+// levels are stored) and Needs Attention (a to-do list of what's open now).
 
 import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { pageInfo } from '../utils/pageInfo.js';
+import { resolveRange, rangeBuckets } from '../utils/dashboardRange.js';
 
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -59,7 +67,6 @@ async function pagedRows(source, { page, limit, order }) {
 }
 
 // ── date helpers ───────────────────────────────────────────
-const istDayStartUtc = (offsetDays = 0) => new Date(getISTDateOnly(offsetDays).getTime() - IST_OFFSET_MS);
 const istKey  = (d) => new Date(d.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 const dateKey = (d) => d.toISOString().slice(0, 10);
 const round1  = (n) => Math.round(n * 10) / 10;
@@ -90,93 +97,105 @@ const OPEN_FEEDBACK = { status: { in: ['received', 'in_review'] } };
 const sqlDate = (d) => dateKey(d);                               // 'YYYY-MM-DD'
 const sqlUtcTimestamp = (d) => d.toISOString().replace('Z', ''); // UTC, no zone
 
-async function countActiveUsersOn(day) {
+// Distinct users who logged progress on any task within the range's days.
+async function countActiveUsersIn(r) {
   const [row] = await prisma.$queryRaw`
-    SELECT COUNT(DISTINCT user_id)::int AS n FROM task_completions WHERE schedule_date = ${sqlDate(day)}::date`;
+    SELECT COUNT(DISTINCT user_id)::int AS n FROM task_completions
+    WHERE schedule_date BETWEEN ${sqlDate(r.from)}::date AND ${sqlDate(r.to)}::date`;
   return row.n;
 }
 
+// Prisma filter for a UTC timestamp column inside the range.
+const inRange = (r) => ({ gte: r.startUtc, lt: r.endUtc });
+// Same, as SQL on a column alias (timestamps are UTC without zone).
+const inRangeSql = (col, r) =>
+  Prisma.sql`${Prisma.raw(col)} >= ${sqlUtcTimestamp(r.startUtc)}::timestamp AND ${Prisma.raw(col)} < ${sqlUtcTimestamp(r.endUtc)}::timestamp`;
+
 // ── KPI strip ─────────────────────────────────────────────
-export async function getCoreKpis() {
-  const today = getISTDateOnly();
-  const yesterday = getISTDateOnly(-1);
-  const todayStart = istDayStartUtc(0);
-  const yesterdayStart = istDayStartUtc(-1);
-  const now = new Date();
-  const dayAgo = new Date(now.getTime() - DAY_MS);
+// Counts in the range, each with its % change vs the previous period.
+export async function getCoreKpis(query = {}) {
+  const r = resolveRange(query);
+  const p = r.prev;
+  const prevEndAt = new Date(r.startUtc.getTime() - 1);
 
   const [
-    totalUsers, usersBeforeToday,
-    activeToday, activeYesterday,
-    signupsToday, signupsYesterday,
+    totalUsers, usersBefore,
+    activeUsers, activeBefore,
+    signups, signupsBefore,
     subs,
-    doneToday, doneYesterday,
-    openFeedback, openFeedbackYesterday,
+    done, doneBefore,
+    openFeedback, openFeedbackBefore,
   ] = await Promise.all([
-    prisma.users.count(),
-    prisma.users.count({ where: { created_at: { lt: todayStart } } }),
-    countActiveUsersOn(today),
-    countActiveUsersOn(yesterday),
-    prisma.users.count({ where: { created_at: { gte: todayStart } } }),
-    prisma.users.count({ where: { created_at: { gte: yesterdayStart, lt: todayStart } } }),
+    prisma.users.count({ where: { created_at: { lt: r.endUtc } } }),
+    prisma.users.count({ where: { created_at: { lt: r.startUtc } } }),
+    countActiveUsersIn(r),
+    countActiveUsersIn(p),
+    prisma.users.count({ where: { created_at: inRange(r) } }),
+    prisma.users.count({ where: { created_at: inRange(p) } }),
     prisma.subscriptions.findMany({ select: { plan: true, status: true, started_at: true, expires_at: true, cancelled_at: true } }),
-    prisma.task_completions.count({ where: { schedule_date: today, status: 'COMPLETED' } }),
-    prisma.task_completions.count({ where: { schedule_date: yesterday, status: 'COMPLETED' } }),
+    prisma.task_completions.count({ where: { schedule_date: { gte: r.from, lte: r.to }, status: 'COMPLETED' } }),
+    prisma.task_completions.count({ where: { schedule_date: { gte: p.from, lte: p.to }, status: 'COMPLETED' } }),
+    // Tickets have no status history, so this is what's open now; the
+    // change compares with the open ones that already existed before the range.
     prisma.feedback.count({ where: OPEN_FEEDBACK }),
-    prisma.feedback.count({ where: { ...OPEN_FEEDBACK, created_at: { lt: todayStart } } }),
+    prisma.feedback.count({ where: { ...OPEN_FEEDBACK, created_at: { lt: r.startUtc } } }),
   ]);
 
-  const activeSubsNow = subs.filter((s) => isEarningAt(s, now)).length;
-  const activeSubsDayAgo = subs.filter((s) => isEarningAt(s, dayAgo)).length;
+  const activeSubs = subs.filter((s) => isEarningAt(s, r.endAt)).length;
+  const activeSubsBefore = subs.filter((s) => isEarningAt(s, prevEndAt)).length;
 
   return {
     totalUsers,
-    activeToday,
-    newSignupsToday: signupsToday,
-    activeSubscriptions: activeSubsNow,
-    tasksCompletedToday: doneToday,
+    activeUsers,
+    newSignups: signups,
+    activeSubscriptions: activeSubs,
+    tasksCompleted: done,
     openFeedbackTickets: openFeedback,
-    totalUsersDelta: delta(totalUsers, usersBeforeToday),
-    activeTodayDelta: delta(activeToday, activeYesterday),
-    newSignupsTodayDelta: delta(signupsToday, signupsYesterday),
-    activeSubscriptionsDelta: delta(activeSubsNow, activeSubsDayAgo),
-    tasksCompletedTodayDelta: delta(doneToday, doneYesterday),
-    openFeedbackTicketsDelta: delta(openFeedback, openFeedbackYesterday),
+    totalUsersDelta: delta(totalUsers, usersBefore),
+    activeUsersDelta: delta(activeUsers, activeBefore),
+    newSignupsDelta: delta(signups, signupsBefore),
+    activeSubscriptionsDelta: delta(activeSubs, activeSubsBefore),
+    tasksCompletedDelta: delta(done, doneBefore),
+    openFeedbackTicketsDelta: delta(openFeedback, openFeedbackBefore),
   };
 }
 
 // ── Subscription & Revenue ────────────────────────────────
-export async function getSubscriptionOverview() {
-  const now = new Date();
-  const todayStart = istDayStartUtc(0);
-  const weekStart = istDayStartUtc(-6);
+// MRR, subscribers and the status split are as of the range's end; new
+// subs, churn and trial conversion count what happened inside it.
+export async function getSubscriptionOverview(query = {}) {
+  const r = resolveRange(query);
+  const at = r.endAt;
+  const within = (d) => d && d >= r.startUtc && d < r.endUtc;
 
   const subs = await prisma.subscriptions.findMany({
     select: { user_id: true, plan: true, status: true, started_at: true, expires_at: true, cancelled_at: true },
   });
 
-  const earning = subs.filter((s) => isEarningAt(s, now));
+  const earning = subs.filter((s) => isEarningAt(s, at));
   const paid = subs.filter(isPaidPlan);
   const mrr = earning.reduce((sum, s) => sum + monthlyValue(s), 0);
 
-  const trialUsers = new Set(subs.filter((s) => s.plan === TRIAL_PLAN).map((s) => String(s.user_id)));
+  // Trials started in the range, and how many of those users ever paid.
+  const trialUsers = new Set(subs.filter((s) => s.plan === TRIAL_PLAN && within(s.started_at)).map((s) => String(s.user_id)));
   const paidUsers = new Set(paid.map((s) => String(s.user_id)));
   const converted = [...trialUsers].filter((id) => paidUsers.has(id)).length;
 
-  const trialing = subs.filter((s) => s.plan === TRIAL_PLAN && s.status === 'TRIAL' && s.expires_at > now).length;
+  const started = (s) => s.started_at <= at;
+  const cancelledBy = (s) => s.cancelled_at && s.cancelled_at <= at;
+  const trialing = subs.filter((s) => s.plan === TRIAL_PLAN && started(s) && s.expires_at > at && !cancelledBy(s)).length;
   // Paid, not cancelled, but the period ran out without a renewal.
-  const pastDue = paid.filter((s) => s.status !== 'CANCELLED' && s.expires_at <= now).length;
-  const canceled = paid.filter((s) => s.status === 'CANCELLED').length;
+  const pastDue = paid.filter((s) => started(s) && !cancelledBy(s) && s.expires_at <= at).length;
+  const canceled = paid.filter(cancelledBy).length;
 
   return {
     mrr: Math.round(mrr * 100) / 100,
     activeSubscribers: new Set(earning.map((s) => String(s.user_id))).size,
-    newSubsToday: paid.filter((s) => s.started_at >= todayStart).length,
-    newSubsWeek: paid.filter((s) => s.started_at >= weekStart).length,
-    churnedThisWeek: subs.filter((s) => s.cancelled_at && s.cancelled_at >= weekStart).length,
+    newSubs: paid.filter((s) => within(s.started_at)).length,
+    churned: subs.filter((s) => within(s.cancelled_at)).length,
     trialToPaidPct: pct(converted, trialUsers.size),
     statusBreakdown: [
-      { status: 'Active', count: earning.filter((s) => s.status === 'ACTIVE').length },
+      { status: 'Active', count: earning.length },
       { status: 'Trialing', count: trialing },
       { status: 'Past Due', count: pastDue },
       { status: 'Canceled', count: canceled },
@@ -184,19 +203,20 @@ export async function getSubscriptionOverview() {
   };
 }
 
-export async function getMrrTrend(days = 90) {
+// MRR at the end of each bucket (day / week / month, see rangeBuckets).
+export async function getMrrTrend(query = {}) {
+  const r = resolveRange(query);
   const subs = await prisma.subscriptions.findMany({
     where: { plan: { not: TRIAL_PLAN } },
     select: { plan: true, status: true, started_at: true, expires_at: true, cancelled_at: true },
   });
-  const points = [];
-  for (let i = days - 1; i >= 0; i--) {
-    // Value at the end of each IST day (today: right now).
-    const at = i === 0 ? new Date() : new Date(istDayStartUtc(-i + 1).getTime() - 1);
+  const now = new Date();
+  return rangeBuckets(r).buckets.map((b) => {
+    const endOfBucket = new Date(b.to.getTime() + DAY_MS - IST_OFFSET_MS - 1);
+    const at = endOfBucket > now ? now : endOfBucket;
     const value = subs.filter((s) => isEarningAt(s, at)).reduce((sum, s) => sum + monthlyValue(s), 0);
-    points.push({ date: dateKey(getISTDateOnly(-i)), value: Math.round(value * 100) / 100 });
-  }
-  return points;
+    return { date: b.key, value: Math.round(value * 100) / 100 };
+  });
 }
 
 // Subscription charges + one-off task purchases.
@@ -210,8 +230,10 @@ const TRANSACTION_SORTS = {
 };
 
 export async function getRecentTransactions(query = {}) {
+  const r = resolveRange(query);
   const args = listArgs(query, TRANSACTION_SORTS);
   const source = Prisma.sql`
+    SELECT * FROM (
     SELECT 'sub_' || s.id AS id, ${nameSql('u')} AS user_name, 'sub' AS kind, s.plan AS label,
            (CASE WHEN s.plan = 'yearly' THEN ${PLAN_CHARGE.yearly} ELSE ${PLAN_CHARGE.monthly} END)::numeric AS amount,
            'paid' AS status, s.platform::text AS method, s.started_at AS at
@@ -220,7 +242,8 @@ export async function getRecentTransactions(query = {}) {
     UNION ALL
     SELECT 'pur_' || p.id, ${nameSql('u')}, 'pur', COALESCE(t.title, 'Task purchase'),
            p.amount, LOWER(p.status::text), COALESCE(p.payment_provider, '—'), COALESCE(p.paid_at, p.created_at)
-    FROM task_purchases p JOIN users u ON u.id = p.user_id LEFT JOIN tasks t ON t.id = p.task_id`;
+    FROM task_purchases p JOIN users u ON u.id = p.user_id LEFT JOIN tasks t ON t.id = p.task_id
+    ) AS all_tx WHERE ${inRangeSql('at', r)}`;
   const { rows, pagination } = await pagedRows(
     Prisma.sql`SELECT *, ${isoSql(Prisma.raw('at'))} AS at_iso FROM (${source}) AS tx`,
     args,
@@ -247,9 +270,11 @@ async function paidUserIds() {
   return new Set(rows.map((r) => String(r.user_id)));
 }
 
-export async function getReferralOverview() {
+// Referrals made in the range; "paid" = that referred user has ever paid.
+export async function getReferralOverview(query = {}) {
+  const r = resolveRange(query);
   const [referrals, paid] = await Promise.all([
-    prisma.referrals.findMany({ select: { referred_id: true } }),
+    prisma.referrals.findMany({ where: { created_at: inRange(r) }, select: { referred_id: true } }),
     paidUserIds(),
   ]);
   const referred = new Set(referrals.map((r) => String(r.referred_id)));
@@ -270,7 +295,9 @@ const REFERRER_SORTS = {
   name:    Prisma.sql`LOWER(user_name) ASC, id ASC`,
 };
 
+// Ranked by referrals made in the range.
 export async function getTopReferrers(query = {}) {
+  const r = resolveRange(query);
   const args = listArgs(query, REFERRER_SORTS);
   const source = Prisma.sql`
     SELECT r.referrer_id AS id, ${nameSql('u')} AS user_name,
@@ -278,14 +305,15 @@ export async function getTopReferrers(query = {}) {
     FROM referrals r
     JOIN users u ON u.id = r.referrer_id
     LEFT JOIN (${PAID_USERS_CTE}) paid ON paid.user_id = r.referred_id
+    WHERE ${inRangeSql('r.created_at', r)}
     GROUP BY r.referrer_id, u.name, u.hunter_id`;
   const { rows, pagination } = await pagedRows(source, args);
-  const items = rows.map((r) => ({
-    userId: String(r.id),
-    userName: r.user_name,
-    linksSent: r.signups,
-    signups: r.signups,
-    paidConversions: r.paid_conversions,
+  const items = rows.map((row) => ({
+    userId: String(row.id),
+    userName: row.user_name,
+    linksSent: row.signups,
+    signups: row.signups,
+    paidConversions: row.paid_conversions,
   }));
   return { items, pagination, sort: args.sort };
 }
@@ -298,6 +326,7 @@ const REFERRAL_ACTIVITY_SORTS = {
 };
 
 export async function getRecentReferralActivity(query = {}) {
+  const r = resolveRange(query);
   const args = listArgs(query, REFERRAL_ACTIVITY_SORTS);
   // converted = paying; signed_up = finished onboarding; pending = account only
   const source = Prisma.sql`
@@ -309,14 +338,15 @@ export async function getRecentReferralActivity(query = {}) {
     FROM referrals r
     JOIN users ref ON ref.id = r.referrer_id
     JOIN users ee  ON ee.id  = r.referred_id
-    LEFT JOIN (${PAID_USERS_CTE}) paid ON paid.user_id = r.referred_id`;
+    LEFT JOIN (${PAID_USERS_CTE}) paid ON paid.user_id = r.referred_id
+    WHERE ${inRangeSql('r.created_at', r)}`;
   const { rows, pagination } = await pagedRows(source, args);
-  const items = rows.map((r) => ({
-    id: String(r.id),
-    referrerName: r.referrer_name,
-    refereeName: r.referee_name,
-    status: r.status,
-    date: r.at_iso ?? new Date().toISOString(),
+  const items = rows.map((row) => ({
+    id: String(row.id),
+    referrerName: row.referrer_name,
+    refereeName: row.referee_name,
+    status: row.status,
+    date: row.at_iso ?? new Date().toISOString(),
   }));
   return { items, pagination, sort: args.sort };
 }
@@ -331,7 +361,9 @@ function couponState(r, now) {
   return 'unused';
 }
 
-export async function getCouponOverview() {
+// Cards given out in the range, by their state now.
+export async function getCouponOverview(query = {}) {
+  const r = resolveRange(query);
   const now = new Date();
   // Same states as couponState(), counted per rarity in the database.
   const groups = await prisma.$queryRaw`
@@ -341,6 +373,7 @@ export async function getCouponOverview() {
                 ELSE 'unused' END AS state,
            COUNT(*)::int AS n
     FROM user_rewards
+    WHERE ${inRangeSql('assigned_at', r)}
     GROUP BY 1, 2`;
 
   const byTier = new Map(RARITIES.map((t) => [t, { tier: titleCase(t), used: 0, unused: 0, expired: 0 }]));
@@ -387,7 +420,9 @@ function couponCards(now) {
     LEFT JOIN reward_coupons rc  ON rc.id = ur.coupon_id`;
 }
 
+// Events (issued / redeemed / expired) that happened in the range.
 export async function getCouponActivityLog(query = {}) {
+  const r = resolveRange(query);
   const args = listArgs(query, COUPON_SORTS);
   const now = new Date();
   const cards = couponCards(now);
@@ -401,41 +436,47 @@ export async function getCouponActivityLog(query = {}) {
   const source = Prisma.sql`
     WITH cards AS (${cards}), events AS (${events})
     SELECT *, ${isoSql(Prisma.raw('at'))} AS at_iso FROM events
-    ${partner ? Prisma.sql`WHERE partner = ${partner}` : Prisma.empty}`;
+    WHERE ${inRangeSql('at', r)} ${partner ? Prisma.sql`AND partner = ${partner}` : Prisma.empty}`;
 
   const [{ rows, pagination }, partnerRows] = await Promise.all([
     pagedRows(source, args),
     prisma.$queryRaw`WITH cards AS (${cards}) SELECT DISTINCT partner FROM cards ORDER BY partner`,
   ]);
-  const items = rows.map((r) => ({
-    id: r.id,
-    code: r.code,
-    partner: r.partner,
-    userName: r.user_name,
-    action: r.action,
-    date: r.at_iso ?? new Date().toISOString(),
+  const items = rows.map((row) => ({
+    id: row.id,
+    code: row.code,
+    partner: row.partner,
+    userName: row.user_name,
+    action: row.action,
+    date: row.at_iso ?? new Date().toISOString(),
   }));
   return { items, pagination, sort: args.sort, partners: partnerRows.map((p) => p.partner) };
 }
 
 // ── Engagement Health ─────────────────────────────────────
 // A user is "active" on a day if they logged progress on any task that day.
-export async function getDauTrend(days = 30) {
-  const since = getISTDateOnly(-(days - 1));
+// Daily points up to ~3 months; for longer ranges each point is the average
+// daily active users over its week / month.
+export async function getDauTrend(query = {}) {
+  const r = resolveRange(query);
   const rows = await prisma.$queryRaw`
     SELECT schedule_date::text AS day, COUNT(DISTINCT user_id)::int AS n
     FROM task_completions
-    WHERE schedule_date >= ${sqlDate(since)}::date
+    WHERE schedule_date BETWEEN ${sqlDate(r.from)}::date AND ${sqlDate(r.to)}::date
     GROUP BY schedule_date`;
-  const perDay = new Map(rows.map((r) => [r.day, r.n]));
-  const points = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const k = dateKey(getISTDateOnly(-i));
-    points.push({ date: k, value: perDay.get(k) ?? 0 });
-  }
-  return points;
+  const perDay = new Map(rows.map((row) => [row.day, row.n]));
+  return rangeBuckets(r).buckets.map((b) => {
+    let sum = 0;
+    let n = 0;
+    for (let d = b.from; d <= b.to; d = new Date(d.getTime() + DAY_MS)) {
+      sum += perDay.get(dateKey(d)) ?? 0;
+      n += 1;
+    }
+    return { date: b.key, value: round1(sum / n) };
+  });
 }
 
+// Current levels only (no level history is stored), so not date-filtered.
 export async function getRankDistribution() {
   const [levels, perLevel] = await Promise.all([
     prisma.levels.findMany({ select: { level_number: true, rank_name: true }, orderBy: { level_number: 'asc' } }),
@@ -454,10 +495,14 @@ export async function getRankDistribution() {
 
 // How many hunters kept an unbroken daily run from their signup day:
 // day N = users who completed at least one task on each of their first N
-// days. Only users who have been around N days count toward day N.
-export async function getStreakDropoff(maxDays = 14) {
+// days. Only users who have been around N days count toward day N. The
+// cohort is the hunters who signed up in the range.
+const STREAK_DAYS = 14;
+export async function getStreakDropoff(query = {}) {
+  const r = resolveRange(query);
+  const maxDays = STREAK_DAYS;
   const [users, completions] = await Promise.all([
-    prisma.users.findMany({ where: { role: 'USER' }, select: { id: true, created_at: true } }),
+    prisma.users.findMany({ where: { role: 'USER', created_at: inRange(r) }, select: { id: true, created_at: true } }),
     // Only each user's first maxDays IST days after signup matter — not
     // their whole history.
     prisma.$queryRaw`
@@ -466,6 +511,7 @@ export async function getStreakDropoff(maxDays = 14) {
       JOIN users u ON u.id = c.user_id
       WHERE c.status::text IN ('COMPLETED', 'PARTIAL')
         AND u.created_at IS NOT NULL
+        AND ${inRangeSql('u.created_at', r)}
         AND c.schedule_date >= (u.created_at + interval '330 minutes')::date
         AND c.schedule_date <  (u.created_at + interval '330 minutes')::date + ${maxDays}::int`,
   ]);

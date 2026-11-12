@@ -713,17 +713,19 @@ const DASHBOARD_WIDGETS = {
   'needs-attention':   dashboardService.getNeedsAttention,
 };
 
+// Every widget takes the date filter ?range=7d|30d|60d|90d|6m|1y|3y or
+// ?from=&to= (YYYY-MM-DD, IST; default the last 7 days — utils/dashboardRange.js),
+// except rank-distribution and needs-attention, which show the current state.
 // The list widgets (transactions, top-referrers, referral-activity,
-// coupon-activity, needs-attention) take ?page=&limit=&sort= (coupon-activity
-// also ?partner=) and return { items, pagination, sort }.
-const DASHBOARD_LISTS = new Set(['transactions', 'top-referrers', 'referral-activity', 'coupon-activity', 'needs-attention']);
-
+// coupon-activity, needs-attention) also take ?page=&limit=&sort=
+// (coupon-activity also ?partner=) and return { items, pagination, sort }.
 for (const [path, load] of Object.entries(DASHBOARD_WIDGETS)) {
   router.get(`/dashboard/${path}`, verifyToken, verifyAdmin, async (req, res, next) => {
     try {
-      const data = DASHBOARD_LISTS.has(path) ? await load(req.query) : await load();
+      const data = await load(req.query ?? {});
       return success(res, data, 'Dashboard data fetched');
     } catch (err) {
+      if (err.message === 'INVALID_RANGE') return error(res, err.reason, 400, 'INVALID_RANGE');
       next(err);
     }
   });
