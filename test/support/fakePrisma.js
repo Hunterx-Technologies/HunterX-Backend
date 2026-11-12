@@ -34,6 +34,7 @@ function matches(row, where = {}) {
 function applyData(row, data) {
   for (const [key, value] of Object.entries(data)) {
     if (value && typeof value === 'object' && 'increment' in value) row[key] = (row[key] ?? 0) + value.increment;
+    else if (value && typeof value === 'object' && 'decrement' in value) row[key] = (row[key] ?? 0) - value.decrement;
     else row[key] = value;
   }
   return row;
@@ -95,6 +96,9 @@ export function createFakePrisma(seed = {}) {
     notifications:  model(seed.notifications ?? []),
     user_settings:  model(seed.user_settings ?? [], { idKey: 'user_id', autoId: false }),
     pending_media_cleanup: model(seed.pending_media_cleanup ?? []),
+    user_progression: model(seed.user_progression ?? []),
+    streak_events:  model(seed.streak_events ?? []),
+    user_rewards:   model(seed.user_rewards ?? []),
   };
   const empty = model([]);
 

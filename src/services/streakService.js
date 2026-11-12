@@ -178,6 +178,10 @@ async function applyGap(userId) {
   const today       = getISTDateOnly();
   const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
   if (!progression) return { progression, event: null };
+  // Frozen while the account waits to be deleted: quests are refused then,
+  // so missed days aren't the hunter's doing. Restoring the account shifts
+  // last_active_date past the pause (shiftStreakPastPause below).
+  if (await isPendingDeletion(userId)) return { progression, event: null };
 
   const { missedDays, lives, coveredByLives } = computeGap(progression, today);
   const streak = progression.daily_streak;
@@ -220,6 +224,43 @@ async function applyGap(userId) {
       : null;
     return { progression: await tx.user_progression.findUnique({ where: { user_id: userId } }), event };
   });
+}
+
+async function isPendingDeletion(userId) {
+  const user = await prisma.users.findUnique({ where: { id: userId }, select: { delete_at: true } });
+  return Boolean(user?.delete_at);
+}
+
+// The IST calendar day `date` falls on, as a UTC-midnight Date (the
+// getISTDateOnly convention).
+function istDayOf(date) {
+  const ist = new Date(date.getTime() + 5.5 * 60 * 60 * 1000);
+  return new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()));
+}
+
+/**
+ * "Keep my account": the streak was frozen from `pausedAt` (the deletion
+ * request) until now, so last_active_date moves forward by the IST days
+ * spent pending — never past yesterday, never backwards. A gap that
+ * already existed before the request is kept as it was (not forgiven);
+ * with no request time on record it falls back to yesterday. Lives and
+ * daily_streak are untouched. Runs inside the caller's transaction.
+ */
+export async function shiftStreakPastPause(tx, userId, pausedAt) {
+  const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
+  if (!progression?.last_active_date) return null;
+
+  const today     = getISTDateOnly();
+  const yesterday = new Date(today.getTime() - MS_PER_DAY);
+  const last      = progression.last_active_date;
+  const pausedDays = pausedAt ? Math.max(0, daysBetween(istDayOf(new Date(pausedAt)), today)) : Infinity;
+
+  const shifted = pausedDays === Infinity ? yesterday : new Date(last.getTime() + pausedDays * MS_PER_DAY);
+  let next = shifted > yesterday ? yesterday : shifted;
+  if (next < last) next = last;
+  if (next.getTime() === last.getTime()) return progression;
+
+  return tx.user_progression.update({ where: { user_id: userId }, data: { last_active_date: next } });
 }
 
 // applyGap for read paths that only need the corrected progression row.
@@ -276,6 +317,16 @@ export async function getStreakRiskStatus(userId) {
   const today       = getISTDateOnly();
   const progression = await reconcileStreak(userId);
   const { missedDays, lives, coveredByLives } = computeGap(progression, today);
+  // Pending deletion: frozen (see applyGap), so nothing is at risk.
+  if (missedDays > 0 && await isPendingDeletion(userId)) {
+    return {
+      daily_streak:   progression?.daily_streak ?? 0,
+      longest_streak: progression?.longest_streak ?? 0,
+      streak_lives:   lives,
+      at_risk:        false,
+      missed_days:    0,
+    };
+  }
 
   return {
     daily_streak:   progression?.daily_streak ?? 0,
