@@ -5,6 +5,7 @@ import { blockPendingDeletion } from '../middleware/pendingDeletion.js';
 import { verifyToken }    from '../middleware/auth.js';
 import { success, error } from '../utils/response.js';
 import * as taskService   from '../services/taskService.js';
+import * as authService   from '../services/authService.js';
 import * as streakService from '../services/streakService.js';
 import * as routineTaskService from '../services/routineTaskService.js';
 
@@ -90,6 +91,10 @@ router.get('/today', verifyToken, async (req, res, next) => {
 // (progress_value isn't sent by the client right now; XP is flat per
 // status, not scaled off it. SKIPPED never earns XP and never extends
 // the daily streak — see taskService.js#setTaskCompletion.)
+//
+// The response also carries `user`: the hunter after this change, in the
+// same shape as GET /auth/me, so the app doesn't call /auth/me again after
+// every quest (older app versions ignore it).
 
 router.put('/:taskId/complete', verifyToken, blockPendingDeletion, async (req, res, next) => {
   try {
@@ -112,8 +117,9 @@ router.put('/:taskId/complete', verifyToken, blockPendingDeletion, async (req, r
       status,
       progressValue: progress_value,
     });
+    const user = await authService.getCurrentUser(req.user.id);
 
-    return success(res, result, 'Task updated');
+    return success(res, { ...result, user }, 'Task updated');
 
   } catch (err) {
     if (err.message === 'TASK_NOT_FOUND')
@@ -184,6 +190,7 @@ router.post('/:taskId/proof', verifyToken, blockPendingDeletion, async (req, res
 // locked, see PUT /:taskId/complete above). No XP or streak
 // side effects: a skip never earned XP or touched the streak in
 // the first place.
+// Like /complete, the response carries `user` (the GET /auth/me shape).
 // Header: Authorization: Bearer <access_token>
 
 router.put('/:taskId/reopen', verifyToken, blockPendingDeletion, async (req, res, next) => {
@@ -194,7 +201,8 @@ router.put('/:taskId/reopen', verifyToken, blockPendingDeletion, async (req, res
       return error(res, 'Invalid task id', 400);
 
     const result = await taskService.reopenTask(req.user.id, taskId);
-    return success(res, result, 'Task reopened');
+    const user = await authService.getCurrentUser(req.user.id);
+    return success(res, { ...result, user }, 'Task reopened');
 
   } catch (err) {
     if (err.message === 'TASK_NOT_FOUND')
