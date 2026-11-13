@@ -63,9 +63,9 @@ describe('friends (Postgres)', { skip }, () => {
     assert.equal((await friends.getCard(2, { userId: '1' })).relationship, 'incoming');
 
     const [push] = await pushes(2, 'FRIEND_REQUEST');
-    assert.equal(push.title, '🤝 New friend request');
-    assert.match(push.body, /Hunter1 wants to be your friend/);
-    assert.equal(push.data.url, '/(tabs)/leaderboard?tab=friends');
+    assert.equal(push.title, '⚔️ Hunter Hunter1 seeks an alliance');
+    assert.match(push.body, /join your party/);
+    assert.equal(push.data.url, '/invite-friends');
     assert.equal((await pushes(1)).length, 0, 'nothing to the sender');
 
     const { requests, count } = await friends.listIncomingRequests(2);
@@ -83,7 +83,8 @@ describe('friends (Postgres)', { skip }, () => {
     assert.equal(card.relationship, 'friends');
     assert.ok(card.friendsSince);
     const [push] = await pushes(1, 'FRIEND_ACCEPTED');
-    assert.equal(push.title, '✅ Hunter2 accepted your friend request');
+    assert.equal(push.title, '⚔️ Hunter Hunter2 joined your party');
+    assert.equal(push.data.url, '/(tabs)/leaderboard?tab=friends');
     assert.deepEqual((await friends.getFriendIds(1)).map(String), ['2']);
     assert.deepEqual((await friends.getFriendIds(2)).map(String), ['1']);
     assert.equal((await friends.listIncomingRequests(2)).count, 0);
@@ -167,7 +168,7 @@ describe('friends (Postgres)', { skip }, () => {
     await friends.removeFriend(1, 2);
     await friends.addByInviteLink(2, 'CODE01');  // "Hunter2 added you" → to 1
     assert.deepEqual((await pushes(1, 'FRIEND_ACCEPTED')).map((n) => n.title),
-      ['✅ Hunter2 accepted your friend request', '🤝 Hunter2 added you as a friend']);
+      ['⚔️ Hunter Hunter2 joined your party', '⚔️ Hunter Hunter2 answered your summons']);
   });
 
   test('remove friend is silent and either side can do it', async () => {
@@ -263,7 +264,7 @@ describe('friends (Postgres)', { skip }, () => {
     assert.equal(row.status, 'ACCEPTED');
     assert.equal(row.source, 'LINK');
     const [push] = await pushes(2, 'FRIEND_ACCEPTED');
-    assert.equal(push.title, '🤝 Hunter1 added you as a friend');
+    assert.equal(push.title, '⚔️ Hunter Hunter1 answered your summons');
     assert.deepEqual(await friends.addByInviteLink(1, 'CODE02'), { relationship: 'friends', userId: '2' }, 'again is fine');
     assert.equal((await pushes(2, 'FRIEND_ACCEPTED')).length, 1);
   });

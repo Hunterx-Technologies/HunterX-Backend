@@ -29,6 +29,9 @@ export const DAILY_REQUEST_LIMIT = 30;       // requests one hunter can send per
 export const REQUEST_COOLDOWN_DAYS = 7;      // before asking again after a decline
 const DAY_MS = 86_400_000;
 const FRIENDS_URL = '/(tabs)/leaderboard?tab=friends';
+// Requests are answered on the Invite Friends screen (the app's list of
+// requests waiting for you), so a request push opens that.
+const REQUESTS_URL = '/invite-friends';
 
 const toBig = (id) => (typeof id === 'bigint' ? id : BigInt(id));
 
@@ -191,7 +194,8 @@ async function nameOf(userId) {
 // Pushes never fail the friendship change itself.
 async function notify(userId, type, title, body, data, dedupeKey) {
   try {
-    await createNotification(prisma, userId, type, title, body, { url: FRIENDS_URL, ...data }, dedupeKey ? { dedupeKey } : {});
+    const url = type === 'FRIEND_REQUEST' ? REQUESTS_URL : FRIENDS_URL;
+    await createNotification(prisma, userId, type, title, body, { url, ...data }, dedupeKey ? { dedupeKey } : {});
   } catch (err) {
     logError(`${type} push for ${userId} failed: ${err.message || err}`);
   }
@@ -202,8 +206,8 @@ function notifyRequest(toId, fromId, fromName) {
   const day = getISTDateOnly().toISOString().slice(0, 10);
   return notify(
     toId, 'FRIEND_REQUEST',
-    '🤝 New friend request',
-    `${fromName} wants to be your friend. Tap to accept or decline.`,
+    `⚔️ Hunter ${fromName} seeks an alliance`,
+    'They want to join your party. Answer the call on the Invite Friends screen.',
     { event: 'FRIEND_REQUEST', from_user_id: fromId.toString() },
     `friend_request:${fromId}:${day}`
   );
@@ -215,9 +219,9 @@ function notifyAccepted(toId, byId, byName, viaLink = false) {
   const day = getISTDateOnly().toISOString().slice(0, 10);
   return notify(
     toId, 'FRIEND_ACCEPTED',
-    viaLink ? `🤝 ${byName} added you as a friend` : `✅ ${byName} accepted your friend request`,
-    viaLink ? 'They opened your invite link. You can now see each other on the Friends leaderboard.'
-            : 'You are now friends. See how you stack up on the Friends leaderboard.',
+    viaLink ? `⚔️ Hunter ${byName} answered your summons` : `⚔️ Hunter ${byName} joined your party`,
+    viaLink ? 'They came through your invite link. Your party grows stronger. Rise together on the Friends leaderboard.'
+            : 'Your alliance is sealed. Rise together on the Friends leaderboard.',
     { event: 'FRIEND_ACCEPTED', friend_id: byId.toString() },
     `${viaLink ? 'friend_link' : 'friend_accepted'}:${byId}:${toId}:${day}`
   );
