@@ -56,3 +56,8 @@ const prisma = baseClient.$extends({
 });
 
 export default prisma;
+
+// The pool belongs to us, not to Prisma: prisma.$disconnect() leaves its
+// connections open (idle ones linger for idleTimeoutMillis). Anything that
+// shuts down — the server, a test file — must also end the pool.
+export { pool };

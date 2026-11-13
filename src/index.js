@@ -10,7 +10,7 @@ import { generalLimiter } from './middleware/rateLimiter.js';
 import { errorHandler }   from './middleware/errorHandler.js';
 import router             from './routes/index.js';
 import { info, logError } from './utils/logger.js';
-import prisma              from './config/prisma.js';
+import prisma, { pool }    from './config/prisma.js';
 import redis, { isRedisUp, assertScorePackingSafe } from './config/redis.js';
 import { loadLevelsCache } from './services/leaderboardService.js';
 import { REDIS_KEYS }      from './config/leaderboardConfig.js';
@@ -130,6 +130,7 @@ function shutdown(signal) {
   setTimeout(() => process.exit(1), 10_000).unref();
   server.close(async () => {
     await Promise.allSettled([prisma.$disconnect(), redis?.quit(), authCacheSubscriber?.quit()]);
+    await pool.end().catch(() => {});
     process.exit(0);
   });
 }

@@ -14,6 +14,7 @@ const skip = !url ? 'TEST_DATABASE_URL not set' : !/test/i.test(dbName) ? `refus
 
 describe('friends (Postgres)', { skip }, () => {
   let prisma;
+  let pool;
   let friends;
   let referrals;
 
@@ -37,7 +38,7 @@ describe('friends (Postgres)', { skip }, () => {
   before(async () => {
     process.env.DATABASE_URL = url;
     delete process.env.REDIS_URL;
-    prisma = (await import('../src/config/prisma.js')).default;
+    ({ default: prisma, pool } = await import('../src/config/prisma.js'));
     friends = await import('../src/services/friendService.js');
     referrals = await import('../src/services/referralService.js');
   });
@@ -51,6 +52,9 @@ describe('friends (Postgres)', { skip }, () => {
 
   after(async () => {
     await prisma?.$disconnect();
+    // $disconnect leaves our own pg pool's idle connections open, which kept
+    // this file alive ~30s — past --test-timeout on Node 22 (CI), failing it.
+    await pool?.end();
   });
 
   test('request → pending both ways, push to the receiver, listed in their requests', async () => {
