@@ -32,7 +32,6 @@ const ERRORS = {
   CANNOT_FRIEND_SELF: [400, 'That\'s you.'],
   USER_BLOCKED:       [409, 'You blocked this hunter. Unblock them first.'],
   NO_PENDING_REQUEST: [409, 'This request is no longer waiting.'],
-  REQUEST_COOLDOWN:   [429, `You can send this hunter another request after ${friends.REQUEST_COOLDOWN_DAYS} days.`],
   REQUEST_LIMIT:      [429, `You've sent ${friends.DAILY_REQUEST_LIMIT} friend requests today. Try again tomorrow.`],
 };
 

@@ -3,7 +3,8 @@
 // One friendships row per pair, smaller id first (user_low < user_high):
 //   PENDING   a request from requested_by, waiting for the other hunter
 //   ACCEPTED  friends (both see each other on the Friends leaderboard)
-//   DECLINED  turned down; the sender can ask again after REQUEST_COOLDOWN_DAYS
+//   DECLINED  turned down; either hunter can ask again straight away (one
+//             request push per sender per day keeps a re-ask from spamming)
 // Signing up with someone's invite code makes the pair friends straight away
 // (source INVITE, see linkInvitePair); so does an existing hunter opening
 // someone's invite link and tapping Add friend (source LINK) — sharing your
@@ -26,7 +27,6 @@ import { logError } from '../utils/logger.js';
 import { FRIENDS_REFERRAL_CAP as FRIENDS_CAP } from '../config/leaderboardConfig.js';
 
 export const DAILY_REQUEST_LIMIT = 30;       // requests one hunter can send per 24h
-export const REQUEST_COOLDOWN_DAYS = 7;      // before asking again after a decline
 const DAY_MS = 86_400_000;
 const FRIENDS_URL = '/(tabs)/leaderboard?tab=friends';
 // Requests are answered on the Invite Friends screen (the app's list of
@@ -238,10 +238,6 @@ export async function sendRequest(meId, otherId) {
   if (row?.status === 'ACCEPTED') return { relationship: 'friends' };
   if (row?.status === 'PENDING' && row.requested_by === me) return { relationship: 'requested' };
   if (row?.status === 'PENDING' && row.requested_by === other) return acceptRequest(me, other);
-  if (row?.status === 'DECLINED' && row.requested_by === me
-      && Date.now() - row.updated_at.getTime() < REQUEST_COOLDOWN_DAYS * DAY_MS) {
-    throw new Error('REQUEST_COOLDOWN');
-  }
 
   const sentToday = await prisma.friendships.count({
     where: { requested_by: me, source: 'REQUEST', created_at: { gt: new Date(Date.now() - DAY_MS) } },

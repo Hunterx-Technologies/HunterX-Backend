@@ -118,16 +118,16 @@ describe('friends (Postgres)', { skip }, () => {
     await assert.rejects(friends.acceptRequest(1, 2), /NO_PENDING_REQUEST/);
   });
 
-  test('decline is silent; asking again waits for the cooldown', async () => {
+  test('decline is silent; the sender can ask again straight away, without a second push today', async () => {
     await friends.sendRequest(1, 2);
     assert.deepEqual(await friends.declineRequest(2, 1), { relationship: 'none' });
     assert.equal((await pushes(1)).length, 0, 'no push for a decline');
     assert.equal((await friends.getCard(1, { userId: '2' })).relationship, 'none');
 
-    await assert.rejects(friends.sendRequest(1, 2), /REQUEST_COOLDOWN/);
-    await prisma.friendships.updateMany({ data: { updated_at: new Date(Date.now() - 8 * DAY) } });
     assert.deepEqual(await friends.sendRequest(1, 2), { relationship: 'requested' });
     assert.equal((await pair(1, 2)).status, 'PENDING');
+    assert.equal((await friends.getCard(2, { userId: '1' })).relationship, 'incoming');
+    assert.equal((await pushes(2, 'FRIEND_REQUEST')).length, 1, 'one request push per sender per day');
   });
 
   test('the one who declined can still ask later', async () => {
