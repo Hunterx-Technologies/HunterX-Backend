@@ -661,41 +661,6 @@ const leaderboardDigest = {
   },
 };
 
-// ── 6.2 Health sync broken ─────────────────────────────────
-// User-local 11:00. Only for users who have synced at least once: if the
-// newest health_metrics_daily row is exactly 3 or 7 IST days old, nudge
-// them to reopen Metrics (permissions revoked / provider disconnected /
-// app not opened). Two nudges per gap, then silence.
-
-const HEALTH_SYNC_NUDGE_DAYS = [3, 7];
-const HEALTH_SOURCE_NAMES = { apple_health: 'Apple Health', health_connect: 'Health Connect' };
-
-const healthSync = {
-  name: 'health_sync',
-  type: 'HEALTH_SYNC',
-  slot: () => '11:00',
-  run: async ({ userId }) => {
-    const last = await prisma.health_metrics_daily.findFirst({
-      where:   { user_id: userId },
-      orderBy: { date: 'desc' },
-      select:  { date: true, source: true },
-    });
-    if (!last) return null;
-
-    const gapDays = Math.round((getISTDateOnly().getTime() - last.date.getTime()) / DAY_MS);
-    if (!HEALTH_SYNC_NUDGE_DAYS.includes(gapDays)) return null;
-
-    const source = HEALTH_SOURCE_NAMES[last.source] || 'your health app';
-    return createNotification(
-      prisma, userId, 'HEALTH_SYNC',
-      'Your health data stopped syncing',
-      `No steps from ${source} in ${gapDays} days. Open Metrics to reconnect.`,
-      { event: 'HEALTH_SYNC', last_sync_date: dateKey(last.date), gap_days: gapDays },
-      { dedupeKey: `health_sync:${dateKey(last.date)}:${gapDays}` }
-    );
-  },
-};
-
 // ── 6.4 Win-back ───────────────────────────────────────────
 // User-local 12:00, at exactly 3 / 7 / 14 local days since the user was
 // last seen, then silence until they come back. "Seen" = latest device
@@ -789,7 +754,6 @@ export const SCHEDULED_NOTIFICATION_JOBS = [
   paidTaskExpiring,
   paidOfferEnding,
   leaderboardDigest,
-  healthSync,
   winBack,
   onboardingNudge,
 ];

@@ -166,49 +166,6 @@ model feedback {
   @@index([user_id, created_at], map: "idx_feedback_user_created")
 }
 
-model health_metrics {
-  id             BigInt        @id @default(autoincrement())
-  user_id        BigInt
-  metric_date    DateTime      @db.Date
-  steps          Int?
-  distance_km    Float?
-  heart_rate_avg Int?
-  heart_rate_max Int?
-  calories       Int?
-  sleep_hours    Float?
-  active_minutes Int?
-  source         health_source @default(MANUAL)
-  created_at     DateTime?     @default(now()) @db.Timestamp(6)
-  users          users         @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([user_id, metric_date, source])
-}
-
-// One row per user per calendar day — daily summaries synced from the
-// client's Apple HealthKit / Google Health Connect reads, powering the
-// Metrics screen's Today/Week/Month/Year tabs. Re-syncing the same day
-// overwrites that row (see unique_user_date) instead of duplicating it.
-// Purely a passive data store: nothing else in this backend (task
-// completion, XP, streaks) reads from or writes to this table.
-model health_metrics_daily {
-  id             BigInt    @id @default(autoincrement())
-  user_id        BigInt
-  date           DateTime  @db.Date
-  steps          Int?
-  calories       Int?
-  distance_km    Decimal?  @db.Decimal(6, 2)
-  active_minutes Int?
-  avg_heart_rate Int?
-  sleep_minutes  Int?
-  workout_count  Int?
-  source         String?   @db.VarChar(20) // 'apple_health' | 'health_connect'
-  created_at     DateTime? @default(now()) @db.Timestamp(6)
-  updated_at     DateTime? @default(now()) @db.Timestamp(6)
-  users          users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-
-  @@unique([user_id, date], map: "unique_user_date")
-}
-
 model leaderboard {
   id            BigInt    @id @default(autoincrement())
   user_id       BigInt    @unique
@@ -847,8 +804,6 @@ model users {
   discovery_swipes_discovery_swipes_swiped_idTousers      discovery_swipes[]         @relation("discovery_swipes_swiped_idTousers")
   discovery_swipes_discovery_swipes_swiper_idTousers      discovery_swipes[]         @relation("discovery_swipes_swiper_idTousers")
   feedback                                                feedback[]
-  health_metrics                                          health_metrics[]
-  health_metrics_daily                                    health_metrics_daily[]
   leaderboard                                             leaderboard?
   messages                                                messages[]
   notifications                                           notifications[]
@@ -1088,12 +1043,6 @@ enum fitness_level {
   BEGINNER
   INTERMEDIATE
   ADVANCED
-}
-
-enum health_source {
-  APPLE_HEALTH
-  GOOGLE_FIT
-  MANUAL
 }
 
 enum level_target {
