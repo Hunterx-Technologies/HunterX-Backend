@@ -612,8 +612,9 @@ function handleRewardAdminError(res, next, err) {
 // Each supports:
 //   GET    /                → { rewards }  (newest-numbered last; birthday: 0 or 1 item)
 //   POST   /                { value, description? } (birthday: no body)
-//   PATCH  /:id             { is_active?, description? } — switch it off (no new
-//                           cards) or on; description renames a special reward
+//   PATCH  /:id             { is_active?, description?, value? } — switch it off (no new
+//                           cards) or on; description renames a special reward;
+//                           value changes a streak's days / a level-up's level
 //   DELETE /:id             only while it has never given anyone a card;
 //                           deletes its coupons and their images too
 //   POST   /:id/coupons     coupon body (below), multipart with an optional image
@@ -647,7 +648,7 @@ for (const [path, kind] of Object.entries(REWARD_KIND_PATHS)) {
     try {
       const body = req.body || {};
       const reward = await adminRewardService.updateTrigger(req.params.id, body, kind);
-      const message = body.description !== undefined ? 'Reward renamed' : reward.is_active ? 'Reward switched on' : 'Reward switched off';
+      const message = body.value !== undefined ? 'Reward updated' : body.description !== undefined ? 'Reward renamed' : reward.is_active ? 'Reward switched on' : 'Reward switched off';
       return success(res, { reward }, message);
     } catch (err) {
       handleRewardAdminError(res, next, err);

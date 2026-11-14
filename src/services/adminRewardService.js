@@ -351,9 +351,12 @@ export async function setTriggerActive(triggerId, isActive, kind = null) {
   return updateTrigger(triggerId, { is_active: isActive }, kind);
 }
 
-// PATCH body: { is_active?, description? }. description renames a special
-// (TASK) reward — streak / level / birthday titles come from their value.
-// Hunters' cards show the coupon, not this name, so a rename is admin-side.
+// PATCH body: { is_active?, description?, value? }. description renames a
+// special (TASK) reward — streak / level / birthday titles come from their
+// value. Hunters' cards show the coupon, not this name, so a rename is
+// admin-side. value changes a streak's days or a level-up's level (to fix
+// a typo); cards already granted stay with their hunters, who won't get
+// this reward again at the new value.
 export async function updateTrigger(triggerId, body = {}, kind = null) {
   const data = {};
   if (body.is_active !== undefined) {
@@ -367,8 +370,29 @@ export async function updateTrigger(triggerId, body = {}, kind = null) {
     if (!name) throw invalid('Give the special reward a name, e.g. "Nike drop"');
     data.description = name;
   }
-  if (Object.keys(data).length === 0) throw invalid('Send is_active or description');
-  await prisma.reward_triggers.update({ where: { id: trigger.id }, data });
+  if (body.value !== undefined) {
+    if (trigger.kind !== 'STREAK' && trigger.kind !== 'LEVEL_UP') throw invalid('Only streak and level rewards have a value to change');
+    const n = Number(body.value);
+    const max = trigger.kind === 'STREAK' ? MAX_DAYS : 1000;
+    if (!Number.isInteger(n) || n < 1 || n > max) throw new Error(trigger.kind === 'STREAK' ? 'INVALID_STREAK_DAYS' : 'INVALID_LEVEL');
+    if (n !== trigger.value) {
+      if (trigger.kind === 'LEVEL_UP' && !(await prisma.levels.findUnique({ where: { level_number: n } }))) throw new Error('INVALID_LEVEL');
+      const clash = await prisma.reward_triggers.findUnique({ where: { kind_value: { kind: trigger.kind, value: n } } });
+      if (clash) throw new Error('TRIGGER_EXISTS');
+      data.value = n;
+      data.description = trigger.kind === 'STREAK' ? `${n}-day streak` : `Level ${n}`;
+    }
+  }
+  if (Object.keys(data).length === 0) {
+    if (body.value !== undefined) return (await listTriggers(trigger.kind)).find((t) => t.id === String(trigger.id));
+    throw invalid('Send is_active, description or value');
+  }
+  try {
+    await prisma.reward_triggers.update({ where: { id: trigger.id }, data });
+  } catch (err) {
+    if (err.code === 'P2002') throw new Error('TRIGGER_EXISTS'); // another admin took that value meanwhile
+    throw err;
+  }
   return (await listTriggers(trigger.kind)).find((t) => t.id === String(trigger.id));
 }
 

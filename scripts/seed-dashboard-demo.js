@@ -320,6 +320,13 @@ async function insert() {
     }
   });
   await prisma.user_rewards.createMany({ data: rewards });
+  // Keep each coupon's counter in step with the cards handed out, as the
+  // reward engine does — the admin shows it as stock and uses it to explain
+  // why a coupon someone holds is switched off instead of deleted.
+  for (const c of coupons) {
+    const awarded = rewards.filter((r) => r.coupon_id === c.id).length;
+    await prisma.reward_coupons.update({ where: { id: c.id }, data: { awarded_count: awarded } });
+  }
 
   // ── feedback ────────────────────────────────────────────
   const feedback = [
