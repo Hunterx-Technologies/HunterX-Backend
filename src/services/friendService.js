@@ -363,6 +363,43 @@ export async function unblockUser(meId, otherId) {
   return { relationship: 'none' };
 }
 
+/** Most hunters one person's block list holds for the leaderboard filter. */
+export const BLOCKED_IDS_CAP = 1000;
+
+/** Ids (strings) of the hunters `userId` blocked — left out of their global leaderboard. */
+export async function getBlockedIds(userId, client = prisma, cap = BLOCKED_IDS_CAP) {
+  const rows = await client.user_blocks.findMany({
+    where:   { blocker_id: toBig(userId) },
+    orderBy: { created_at: 'desc' },
+    take:    cap,
+    select:  { blocked_id: true },
+  });
+  return new Set(rows.map((r) => r.blocked_id.toString()));
+}
+
+/**
+ * Hunters I blocked, newest block first, each with their card (relationship
+ * 'blocked') and blockedAt — the Blocked hunters list, where they're unblocked.
+ * Accounts that have since been deleted go with their block (cascade).
+ */
+export async function listBlocked(meId) {
+  const me = toBig(meId);
+  const rows = await prisma.user_blocks.findMany({
+    where:   { blocker_id: me },
+    orderBy: { created_at: 'desc' },
+    take:    BLOCKED_IDS_CAP,
+    select:  { blocked_id: true, created_at: true },
+  });
+  if (rows.length === 0) return { blocked: [], count: 0 };
+  const users = await prisma.users.findMany({ where: { id: { in: rows.map((r) => r.blocked_id) } }, select: PROFILE_SELECT });
+  const byId = new Map(users.map((u) => [u.id.toString(), u]));
+  const blocked = rows
+    .map((r) => ({ row: r, user: byId.get(r.blocked_id.toString()) }))
+    .filter(({ user }) => Boolean(user))
+    .map(({ row, user }) => ({ ...toCard(user, 'blocked', null), blockedAt: row.created_at }));
+  return { blocked, count: blocked.length };
+}
+
 /**
  * Requests waiting for me, newest first, with each sender's card. Senders
  * who've since been banned, scheduled for deletion or blocked are left out.

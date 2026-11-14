@@ -13,7 +13,7 @@ import redis, { isRedisUp } from '../config/redis.js';
 import { logError, info } from '../utils/logger.js';
 import { getISTDateOnly } from '../utils/helpers.js';
 import { computeGap } from './streakService.js';
-import { getFriendIds } from './friendService.js';
+import { getFriendIds, getBlockedIds } from './friendService.js';
 import {
   XP_SHIFT,
   REDIS_KEYS,
@@ -235,14 +235,23 @@ function decodeCursor(str) {
 // Public entry point
 // ─────────────────────────────────────────────────────────────
 
+// Hunters I blocked are left out of my global leaderboard (until I unblock
+// them). Everyone else keeps their real rank, so the numbers can skip
+// (2, 4…) where a blocked hunter sits — the ranks match what others see.
+// Each page reads `blocked.size` extra rows so it still fills to `limit`
+// (at most that many of them can be blocked), and its cursor resumes after
+// the last row shown. The Friends scope needs no filter: a block ends the
+// friendship.
 export async function getLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }) {
   if (scope === 'friends') {
     return getFriendsLeaderboard({ meId, meSnapshot, cursorStr, limit });
   }
 
+  const blocked = await getBlockedIds(meId);
+
   if (isRedisUp()) {
     try {
-      return await getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit });
+      return await getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked });
     } catch (err) {
       logError(`Leaderboard scope=${scope} Redis read failed, falling back to Postgres: ${err.message}`);
     }
@@ -250,7 +259,7 @@ export async function getLeaderboard({ meId, meSnapshot, scope, cursorStr, limit
     logError(`Leaderboard scope=${scope} served from Postgres fallback — Redis is down`);
   }
 
-  return getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit });
+  return getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked });
 }
 
 // Each row's (and "me"'s) current daily streak, shown under the name.
@@ -289,7 +298,7 @@ function meStatusFromSnapshot(meSnapshot) {
 
 // ── Redis path (global) ─────────────────────────────────────
 
-async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }) {
+async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked = new Set() }) {
   const key = REDIS_KEYS[scope];
   const meMember = meId.toString();
   const isFirstPage = !cursorStr;
@@ -305,10 +314,12 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }
 
   let rawPairs;
   let me = null;
+  // One past a full page, plus room for every blocked hunter it may hold.
+  const fetchCount = limit + 1 + blocked.size;
 
   if (isFirstPage) {
     const pipeline = redis.pipeline();
-    pipeline.zrevrange(key, 0, limit, 'WITHSCORES');
+    pipeline.zrevrange(key, 0, fetchCount - 1, 'WITHSCORES');
     pipeline.zscore(key, meMember);
     pipeline.zrevrank(key, meMember);
     pipeline.zcard(key);
@@ -340,31 +351,37 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }
       };
     }
   } else {
-    rawPairs = await redis.zrevrangebyscore(key, `(${cursor.s}`, '-inf', 'WITHSCORES', 'LIMIT', 0, limit + 1);
+    rawPairs = await redis.zrevrangebyscore(key, `(${cursor.s}`, '-inf', 'WITHSCORES', 'LIMIT', 0, fetchCount);
   }
 
   const pairs = [];
   for (let i = 0; i < rawPairs.length; i += 2) pairs.push([rawPairs[i], Number(rawPairs[i + 1])]);
 
-  const hasMore = pairs.length > limit;
-  const page = pairs.slice(0, limit);
-
+  // Ranks come from the unfiltered order, before blocked hunters are dropped.
   let firstRank = null;
-  if (!isFirstPage && page.length > 0) {
-    const rankRaw = await redis.zrevrank(key, page[0][0]);
+  if (!isFirstPage && pairs.length > 0) {
+    const rankRaw = await redis.zrevrank(key, pairs[0][0]);
     firstRank = rankRaw != null ? Number(rankRaw) + 1 : null;
   }
+  const ranked = pairs.map(([member, score], i) => ({
+    member, score,
+    rank: isFirstPage ? i + 1 : (firstRank != null ? firstRank + i : null),
+  }));
+
+  const shown = ranked.filter((r) => !blocked.has(r.member));
+  const hasMore = shown.length > limit;
+  const page = shown.slice(0, limit);
 
   const entries = await attachDisplayData(
-    page.map(([member, score], i) => ({
+    page.map(({ member, score, rank }) => ({
       userId: member,
       totalXp: decodeXpFromScore(score),
-      rank: isFirstPage ? i + 1 : (firstRank != null ? firstRank + i : null),
+      rank,
       isMe: member === meMember,
     }))
   );
 
-  const nextCursor = hasMore ? encodeCursor({ m: 'rd', s: page[page.length - 1][1] }) : null;
+  const nextCursor = hasMore ? encodeCursor({ m: 'rd', s: page[page.length - 1].score }) : null;
   const emptyState = isFirstPage && entries.length === 0 ? 'no_entries' : null;
 
   return { entries, me, nextCursor, emptyState };
@@ -444,7 +461,7 @@ export function eligibilityWhere() {
   };
 }
 
-async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit }) {
+async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked = new Set() }) {
   let cursor = null;
   let offset = 0;
   if (cursorStr) {
@@ -464,7 +481,7 @@ async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorS
   const rows = await prisma.users.findMany({
     where,
     orderBy: [{ user_progression: { total_xp: 'desc' } }, { id: 'asc' }],
-    take: limit + 1,
+    take: limit + 1 + blocked.size,
     select: {
       id: true, name: true,
       avatars: { select: { image_url: true } },
@@ -472,14 +489,20 @@ async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorS
     },
   });
 
-  const hasMore = rows.length > limit;
-  const page = rows.slice(0, limit);
+  // Ranks (and the cursor's offset) count blocked hunters too; they're
+  // just not shown.
+  const shown = rows
+    .map((r, i) => ({ r, rank: offset + i + 1 }))
+    .filter(({ r }) => !blocked.has(r.id.toString()));
+  const hasMore = shown.length > limit;
+  const pageRows = shown.slice(0, limit);
+  const page = pageRows.map(({ r }) => r);
 
-  const entries = page.map((r, i) => {
+  const entries = pageRows.map(({ r, rank }) => {
     const totalXp = r.user_progression?.total_xp ?? 0;
     const { level, rankName } = getLevelInfo(totalXp);
     return {
-      rank: offset + i + 1,
+      rank,
       userId: r.id.toString(),
       name: r.name,
       avatarThumbUrl: buildAvatarThumbUrl(r.avatars?.image_url),
@@ -490,7 +513,7 @@ async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorS
 
   const last = page[page.length - 1];
   const nextCursor = hasMore && last
-    ? encodeCursor({ m: 'pg', offset: offset + limit, xp: last.user_progression?.total_xp ?? 0, id: last.id.toString() })
+    ? encodeCursor({ m: 'pg', offset: pageRows[pageRows.length - 1].rank, xp: last.user_progression?.total_xp ?? 0, id: last.id.toString() })
     : null;
 
   let me = null;

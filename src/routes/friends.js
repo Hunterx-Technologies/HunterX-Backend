@@ -9,6 +9,7 @@
 // DELETE /api/friends/requests/:userId      withdraw my request (silent)
 // POST   /api/friends/link/:code            opened their invite link → friends straight away
 // DELETE /api/friends/:userId               remove friend (silent)
+// GET    /api/friends/blocks                hunters I blocked → { blocked, count } (cards + blockedAt)
 // POST   /api/friends/blocks/:userId        block · DELETE to unblock
 //
 // Card: { userId, name, avatarThumbUrl, level, rankName, totalXp, streak,
@@ -67,6 +68,8 @@ router.delete('/requests/:userId',
 router.post('/link/:code', friendCodeLimiter, blockPendingDeletion,
   handle((req) => friends.addByInviteLink(req.user.id, req.params.code), 'You are now friends'));
 
+router.get('/blocks',
+  handle((req) => friends.listBlocked(req.user.id), 'Blocked hunters'));
 router.post('/blocks/:userId',
   handle((req) => friends.blockUser(req.user.id, req.params.userId), 'Hunter blocked'));
 router.delete('/blocks/:userId',
