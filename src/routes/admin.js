@@ -464,8 +464,10 @@ router.get('/users/:id', verifyToken, verifyAdmin, async (req, res, next) => {
 // Body: { reason?: string }  (max 500 chars)
 router.patch('/users/:id/ban', verifyToken, verifyAdmin, async (req, res, next) => {
   try {
-    const user = await adminUserService.banUser(req.user.id, req.params.id, req.body?.reason);
-    return success(res, { user }, 'User banned');
+    const { user, banPush } = await adminUserService.banUser(req.user.id, req.params.id, req.body?.reason);
+    // ban_push: did the "account suspended" push reach their phone? (SENT /
+    // NO_DEVICE / RETRYING / FAILED, see adminUserService#deliverNow)
+    return success(res, { user, ban_push: banPush }, 'User banned');
   } catch (err) {
     const known = {
       INVALID_USER_ID:     [400, 'Invalid user id'],

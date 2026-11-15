@@ -1,9 +1,10 @@
 // src/middleware/auth.js — Verify JWT on protected routes
 
 import { verifyAccessToken } from '../utils/helpers.js';
-import { error } from '../utils/response.js';
+import { error, accountSuspended } from '../utils/response.js';
 import prisma from '../config/prisma.js';
 import { getCachedAuthUser, setCachedAuthUser } from '../services/authUserCache.js';
+import { rememberUserTimezone } from '../utils/userClock.js';
 
 export async function verifyToken(req, res, next) {
   try {
@@ -26,6 +27,7 @@ export async function verifyToken(req, res, next) {
           id:       true,
           role:     true,
           is_banned: true,
+          ban_reason: true,
           onboarding_done: true,
           hunter_id: true,
           name:     true,
@@ -45,13 +47,20 @@ export async function verifyToken(req, res, next) {
     }
 
     if (user.is_banned) {
-      return error(res, 'Your account has been suspended', 403);
+      return accountSuspended(res, user.ban_reason);
     }
 
     req.user = {
       ...user,
       gender: decoded.gender || user.gender,
     };
+
+    // The phone's IANA zone: quests and streaks roll over at the user's own
+    // midnight (utils/userClock.js). Saved before the route runs so this
+    // very request already uses it. Usually a cache hit, no DB work.
+    const tz = req.headers['x-timezone'];
+    if (typeof tz === 'string' && tz) await rememberUserTimezone(user.id, tz);
+
     next();
   } catch (err) {
     if (err.name === 'TokenExpiredError') {

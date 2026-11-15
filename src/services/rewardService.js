@@ -12,7 +12,7 @@
 // Granted by a reward_triggers row: a streak of N days
 // (streakService.js#bumpDailyStreak), reaching level N
 // (xpService.js#checkLevelUp), the user's birthday (nightly cron,
-// grantBirthdayCards), or completing a task with a special reward linked
+// ensureBirthdayCard), or completing a task with a special reward linked
 // (taskService.js → grantTaskSpecialCard). A trigger with at least one active reward_coupons
 // row grants a scratch card. The prize is picked right then, by weight, among the
 // active, in-window, in-stock coupons (pickCoupon) and snapshotted onto
@@ -25,7 +25,7 @@
 import crypto from 'crypto';
 import prisma from '../config/prisma.js';
 import { createNotification } from './notificationService.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getUserToday } from '../utils/userClock.js';
 import { logError } from '../utils/logger.js';
 
 export const STREAK_MILESTONE_BADGES = {
@@ -339,47 +339,9 @@ export async function grantTaskSpecialCard(tx, userId, task) {
 // users.dob_updated_at).
 export const BIRTHDAY_DOB_HOLD_DAYS = 30;
 
-// Nightly (src/cron/midnight.js, 00:30 IST): a birthday card for everyone
-// whose birthday is `today` (an IST calendar date). Feb 29 birthdays are
-// celebrated on Feb 28 in other years. Once per user per year.
-export async function grantBirthdayCards(today) {
-  const trigger = await prisma.reward_triggers.findUnique({ where: { kind_value: { kind: 'BIRTHDAY', value: 0 } } });
-  if (!trigger || !trigger.is_active) return 0;
-  const active = await prisma.reward_coupons.count({ where: { trigger_id: trigger.id, is_active: true } });
-  if (active === 0) return 0;
-
-  const year  = today.getUTCFullYear();
-  const month = today.getUTCMonth() + 1;
-  const day   = today.getUTCDate();
-  const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
-  const alsoFeb29 = month === 2 && day === 28 && !isLeap;
-  const holdCutoff = new Date(Date.now() - BIRTHDAY_DOB_HOLD_DAYS * 24 * 60 * 60 * 1000);
-
-  const users = await prisma.$queryRaw`
-    SELECT id FROM users
-    WHERE date_of_birth IS NOT NULL AND is_banned = false AND delete_at IS NULL
-      AND (dob_updated_at IS NULL OR dob_updated_at <= ${holdCutoff})
-      AND (
-        (EXTRACT(MONTH FROM date_of_birth) = ${month} AND EXTRACT(DAY FROM date_of_birth) = ${day})
-        OR (${alsoFeb29} AND EXTRACT(MONTH FROM date_of_birth) = 2 AND EXTRACT(DAY FROM date_of_birth) = 29)
-      )`;
-
-  let granted = 0;
-  for (const { id } of users) {
-    try {
-      const reward = await prisma.$transaction((tx) => grantTriggerCard(tx, id, 'BIRTHDAY', 0, { period: year }));
-      if (reward) granted += 1;
-    } catch (err) {
-      // P2002: a concurrent run already granted this year's card.
-      if (err.code !== 'P2002') throw err;
-    }
-  }
-  return granted;
-}
-
-// Is `dob` celebrated on `today` (IST calendar date)? Same Feb 29 rule as
-// grantBirthdayCards.
-function isBirthdayOn(dob, today) {
+// Is `dob` celebrated on `today` (the hunter's own calendar day)? Feb 29
+// birthdays are celebrated on Feb 28 in other years.
+export function isBirthdayOn(dob, today) {
   const month = today.getUTCMonth() + 1;
   const day   = today.getUTCDate();
   const dobMonth = dob.getUTCMonth() + 1;
@@ -390,10 +352,11 @@ function isBirthdayOn(dob, today) {
   return !isLeap && month === 2 && day === 28 && dobMonth === 2 && dobDay === 29;
 }
 
-// On-demand birthday card for one user (listUnseenRewards, i.e. login and
-// app open). The nightly run only covers users whose birthday coupons were
-// already set up at 00:30; this catches a coupon added later that day.
-// Same rules: today is their birthday, the DOB hold has passed, once a year.
+// Birthday card for one user: at their local midnight (src/cron/midnight.js)
+// and on login / app open (listUnseenRewards), which catches a coupon an
+// admin added later that day. Rules: today (their own calendar day) is
+// their birthday, the DOB hold has passed, once a year. Needs an active
+// BIRTHDAY trigger with coupons (grantTriggerCard returns null otherwise).
 export async function ensureBirthdayCard(userId) {
   const bUserId = BigInt(userId);
   const user = await prisma.users.findUnique({
@@ -403,7 +366,7 @@ export async function ensureBirthdayCard(userId) {
   // No birthday card while the account waits to be deleted.
   if (!user?.date_of_birth || user.is_banned || user.delete_at) return null;
 
-  const today = getISTDateOnly();
+  const today = await getUserToday(bUserId);
   if (!isBirthdayOn(user.date_of_birth, today)) return null;
   const holdCutoff = Date.now() - BIRTHDAY_DOB_HOLD_DAYS * 24 * 60 * 60 * 1000;
   if (user.dob_updated_at && user.dob_updated_at.getTime() > holdCutoff) return null;
@@ -411,7 +374,7 @@ export async function ensureBirthdayCard(userId) {
   try {
     return await prisma.$transaction((tx) => grantTriggerCard(tx, bUserId, 'BIRTHDAY', 0, { period: today.getUTCFullYear() }));
   } catch (err) {
-    // P2002: the nightly run or a parallel request granted it first.
+    // P2002: the midnight run or a parallel request granted it first.
     if (err.code === 'P2002') return null;
     throw err;
   }

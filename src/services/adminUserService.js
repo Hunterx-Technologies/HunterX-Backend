@@ -10,10 +10,13 @@
 
 import bcrypt from 'bcryptjs';
 import prisma from '../config/prisma.js';
-import { parseDateOnly, getISTDateOnly, isValidEmail, isStrongPassword, generateHunterId, generateReferralCode } from '../utils/helpers.js';
+import { parseDateOnly, isValidEmail, isStrongPassword, generateHunterId, generateReferralCode } from '../utils/helpers.js';
 import { info, logError } from '../utils/logger.js';
 import { syncLeaderboardMember } from './leaderboardService.js';
+import { adminDayStart, getAdminToday } from '../utils/adminClock.js';
 import { createNotification } from './notificationService.js';
+import { revokeAllSessions } from './sessionService.js';
+import { runPushDispatch } from './pushDispatchService.js';
 
 // Scheduled account deletion, for admin screens: when, and whole days left
 // (the app's banner rounds the same way). Nulls when nothing is scheduled.
@@ -33,7 +36,6 @@ async function notifyAccountUpdate(userId, event, title, body, extra = {}) {
   }
 }
 
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const MS_PER_DAY     = 24 * 60 * 60 * 1000;
 
 const STATUSES     = ['ACTIVE', 'BANNED'];
@@ -45,13 +47,6 @@ const SORTABLE      = {
   streak:      { user_progression: { daily_streak: 'desc' } },
 };
 
-// getISTDateOnly() returns a Date holding the IST calendar date at UTC
-// midnight (a display/comparison convention, not a real instant). users.
-// created_at is a real timestamptz, so "00:00 IST on that calendar date"
-// has to be converted back to the actual UTC instant it occurred at.
-function istDateToUtcInstant(istDate) {
-  return new Date(istDate.getTime() - IST_OFFSET_MS);
-}
 
 function addDays(date, days) {
   return new Date(date.getTime() + days * MS_PER_DAY);
@@ -79,10 +74,11 @@ function resolveDateRange({ datePreset, startDate, endDate }) {
   const days = DATE_PRESETS[datePreset];
   if (!days) throw new Error('INVALID_DATE_PRESET');
 
-  const today = getISTDateOnly();
+  // Signup dates on the admin's calendar (utils/adminClock.js).
+  const today = getAdminToday();
   return {
-    gte: istDateToUtcInstant(getISTDateOnly(-(days - 1))),
-    lt:  istDateToUtcInstant(addDays(today, 1)),
+    gte: adminDayStart(addDays(today, -(days - 1))),
+    lt:  adminDayStart(addDays(today, 1)),
   };
 }
 
@@ -126,11 +122,14 @@ export async function getRanks() {
 // ─────────────────────────────────────────────────────────────
 
 export async function getUserStats() {
-  const today = getISTDateOnly();
-
-  const [totalUsers, activeToday, aggregates] = await Promise.all([
+  const [totalUsers, [{ n: activeToday }], aggregates] = await Promise.all([
     prisma.users.count(),
-    prisma.user_progression.count({ where: { last_active_date: today } }),
+    // Active on their own today (each hunter's zone, utils/userClock.js).
+    prisma.$queryRaw`
+      SELECT COUNT(*)::int AS n
+      FROM user_progression p
+      LEFT JOIN user_settings s ON s.user_id = p.user_id
+      WHERE p.last_active_date = (now() AT TIME ZONE COALESCE(s.timezone, 'Asia/Kolkata'))::date`,
     prisma.user_progression.aggregate({
       _avg: { current_level: true, daily_streak: true },
     }),
@@ -152,7 +151,7 @@ export async function getUserStats() {
 //   rank           — a levels.rank_name value, e.g. "PREDATOR"
 //   level          — a range string, e.g. "1-10", "20-30"
 //   status         — 'ACTIVE' | 'BANNED'
-//   date_preset    — '7d' | '30d' | '90d' | 'all'  (signup date, IST)
+//   date_preset    — '7d' | '30d' | '90d' | 'all'  (signup date, admin's calendar)
 //   start_date/end_date — 'YYYY-MM-DD', inclusive custom range; overrides
 //                    date_preset when either is given
 //   sort_by        — 'signup_date' (default) | 'name' | 'level' | 'streak'
@@ -498,13 +497,22 @@ export async function getUserDetail(id) {
 // ─────────────────────────────────────────────────────────────
 // PATCH /api/admin/users/:id/ban and /unban.
 //
-// Banning only flips users.is_banned — every enforcement point already
-// keys off that flag: verifyToken rejects every authenticated request with
-// 403 (it re-reads the user from the DB per request, so existing access
-// tokens die immediately, not at expiry), email/Google/Apple login and
-// token refresh all throw ACCOUNT_BANNED, and leaderboards, broadcasts and
-// the notification crons all filter is_banned users out. The Redis
-// leaderboard is the one cached copy, so it's re-synced right after.
+// A ban means no access at all, from the moment it's saved:
+//   - every refresh token is revoked in the same transaction, so no device
+//     can renew its session (an unbanned hunter signs in again);
+//   - verifyToken answers every request with 403 ACCOUNT_SUSPENDED (+ the
+//     reason) — the cached auth row is dropped on the update, so existing
+//     access tokens die immediately, not at expiry; email/Google/Apple
+//     login and refresh answer the same;
+//   - the ACCOUNT_BANNED push (data.event, data.reason) tells an open app to
+//     sign out and show its "Account suspended" screen right away. It's
+//     written in the ban's own transaction (no ban without its push), sent
+//     straight away rather than on the next dispatcher tick (if that fails
+//     the outbox retries at most twice, after 1 and 5 min), and its outcome
+//     goes back to the admin;
+//   - leaderboards, broadcasts and the notification crons filter is_banned
+//     users out. The Redis leaderboard is the one cached copy, so it's
+//     re-synced right after.
 //
 // No data is deleted: progression, history and rewards are kept intact,
 // so an unban restores the account exactly as it was. Each ban/unban also
@@ -533,8 +541,8 @@ export async function banUser(adminUserId, id, reason) {
   if (user.role === 'ADMIN') throw new Error('CANNOT_BAN_ADMIN');
   if (user.is_banned) throw new Error('ALREADY_BANNED');
 
-  await prisma.$transaction([
-    prisma.users.update({
+  const banNotice = await prisma.$transaction(async (tx) => {
+    await tx.users.update({
       where: { id: userId },
       data: {
         is_banned:  true,
@@ -542,21 +550,56 @@ export async function banUser(adminUserId, id, reason) {
         banned_at:  new Date(),
         banned_by:  BigInt(adminUserId),
       },
-    }),
-    prisma.admin_user_actions.create({
+    });
+    await tx.admin_user_actions.create({
       data: { user_id: userId, admin_id: BigInt(adminUserId), action: 'BAN', reason: trimmedReason || null },
-    }),
-  ]);
+    });
+    // Signed out everywhere: no device can renew its session.
+    await revokeAllSessions(userId, tx);
+    // The push, in the same transaction: no ban is saved without it. The
+    // app signs out the moment it arrives and shows the reason.
+    return createNotification(
+      tx, userId, 'ACCOUNT_UPDATE',
+      'Your account has been suspended',
+      `${trimmedReason ? `Reason: ${trimmedReason}. ` : ''}Contact support if you think this is a mistake.`,
+      { event: 'ACCOUNT_BANNED', reason: trimmedReason || null }
+    );
+  });
 
   await syncLeaderboardMember(userId); // drops them from global
-  await notifyAccountUpdate(
-    userId, 'ACCOUNT_BANNED',
-    'Your account has been suspended',
-    `${trimmedReason ? `Reason: ${trimmedReason}. ` : ''}Contact support if you think this is a mistake.`
-  );
-  info(`Admin ${adminUserId} banned user ${userId}${trimmedReason ? ` (reason: ${trimmedReason})` : ''}`);
+  const banPush = await deliverNow(banNotice);
+  info(`Admin ${adminUserId} banned user ${userId}${trimmedReason ? ` (reason: ${trimmedReason})` : ''} — push ${banPush.status}`);
 
-  return getUserDetail(userId.toString());
+  return { user: await getUserDetail(userId.toString()), banPush };
+}
+
+/**
+ * Sends a just-queued notification now instead of on the next dispatcher
+ * tick, and reports what happened to it:
+ *   SENT       — accepted for at least one of the hunter's devices
+ *   NO_DEVICE  — no device registered (notifications never allowed), so no
+ *                push is possible; the app still signs out on its next request
+ *   RETRYING   — not accepted yet; the outbox tries twice more (after 1 min,
+ *                then 5 min) and then marks it FAILED — never more than 3 sends
+ *   FAILED     — gave up (every device refused it)
+ */
+export async function deliverNow(notification) {
+  if (!notification) return { status: 'FAILED', devices: 0 };
+  try {
+    await runPushDispatch();
+  } catch (err) {
+    logError(`Immediate push for notification ${notification.id} failed: ${err.message}`);
+  }
+  const [row, devices] = await Promise.all([
+    prisma.notifications.findUnique({ where: { id: notification.id }, select: { push_status: true, push_error: true } }),
+    prisma.user_push_tokens.count({ where: { user_id: notification.user_id } }),
+  ]);
+  const status =
+    row?.push_status === 'SENT' ? 'SENT'
+    : row?.push_error === 'no_device' || devices === 0 ? 'NO_DEVICE'
+    : row?.push_status === 'FAILED' ? 'FAILED'
+    : 'RETRYING';
+  return { status, devices };
 }
 
 export async function unbanUser(adminUserId, id) {

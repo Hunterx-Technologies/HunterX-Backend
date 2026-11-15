@@ -2,7 +2,8 @@
 //
 // A paid task (tasks.is_paid) is shown locked to every user while it's on
 // sale (tasks.start_date .. tasks.end_date). Buying it gives that user
-// their own access window of one full period from the IST day they paid
+// their own access window of one full period from the day they paid (their
+// own calendar day, utils/userClock.js)
 // — 1 day for DAILY_ADMIN, 7 for WEEKLY, 30 for MONTHLY (accessEndFor) —
 // whatever day of the sale they bought on, so a late buyer gets the same
 // time as an early one. Only then does taskAssignmentService assign it to
@@ -20,7 +21,7 @@
 // a client request, since it's what unlocks the task.
 
 import prisma from '../config/prisma.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getLocalDateOnly, getUserToday } from '../utils/userClock.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { createNotification } from './notificationService.js';
 import { formatDay } from './questNotificationService.js';
@@ -57,7 +58,8 @@ function activeOrCompleted(date) {
 }
 
 // The user's PAID, not-yet-completed purchase covering `date`, if any.
-export async function getActivePurchase(bUserId, taskId, date = getISTDateOnly()) {
+export async function getActivePurchase(bUserId, taskId, date = null) {
+  date ??= await getUserToday(bUserId);
   return prisma.task_purchases.findFirst({
     where: {
       user_id:      bUserId,
@@ -73,7 +75,8 @@ export async function getActivePurchase(bUserId, taskId, date = getISTDateOnly()
 // Called inside setTaskCompletion's transaction when a buyer marks a paid
 // task COMPLETED. Returns true only the first time (the purchase was still
 // open), so a resent COMPLETED doesn't announce the clear twice.
-export async function markPurchaseCompleted(tx, bUserId, taskId, date = getISTDateOnly()) {
+export async function markPurchaseCompleted(tx, bUserId, taskId, date = null) {
+  date ??= await getUserToday(bUserId);
   const { count } = await tx.task_purchases.updateMany({
     where: {
       user_id:      bUserId,
@@ -101,7 +104,7 @@ export async function getCompletedPaidTaskIds(bUserId) {
 // is copied from the task so a later price change can't alter it.
 export async function createPendingPurchase(userId, taskId, { provider = null } = {}) {
   const bUserId = BigInt(userId);
-  const today = getISTDateOnly();
+  const today = await getUserToday(bUserId);
 
   const task = await prisma.tasks.findUnique({ where: { id: BigInt(taskId) } });
   if (!task) throw new Error('TASK_NOT_FOUND');
@@ -136,7 +139,7 @@ export async function markPurchasePaid(purchaseId, { paymentRef = null } = {}) {
   if (purchase.status === 'PAID') return purchase;
   if (purchase.status !== 'PENDING') throw new Error('PURCHASE_NOT_PENDING');
 
-  const accessStart = getISTDateOnly();
+  const accessStart = await getUserToday(purchase.user_id);
   const saleEnd = purchase.tasks.end_date;
   if (!purchase.tasks.is_active || !saleEnd || saleEnd.getTime() < accessStart.getTime())
     throw new Error('TASK_NOT_ON_SALE'); // offer ended between checkout and payment
@@ -172,7 +175,8 @@ export async function markPurchasePaid(purchaseId, { paymentRef = null } = {}) {
 
 // Paid tasks on sale today that this user hasn't got access to — shown
 // locked on the task list.
-export async function getLockedTasks(bUserId, date = getISTDateOnly()) {
+export async function getLockedTasks(bUserId, date = null) {
+  date ??= await getUserToday(bUserId);
   return prisma.tasks.findMany({
     where: {
       is_active:  true,
@@ -189,7 +193,9 @@ export async function getLockedTasks(bUserId, date = getISTDateOnly()) {
 // inactive once no buyer still has access. Until then it stays active so
 // buyers keep it for their full period — the sale itself already stops at
 // end_date (onSaleOn / getLockedTasks check the date, not is_active).
-export async function deactivateExpiredPaidTasks(today = getISTDateOnly()) {
+// `today` defaults to the date in UTC−12, the last zone to reach any given
+// day, so a hunter still on the sale's last day anywhere keeps the task.
+export async function deactivateExpiredPaidTasks(today = getLocalDateOnly('Etc/GMT+12')) {
   const { count } = await prisma.tasks.updateMany({
     where: {
       is_paid:   true,

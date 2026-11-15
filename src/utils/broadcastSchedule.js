@@ -16,8 +16,8 @@
 // month's last day otherwise, instead of drifting to the 28th forever.
 
 import { getLocalTime } from './timezone.js';
+import { getAdminTimezone } from './adminClock.js';
 
-export const ADMIN_TIMEZONE = 'Asia/Kolkata'; // "is this in the future?" is judged on the admin's clock
 export const RECURRENCES = ['NONE', 'DAILY', 'WEEKLY', 'MONTHLY'];
 
 const MINUTE_MS = 60 * 1000;
@@ -111,9 +111,13 @@ export function localToUtc(wall, tz) {
   return new Date(w - offsetAt(tz, first));
 }
 
-/** The admin's current wall clock (IST), as a floating Date. */
+/**
+ * The admin's current wall clock, as a floating Date: "is this in the
+ * future?" is judged on the admin's own clock (their browser's zone,
+ * utils/adminClock.js; IST without one).
+ */
 export function adminWallNow(now = new Date()) {
-  return new Date(now.getTime() + offsetAt(ADMIN_TIMEZONE, now.getTime()));
+  return new Date(now.getTime() + offsetAt(getAdminTimezone(), now.getTime()));
 }
 
 /** Floating Date → 'YYYY-MM-DDTHH:MM'. */

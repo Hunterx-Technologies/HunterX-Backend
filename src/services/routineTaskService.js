@@ -15,6 +15,7 @@
 
 import prisma from '../config/prisma.js';
 import { getISTDateOnly } from '../utils/helpers.js';
+import { getUserToday } from '../utils/userClock.js';
 import { assignDailyTasks, routineTaskWhere, selectedRoutineIds } from './taskAssignmentService.js';
 
 // Request body value -> unique BigInt ids, or null if it isn't a list of ids.
@@ -51,10 +52,10 @@ function toApiRoutineTask(task, gender) {
   };
 }
 
-// Routine tasks live today (see routineTaskWhere).
-function findRoutineTasks() {
+// Routine tasks live on `date` (see routineTaskWhere).
+function findRoutineTasks(date) {
   return prisma.tasks.findMany({
-    where:   routineTaskWhere(getISTDateOnly()),
+    where:   routineTaskWhere(date),
     orderBy: { id: 'asc' },
     select:  {
       id: true, title: true, description: true, tag: true, xp_reward: true,
@@ -65,15 +66,17 @@ function findRoutineTasks() {
 
 // GET /api/public/routine-tasks — the onboarding picker's options: routine
 // tasks only (built-in + admin-marked routine).
-export async function listRoutineTasks(gender = null) {
-  const tasks = await findRoutineTasks();
+// No account yet, so `date` is the phone's today when the route knows its
+// zone (X-Timezone), else IST.
+export async function listRoutineTasks(gender = null, date = getISTDateOnly()) {
+  const tasks = await findRoutineTasks(date);
   return tasks.map((t) => toApiRoutineTask(t, gender));
 }
 
 // GET /api/tasks/routine — every routine task, with the user's selected flag.
 export async function getUserRoutineTasks(userId, gender = null) {
   const bUserId = BigInt(userId);
-  const tasks   = await findRoutineTasks();
+  const tasks   = await findRoutineTasks(await getUserToday(bUserId));
   const chosen  = new Set(await selectedRoutineIds(bUserId, tasks.map((t) => t.id)));
   return tasks.map((t) => ({ ...toApiRoutineTask(t, gender), selected: chosen.has(t.id) }));
 }
@@ -86,8 +89,8 @@ export async function getUserRoutineTasks(userId, gender = null) {
 // hunter already acted on them today.
 export async function setUserRoutineTasks(userId, taskIds, { syncToday = true } = {}) {
   const bUserId  = typeof userId === 'bigint' ? userId : BigInt(userId);
-  const today    = getISTDateOnly();
-  const activeIds = (await findRoutineTasks()).map((t) => t.id);
+  const today    = await getUserToday(bUserId);
+  const activeIds = (await findRoutineTasks(today)).map((t) => t.id);
   const active   = new Set(activeIds);
   const chosen   = taskIds.filter((id) => active.has(id));
   if (chosen.length === 0) throw new Error('NO_ROUTINE_TASKS');
@@ -134,7 +137,7 @@ export async function setUserRoutineTasks(userId, taskIds, { syncToday = true } 
 // Onboarding without a routine choice (e.g. an older app build): every
 // live routine task on, so the hunter starts with a full routine.
 export async function selectAllRoutineTasks(userId, options = {}) {
-  const activeIds = (await findRoutineTasks()).map((t) => t.id);
+  const activeIds = (await findRoutineTasks(await getUserToday(userId))).map((t) => t.id);
   if (activeIds.length === 0) return [];
   return setUserRoutineTasks(userId, activeIds, options);
 }

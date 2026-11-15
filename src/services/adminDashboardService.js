@@ -1,9 +1,10 @@
 // src/services/adminDashboardService.js — data for the admin Dashboard page
 // (HunterX-Admin app/(dashboard)/page.tsx, shapes in types/dashboard.ts).
 //
-// Every "day" here is an IST calendar day, matching the rest of the app.
-// @db.Date columns (schedule_date, last_active_date) already hold IST dates;
-// timestamp columns are UTC, so they are shifted by +5:30 before bucketing.
+// Every "day" here is on the admin's calendar (their browser's zone,
+// utils/adminClock.js); timestamp columns are UTC and are bucketed on it.
+// @db.Date columns (schedule_date, last_active_date) hold each hunter's own
+// local day (utils/userClock.js) and are compared as calendar dates.
 //
 // Things the schema doesn't record, and how they're handled:
 //   • Subscription prices — no price column, so PLAN_MONTHLY_PRICE below is
@@ -23,11 +24,12 @@
 
 import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { adminDayStart } from '../utils/adminClock.js';
+import { getLocalDateOnly, getUserTimezones } from '../utils/userClock.js';
+import { getLocalTime } from '../utils/timezone.js';
 import { pageInfo } from '../utils/pageInfo.js';
 import { resolveRange, rangeBuckets } from '../utils/dashboardRange.js';
 
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 // Monthly-equivalent price per plan, USD (the dashboard shows "$").
@@ -67,7 +69,6 @@ async function pagedRows(source, { page, limit, order }) {
 }
 
 // ── date helpers ───────────────────────────────────────────
-const istKey  = (d) => new Date(d.getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 const dateKey = (d) => d.toISOString().slice(0, 10);
 const round1  = (n) => Math.round(n * 10) / 10;
 const pct     = (part, whole) => (whole > 0 ? round1((part / whole) * 100) : 0);
@@ -212,7 +213,7 @@ export async function getMrrTrend(query = {}) {
   });
   const now = new Date();
   return rangeBuckets(r).buckets.map((b) => {
-    const endOfBucket = new Date(b.to.getTime() + DAY_MS - IST_OFFSET_MS - 1);
+    const endOfBucket = new Date(adminDayStart(new Date(b.to.getTime() + DAY_MS)).getTime() - 1);
     const at = endOfBucket > now ? now : endOfBucket;
     const value = subs.filter((s) => isEarningAt(s, at)).reduce((sum, s) => sum + monthlyValue(s), 0);
     return { date: b.key, value: Math.round(value * 100) / 100 };
@@ -503,17 +504,19 @@ export async function getStreakDropoff(query = {}) {
   const maxDays = STREAK_DAYS;
   const [users, completions] = await Promise.all([
     prisma.users.findMany({ where: { role: 'USER', created_at: inRange(r) }, select: { id: true, created_at: true } }),
-    // Only each user's first maxDays IST days after signup matter — not
-    // their whole history.
+    // Only each user's first maxDays days after signup matter — not their
+    // whole history. Signup day = the calendar day in the hunter's own zone,
+    // the same calendar their schedule_date uses.
     prisma.$queryRaw`
       SELECT c.user_id, c.schedule_date::text AS day
       FROM task_completions c
       JOIN users u ON u.id = c.user_id
+      LEFT JOIN user_settings s ON s.user_id = u.id
       WHERE c.status::text IN ('COMPLETED', 'PARTIAL')
         AND u.created_at IS NOT NULL
         AND ${inRangeSql('u.created_at', r)}
-        AND c.schedule_date >= (u.created_at + interval '330 minutes')::date
-        AND c.schedule_date <  (u.created_at + interval '330 minutes')::date + ${maxDays}::int`,
+        AND c.schedule_date >= ((u.created_at AT TIME ZONE 'UTC') AT TIME ZONE COALESCE(s.timezone, 'Asia/Kolkata'))::date
+        AND c.schedule_date <  ((u.created_at AT TIME ZONE 'UTC') AT TIME ZONE COALESCE(s.timezone, 'Asia/Kolkata'))::date + ${maxDays}::int`,
   ]);
   const daysByUser = new Map();
   for (const c of completions) {
@@ -522,11 +525,13 @@ export async function getStreakDropoff(query = {}) {
     daysByUser.get(k).add(c.day);
   }
 
-  const todayMs = getISTDateOnly().getTime();
+  const zones = await getUserTimezones(users.map((u) => u.id));
   const remaining = Array(maxDays).fill(0);
   for (const u of users) {
     if (!u.created_at) continue;
-    const signupMs = Date.parse(`${istKey(u.created_at)}T00:00:00Z`);
+    const tz = zones.get(String(u.id));
+    const todayMs  = getLocalDateOnly(tz).getTime();
+    const signupMs = Date.parse(`${getLocalTime(tz, u.created_at).dateStr}T00:00:00Z`);
     const ageDays = Math.floor((todayMs - signupMs) / DAY_MS) + 1; // signup day counts as day 1
     const done = daysByUser.get(String(u.id)) ?? new Set();
     for (let d = 1; d <= Math.min(maxDays, ageDays); d++) {

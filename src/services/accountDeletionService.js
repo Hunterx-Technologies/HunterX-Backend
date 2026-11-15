@@ -20,6 +20,8 @@ import { createNotification } from './notificationService.js';
 import { info, logError } from '../utils/logger.js';
 import { cleanupUserMedia } from './userMediaCleanupService.js';
 import { shiftStreakPastPause } from './streakService.js';
+import { DEFAULT_TIMEZONE, isValidTimeZone } from '../utils/timezone.js';
+import { getUserTimezone } from '../utils/userClock.js';
 import { extendRewardsPastPause } from './rewardService.js';
 
 // onlyIfDueBy (the hourly purge): delete only if delete_at is still set and
@@ -107,10 +109,10 @@ const LINK_TTL_MS = 10 * 60 * 1000;
 const DAY_MS = 86_400_000;
 const PROFILE_URL = '/(tabs)/profile';
 
-// "12 December 2026" — the IST calendar day, like the rest of the app.
-export function formatDeletionDate(date) {
+// "12 December 2026" — the calendar day in the hunter's own zone.
+export function formatDeletionDate(date, tz = DEFAULT_TIMEZONE) {
   return new Date(date).toLocaleDateString('en-IN', {
-    day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata',
+    day: 'numeric', month: 'long', year: 'numeric', timeZone: isValidTimeZone(tz) ? tz : DEFAULT_TIMEZONE,
   });
 }
 
@@ -185,7 +187,7 @@ async function schedule(user) {
   info(`Account ${user.id} scheduled for deletion on ${deleteAt.toISOString()}`);
   // Off the leaderboards while pending (computeEligibility).
   await syncLeaderboardMember(user.id);
-  const day = formatDeletionDate(deleteAt);
+  const day = formatDeletionDate(deleteAt, await getUserTimezone(user.id));
   mailHunter(user, 'Your HunterX account will be deleted', 'Your account is scheduled for deletion', [
     `Your HunterX account and its data will be permanently deleted on ${strong(day)}.`,
     `Changed your mind? Log in to the app and tap ${strong('Keep my account')} any time before then.`,
@@ -255,7 +257,7 @@ export async function sendDeletionReminders(now = new Date()) {
     const lastDay  = msLeft <= DELETION_LAST_DAY_DAYS * DAY_MS;
     const daysLeft = Math.max(1, Math.ceil(msLeft / DAY_MS));
     const inDays   = daysText(daysLeft);
-    const day      = formatDeletionDate(deleteAt);
+    const day      = formatDeletionDate(deleteAt, await getUserTimezone(user.id));
     const stage    = lastDay ? 'last_day' : `${DELETION_REMINDER_DAYS}d`;
 
     const notification = await notifyHunter(

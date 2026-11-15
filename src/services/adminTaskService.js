@@ -45,7 +45,8 @@
 // editable fields on later runs.
 
 import prisma from '../config/prisma.js';
-import { parseDateOnly, getISTDateOnly } from '../utils/helpers.js';
+import { parseDateOnly } from '../utils/helpers.js';
+import { getAdminToday } from '../utils/adminClock.js';
 import { uploadCompressedImage, deleteImages, ownPublicIdFromUrl } from './imageUploadService.js';
 import { announceTaskChange } from './questNotificationService.js';
 import { syncTaskForToday } from './taskAssignmentService.js';
@@ -53,7 +54,7 @@ import { info, logError } from '../utils/logger.js';
 
 const TASK_IMAGE_FOLDER = 'hunterx/tasks';
 
-// Pushes for a task that starts today after the 08:00 IST announcement
+// Pushes for a task that starts today after the 08:00 (each hunter's time) announcement
 // jobs already ran, or a paid offer coming back on sale. Fans out to every
 // user, so it runs after the response instead of holding up the admin.
 function announceInBackground(saved, existing = null) {
@@ -162,7 +163,8 @@ function buildTaskData(input, existing = null) {
   // ── Date window. start_date is always required. end_date is required for
   // paid tasks (it ends the offer; buyers keep a full period from purchase); for free ones
   // it's optional — one-time tasks derive it, recurring tasks have no end.
-  const today = getISTDateOnly();
+  // "In the past" on the admin's calendar (their browser's zone).
+  const today = getAdminToday();
   if (!start_date) throw new Error('START_DATE_REQUIRED');
   const parsedStart = parseDateOnly(start_date);
   if (!parsedStart) throw new Error('INVALID_START_DATE');
@@ -317,9 +319,12 @@ export async function getTaskAssignmentStats(taskId) {
 
   const [[shown], [done]] = await Promise.all([
     prisma.$queryRaw`
-      SELECT COUNT(DISTINCT user_id)::int AS users, MIN(active_date) AS first_shown, MAX(active_date) AS last_shown,
-             COUNT(*) FILTER (WHERE active_date = ${getISTDateOnly()})::int AS today
-      FROM task_schedule WHERE task_id = ${bTaskId}`,
+      SELECT COUNT(DISTINCT t.user_id)::int AS users, MIN(t.active_date) AS first_shown, MAX(t.active_date) AS last_shown,
+             -- On each hunter's own today (their zone, utils/userClock.js).
+             COUNT(*) FILTER (WHERE t.active_date = (now() AT TIME ZONE COALESCE(s.timezone, 'Asia/Kolkata'))::date)::int AS today
+      FROM task_schedule t
+      LEFT JOIN user_settings s ON s.user_id = t.user_id
+      WHERE t.task_id = ${bTaskId}`,
     prisma.$queryRaw`
       SELECT COUNT(DISTINCT user_id)::int AS users, COUNT(*)::int AS completions
       FROM task_completions WHERE task_id = ${bTaskId} AND status IN ('COMPLETED', 'PARTIAL')`,
@@ -515,7 +520,7 @@ export async function updateTask(taskId, body, files = {}) {
   if (typeof changes.is_active === 'boolean') {
     data.is_active = changes.is_active;
   } else if (data.is_paid && !existing.is_active && data.end_date &&
-             data.end_date.getTime() >= getISTDateOnly().getTime() &&
+             data.end_date.getTime() >= getAdminToday().getTime() &&
              dateKey(data.end_date) !== dateKey(existing.end_date)) {
     // Moving a paid task's end_date forward brings back an offer the
     // nightly cron already deactivated for passing its old end_date.

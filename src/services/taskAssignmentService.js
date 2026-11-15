@@ -18,7 +18,8 @@
 // already acted on).
 
 import prisma from '../config/prisma.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getLocalDateOnly } from '../utils/userClock.js';
+import { DEFAULT_TIMEZONE } from '../utils/timezone.js';
 
 // The routine + admin-dated task lists are the same for every user on a
 // given date — the nightly cron loads them once (loadSharedTasks) and
@@ -84,8 +85,8 @@ export async function selectedRoutineIds(userId, activeIds, client = prisma) {
   return activeIds.filter((id) => !off.has(id));
 }
 
-// date is a UTC-midnight Date representing an IST calendar day — same
-// convention as getISTDateOnly()/getISTWeekStart() in utils/helpers.js.
+// date is a UTC-midnight Date representing the user's own calendar day —
+// see utils/userClock.js (getUserToday / getLocalDateOnly).
 // `shared` is an optional loadSharedTasks(date) result.
 export async function assignDailyTasks(userId, date, shared = null) {
   const bUserId = typeof userId === 'bigint' ? userId : BigInt(userId);
@@ -201,12 +202,45 @@ async function audienceFor(task) {
   return ids;
 }
 
-export async function syncTaskForToday(taskId, date = getISTDateOnly()) {
+// Every onboarded hunter grouped by the calendar day it is for them at
+// `now` — usually one or two dates, three around the date line.
+async function huntersByLocalDate(now) {
+  const users = await prisma.users.findMany({
+    where:  { onboarding_done: true, is_banned: false },
+    select: { id: true, user_settings: { select: { timezone: true } } },
+  });
+  const groups = new Map(); // 'YYYY-MM-DD' → { date, ids: Set<bigint> }
+  for (const u of users) {
+    const date = getLocalDateOnly(u.user_settings?.timezone ?? DEFAULT_TIMEZONE, 0, now);
+    const key  = date.toISOString().slice(0, 10);
+    if (!groups.has(key)) groups.set(key, { date, ids: new Set() });
+    groups.get(key).ids.add(u.id);
+  }
+  return [...groups.values()];
+}
+
+// `date` given: sync everyone's list for that day. Omitted: each hunter's
+// own today (an admin edit lands while hunters sit on different dates).
+export async function syncTaskForToday(taskId, date = null) {
   const task = await prisma.tasks.findUnique({ where: { id: BigInt(taskId) } });
   if (!task || !task.is_active) return { added: 0, removed: 0 };
 
+  const groups = date ? [{ date, ids: null }] : await huntersByLocalDate(new Date());
+  const total = { added: 0, removed: 0 };
+  for (const group of groups) {
+    const r = await syncTaskOn(task, group.date, group.ids);
+    total.added   += r.added;
+    total.removed += r.removed;
+  }
+  return total;
+}
+
+// One calendar day; `onlyIds` (a Set) limits it to the hunters on that day.
+async function syncTaskOn(task, date, onlyIds) {
+  const within = (id) => !onlyIds || onlyIds.has(id);
+
   if (isTaskLiveOn(task, date)) {
-    const userIds = await audienceFor(task);
+    const userIds = (await audienceFor(task)).filter(within);
     let added = 0;
     for (let i = 0; i < userIds.length; i += INSERT_CHUNK) {
       const { count } = await prisma.task_schedule.createMany({
@@ -234,7 +268,7 @@ export async function syncTaskForToday(taskId, date = getISTDateOnly()) {
     select: { user_id: true },
   });
   const keep   = new Set(acted.map((c) => c.user_id));
-  const remove = onToday.map((r) => r.user_id).filter((id) => !keep.has(id));
+  const remove = onToday.map((r) => r.user_id).filter((id) => within(id) && !keep.has(id));
   if (remove.length === 0) return { added: 0, removed: 0 };
 
   const { count } = await prisma.task_schedule.deleteMany({

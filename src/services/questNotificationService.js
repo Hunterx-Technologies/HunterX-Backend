@@ -1,9 +1,9 @@
 // src/services/questNotificationService.js — Announcing admin-created
 // quests (free DAILY_ADMIN / WEEKLY / MONTHLY and paid tasks) to users.
 //
-// The morning IST scheduled jobs (scheduledNotificationJobs.js: new_quest
-// at 07:00, paid_quest_launch at 08:00) cover everything starting on a
-// given day as long as it exists by then. This service covers what those
+// The morning scheduled jobs (scheduledNotificationJobs.js: new_quest at
+// 07:00, paid_quest_launch at 08:00, each user's local time) cover
+// everything starting on a given day as long as it exists by then. This service covers what those
 // jobs can't see:
 //   - a task created (or moved to start today) after its job ran — announced
 //     right away instead of never (the next morning it's no longer "new")
@@ -13,15 +13,12 @@
 
 import prisma from '../config/prisma.js';
 import { createNotification } from './notificationService.js';
-import { getISTDateOnly } from '../utils/helpers.js';
 import { getLocalTime } from '../utils/timezone.js';
+import { getLocalDateOnly, getUserTimezones, localDayEnd } from '../utils/userClock.js';
 import { info, logError } from '../utils/logger.js';
 
-const IST            = 'Asia/Kolkata';
-const DAY_MS         = 24 * 60 * 60 * 1000;
-const IST_OFFSET_MS  = 5.5 * 60 * 60 * 1000;
-const NEW_QUEST_SLOT_H  = 7; // new_quest runs at 07:00 IST
-const PAID_LAUNCH_SLOT_H = 8; // paid_quest_launch runs at 08:00 IST
+const NEW_QUEST_SLOT_H  = 7; // new_quest runs at 07:00 local
+const PAID_LAUNCH_SLOT_H = 8; // paid_quest_launch runs at 08:00 local
 
 export const QUEST_LABELS = {
   DAILY_ADMIN: "Today's quest",
@@ -33,14 +30,9 @@ export function dateKey(date) {
   return date ? date.toISOString().slice(0, 10) : null;
 }
 
-// A @db.Date (UTC midnight standing for an IST day) → "21 Oct".
+// A @db.Date (UTC midnight standing for a calendar day) → "21 Oct".
 export function formatDay(date) {
   return date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
-}
-
-// getISTDateOnly()-style date → the real instant that IST day ends.
-export function istDayEnd(istDate) {
-  return new Date(istDate.getTime() + DAY_MS - IST_OFFSET_MS);
 }
 
 export function newQuestKey(taskId) {
@@ -88,68 +80,78 @@ async function audience(task) {
   return users.map((u) => u.id);
 }
 
-async function fanOut(task, { title, body, event, dedupeKey, expiresAt = null }) {
+// `decide(tz)` → the announcement for a user in zone `tz`, or null to skip
+// them. Per user because "today" and "has 07:00 passed" depend on where
+// each hunter is.
+async function fanOut(task, decide) {
   const userIds = await audience(task);
+  const zones   = await getUserTimezones(userIds);
   let created = 0;
+  let key = null;
   for (const userId of userIds) {
+    const msg = decide(zones.get(String(userId)));
+    if (!msg) continue;
+    key = msg.dedupeKey;
     try {
       const n = await createNotification(
-        prisma, userId, 'NEW_QUEST', title, body,
-        { event, task_ids: [String(task.id)] },
-        { dedupeKey, expiresAt }
+        prisma, userId, 'NEW_QUEST', msg.title, msg.body,
+        { event: msg.event, task_ids: [String(task.id)] },
+        { dedupeKey: msg.dedupeKey, expiresAt: msg.expiresAt ?? null }
       );
       if (n) created += 1;
     } catch (err) {
-      logError(`Quest announcement ${dedupeKey} failed for user ${userId}: ${err.message}`);
+      logError(`Quest announcement ${msg.dedupeKey} failed for user ${userId}: ${err.message}`);
     }
   }
-  if (created > 0) info(`Quest announcement ${dedupeKey}: ${created} notification(s) queued`);
+  if (created > 0) info(`Quest announcement ${key}: ${created} notification(s) queued`);
   return created;
 }
 
-function slotPassed(hour, now = new Date()) {
-  return getLocalTime(IST, now).hour >= hour;
-}
-
-// Called after an admin creates (existing = null) or edits a task.
-export async function announceTaskChange(saved, existing = null) {
-  if (!saved.is_active) return 0;
-
-  const today       = getISTDateOnly();
+// What one user in `tz` should hear about this change, or null.
+function announcementFor(saved, existing, tz, now) {
+  const today       = getLocalDateOnly(tz, 0, now);
+  const slotPassed  = (hour) => getLocalTime(tz, now).hour >= hour;
   const startsToday = dateKey(saved.start_date) === dateKey(today);
 
   if (saved.is_paid) {
     const nowOnSale = isOnSale(saved, today);
     const wasOnSale = existing ? isOnSale(existing, today) : false;
-    if (!nowOnSale || wasOnSale) return 0;
+    if (!nowOnSale || wasOnSale) return null;
 
     // Offered before (started on an earlier day) → it's coming back.
     if (existing && existing.start_date.getTime() < today.getTime()) {
-      return fanOut(saved, {
+      return {
         title:     `${saved.title} is back`,
         body:      `This premium quest is on offer again until ${formatDay(saved.end_date)}.`,
         event:     'PAID_QUEST_BACK',
         dedupeKey: `paid_quest_back:${saved.id}:${dateKey(saved.end_date)}`,
-      });
+      };
     }
     // Starts today and missed the 08:00 launch job → launch now.
     if (startsToday && slotPassed(PAID_LAUNCH_SLOT_H)) {
-      return fanOut(saved, { ...paidLaunchMessage(saved), event: 'PAID_QUEST_LAUNCH', dedupeKey: paidLaunchKey(saved) });
+      return { ...paidLaunchMessage(saved), event: 'PAID_QUEST_LAUNCH', dedupeKey: paidLaunchKey(saved) };
     }
-    return 0;
+    return null;
   }
 
   // Free task: only the "starts today, after 07:00" case needs help.
-  if (!startsToday || !slotPassed(NEW_QUEST_SLOT_H)) return 0;
-  if (existing && existing.is_active && dateKey(existing.start_date) === dateKey(today)) return 0;
+  if (!startsToday || !slotPassed(NEW_QUEST_SLOT_H)) return null;
+  if (existing && existing.is_active && dateKey(existing.start_date) === dateKey(today)) return null;
 
   const label = QUEST_LABELS[saved.task_type] ?? 'Quest';
   const lastDay = saved.end_date ?? null;
-  return fanOut(saved, {
+  return {
     title:     `New quest: ${saved.title}`,
     body:      `${label} · +${saved.xp_reward} XP. Accept the challenge.`,
     event:     'NEW_QUEST',
     dedupeKey: newQuestKey(saved.id),
-    expiresAt: lastDay ? istDayEnd(lastDay) : null,
-  });
+    expiresAt: lastDay ? localDayEnd(lastDay, tz) : null,
+  };
+}
+
+// Called after an admin creates (existing = null) or edits a task.
+export async function announceTaskChange(saved, existing = null) {
+  if (!saved.is_active) return 0;
+  const now = new Date();
+  return fanOut(saved, (tz) => announcementFor(saved, existing, tz, now));
 }

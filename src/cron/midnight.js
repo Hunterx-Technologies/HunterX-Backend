@@ -1,102 +1,126 @@
-// src/cron/midnight.js — Nightly task-assignment cron, scheduled for
-// 00:30 IST (19:00 UTC), ahead of the 6 AM DAILY_MOTIVATION push.
+// src/cron/midnight.js — Day rollover jobs.
 //
-// Trigger A of the automatic task-assignment system (see
-// src/services/taskAssignmentService.js): for every active user, assigns
-// today's routine daily tasks + any weekly task recurring today + any
-// admin one-off task scheduled for today. Covers all EXISTING users so
-// their tasks are ready before they even open the app.
+// Every hunter's day starts at their OWN local midnight (utils/userClock.js),
+// so the per-user work runs every 15 minutes for whoever just reached it:
+//
+//   Local midnight (every 15 min) — for each active user whose local time is
+//   00:00–00:14: trigger A of the automatic task-assignment system (see
+//   src/services/taskAssignmentService.js: today's routine daily tasks, any
+//   weekly task recurring today, any admin task scheduled for today), the
+//   birthday age update and the birthday scratch card. Every zone offset is
+//   a multiple of 15 minutes and the cron fires on UTC quarter-hours, so
+//   each user lands in exactly one tick a day.
+//
+//   Nightly housekeeping (00:30 IST, 19:00 UTC) — shared cleanup with no
+//   per-user day: ended paid sales, expired OTPs, old notifications,
+//   expired rewards.
 //
 // Safe to re-run / overlap with the request-time fallback (trigger C) —
-// assignDailyTasks() is idempotent per user/date.
+// assignDailyTasks() is idempotent per user/date, birthday cards once a year.
 
 import { scheduleJob } from './lock.js';
 import prisma from '../config/prisma.js';
 import { assignDailyTasks, loadSharedTasks } from '../services/taskAssignmentService.js';
 import { deactivateExpiredPaidTasks } from '../services/taskPurchaseService.js';
-import { expireRewards, grantBirthdayCards } from '../services/rewardService.js';
+import { expireRewards, ensureBirthdayCard, isBirthdayOn } from '../services/rewardService.js';
 import { deleteOldNotifications, NOTIFICATION_RETENTION_DAYS } from '../services/notificationService.js';
-import { getISTDateOnly, calculateStepsGoal } from '../utils/helpers.js';
+import { calculateStepsGoal } from '../utils/helpers.js';
+import { getLocalTime, DEFAULT_TIMEZONE } from '../utils/timezone.js';
+import { getLocalDateOnly } from '../utils/userClock.js';
 import { info, logError } from '../utils/logger.js';
 
-export async function syncUserAgesForBirthdays(today) {
-  // Only users whose stored age no longer matches their birthday — usually
-  // just today's birthdays, but also anyone missed by an earlier run — so
-  // this stays small however many users there are. The loop below
-  // recomputes and double-checks each one exactly as before.
-  const todayKey = today.toISOString().slice(0, 10);
-  const usersWithDob = await prisma.$queryRaw`
-    SELECT id, date_of_birth, age, bmi
-    FROM users
-    WHERE date_of_birth IS NOT NULL
-      AND (age IS NULL OR age <> date_part('year', age(${todayKey}::date, date_of_birth))::int)
-  `;
-
-  let updatedCount = 0;
-
-  for (const user of usersWithDob) {
-    try {
-      const dob = user.date_of_birth;
-      let calculatedAge = today.getUTCFullYear() - dob.getUTCFullYear();
-      const monthDiff = today.getUTCMonth() - dob.getUTCMonth();
-      const dayDiff = today.getUTCDate() - dob.getUTCDate();
-      if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) {
-        calculatedAge--;
-      }
-
-      if (user.age !== calculatedAge) {
-        const data = { age: calculatedAge };
-
-        // daily_steps_goal is age-banded (steps down at 50/65) — keep it
-        // in sync with the birthday instead of only reacting to a manual
-        // profile edit (see helpers.js#calculateStepsGoal).
-        if (user.bmi != null) {
-          data.daily_steps_goal = calculateStepsGoal(user.bmi, calculatedAge);
-        }
-
-        await prisma.users.update({
-          where: { id: user.id },
-          data,
-        });
-        updatedCount++;
-      }
-    } catch (err) {
-      logError(`Failed to update age for user ${user.id}: ${err.message}`);
-    }
-  }
-
-  if (updatedCount > 0) {
-    info(`Daily birthday age sync completed: updated ${updatedCount} user(s)`);
-  }
+// Age on `today` (UTC-midnight Date of the user's local day).
+export function ageOn(dob, today) {
+  let age = today.getUTCFullYear() - dob.getUTCFullYear();
+  const monthDiff = today.getUTCMonth() - dob.getUTCMonth();
+  const dayDiff   = today.getUTCDate() - dob.getUTCDate();
+  if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) age--;
+  return age;
 }
 
-// Users assigned in parallel by the nightly job.
+// Keeps users.age (and the age-banded daily_steps_goal, which steps down at
+// 50/65 — see helpers.js#calculateStepsGoal) in step with the birthday.
+async function syncAge(user, today) {
+  const age = ageOn(user.date_of_birth, today);
+  if (user.age === age) return false;
+  const data = { age };
+  if (user.bmi != null) data.daily_steps_goal = calculateStepsGoal(user.bmi, age);
+  await prisma.users.update({ where: { id: user.id }, data });
+  return true;
+}
+
+// Users assigned in parallel per tick.
 const ASSIGN_CONCURRENCY = 4;
+const TICK_MINUTES = 15;
 
-export async function runNightlyTaskAssignment() {
-  const today = getISTDateOnly();
+export async function runLocalMidnight(now = new Date()) {
+  const users = await prisma.users.findMany({
+    where:  { onboarding_done: true, is_banned: false },
+    select: {
+      id: true, date_of_birth: true, age: true, bmi: true,
+      user_settings: { select: { timezone: true } },
+    },
+  });
 
-  // Run daily birthday sync first — its failure must not cost every user
-  // today's task assignment.
-  try {
-    await syncUserAgesForBirthdays(today);
-  } catch (err) {
-    logError(`Birthday age sync failed: ${err.message}`);
+  // Just past local midnight, with that user's local day.
+  const due = [];
+  for (const user of users) {
+    const tz = user.user_settings?.timezone ?? DEFAULT_TIMEZONE;
+    if (getLocalTime(tz, now).minutesOfDay < TICK_MINUTES) {
+      due.push({ user, today: getLocalDateOnly(tz, 0, now) });
+    }
   }
+  if (due.length === 0) return;
 
-  // Birthday scratch cards (only once an admin has put coupons on the
-  // birthday trigger) — see rewardService.js#grantBirthdayCards.
-  try {
-    const granted = await grantBirthdayCards(today);
-    if (granted > 0) info(`Granted ${granted} birthday scratch card(s)`);
-  } catch (err) {
-    logError(`Birthday scratch cards failed: ${err.message}`);
-  }
+  // Shared task lists, once per calendar date in this tick.
+  const sharedByDate = new Map();
+  const sharedFor = (today) => {
+    const key = today.toISOString().slice(0, 10);
+    if (!sharedByDate.has(key)) sharedByDate.set(key, loadSharedTasks(today));
+    return sharedByDate.get(key);
+  };
 
+  let assignedTotal = 0;
+  let failedCount   = 0;
+  let agesUpdated   = 0;
+  let birthdayCards = 0;
+
+  let next = 0;
+  const worker = async () => {
+    while (next < due.length) {
+      const { user, today } = due[next++];
+      try {
+        if (user.date_of_birth) {
+          if (await syncAge(user, today)) agesUpdated += 1;
+          if (isBirthdayOn(user.date_of_birth, today) && await ensureBirthdayCard(user.id)) birthdayCards += 1;
+        }
+      } catch (err) {
+        logError(`Birthday update failed for user ${user.id}: ${err.message}`);
+      }
+      try {
+        const { assigned } = await assignDailyTasks(user.id, today, await sharedFor(today));
+        assignedTotal += assigned;
+      } catch (err) {
+        failedCount += 1;
+        logError(`Local-midnight task assignment failed for user ${user.id}: ${err.message}`);
+      }
+    }
+  };
+  // A few users at a time: each is independent and idempotent, and the cap
+  // leaves most of the DB pool free for app traffic.
+  await Promise.all(Array.from({ length: Math.min(ASSIGN_CONCURRENCY, due.length) }, worker));
+
+  info(
+    `Local midnight — ${due.length} user(s): ${assignedTotal} task_schedule rows created, ` +
+    `${agesUpdated} age(s) updated, ${birthdayCards} birthday card(s), ${failedCount} failed`
+  );
+}
+
+export async function runNightlyHousekeeping() {
   // Paid tasks whose sale (end_date) is over and whose last buyer's access
   // has ended are switched off.
   try {
-    const deactivated = await deactivateExpiredPaidTasks(today);
+    const deactivated = await deactivateExpiredPaidTasks();
     if (deactivated > 0) info(`Deactivated ${deactivated} expired paid task(s)`);
   } catch (err) {
     logError(`Expired paid task deactivation failed: ${err.message}`);
@@ -125,40 +149,13 @@ export async function runNightlyTaskAssignment() {
   } catch (err) {
     logError(`Reward expiry failed: ${err.message}`);
   }
-
-  const users = await prisma.users.findMany({
-    where:  { onboarding_done: true, is_banned: false },
-    select: { id: true },
-  });
-
-  let assignedTotal = 0;
-  let failedCount   = 0;
-  const shared      = await loadSharedTasks(today);
-
-  // A few users at a time: each assignment is independent and idempotent,
-  // and the cap leaves most of the DB pool free for app traffic.
-  let next = 0;
-  const worker = async () => {
-    while (next < users.length) {
-      const user = users[next++];
-      try {
-        const { assigned } = await assignDailyTasks(user.id, today, shared);
-        assignedTotal += assigned;
-      } catch (err) {
-        failedCount += 1;
-        logError(`Nightly task assignment failed for user ${user.id}: ${err.message}`);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(ASSIGN_CONCURRENCY, users.length) }, worker));
-
-  info(
-    `Nightly task assignment done — ${users.length} active users, ` +
-    `${assignedTotal} task_schedule rows created, ${failedCount} user(s) failed`
-  );
 }
 
-// Cron schedule: 0 19 * * * corresponding to 00:30 IST (19:00 UTC)
-export const midnightJob = scheduleJob('Nightly task assignment', '0 19 * * *', 2 * 60 * 60, runNightlyTaskAssignment);
+// UTC quarter-hours: every whole-hour, :30 and :45 offset zone's local
+// midnight falls on one of them.
+export const localMidnightJob = scheduleJob('Local midnight', '*/15 * * * *', 14 * 60, runLocalMidnight);
 
-export default midnightJob;
+// 0 19 * * * = 00:30 IST (19:00 UTC).
+export const housekeepingJob = scheduleJob('Nightly housekeeping', '0 19 * * *', 2 * 60 * 60, runNightlyHousekeeping);
+
+export default localMidnightJob;

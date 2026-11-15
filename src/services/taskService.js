@@ -1,7 +1,7 @@
 // src/services/taskService.js — Daily, weekly & monthly task fetching + completion logic
 
 import prisma from '../config/prisma.js';
-import { getISTDateOnly, getISTWeekStart } from '../utils/helpers.js';
+import { getUserTimezone, getLocalDateOnly, getLocalWeekStart, localDayOf, localDayEnd } from '../utils/userClock.js';
 import { assignDailyTasks } from './taskAssignmentService.js';
 import { bumpDailyStreak, getStreakRiskStatus, reconcileStreak } from './streakService.js';
 import { checkLevelUp } from './xpService.js';
@@ -12,7 +12,6 @@ import {
 } from './taskPurchaseService.js';
 import { createNotification } from './notificationService.js';
 import { deleteImages, ownPublicIdFromUrl } from './imageUploadService.js';
-import { istDayEnd } from './questNotificationService.js';
 import { logError } from '../utils/logger.js';
 
 const DAILY_TYPES     = ['DAILY_FIXED', 'DAILY_ADMIN'];
@@ -32,7 +31,8 @@ const PERIOD_DAYS = { WEEKLY: 7, MONTHLY: 30 };
 // Tue is one period (one completion), not two calendar weeks. `end` is
 // capped at the last day the user has the task (end_date / access_end).
 // period.start is the task_completions.schedule_date key.
-export async function getTaskPeriod(bUserId, task, today = getISTDateOnly()) {
+export async function getTaskPeriod(bUserId, task, today = null) {
+  today ??= getLocalDateOnly(await getUserTimezone(bUserId));
   const length = PERIOD_DAYS[task.task_type];
   if (!length) return { start: today, end: today };
 
@@ -97,8 +97,10 @@ export async function getTodayTasks(userId, overrideGender = null) {
 
   const effectiveGender = (overrideGender ?? user.gender ?? '').toString().toUpperCase();
 
-  const todayDate     = getISTDateOnly();
-  const weekStartDate = getISTWeekStart();
+  // The hunter's own calendar day (utils/userClock.js), not the server's.
+  const tz            = await getUserTimezone(bUserId);
+  const todayDate     = getLocalDateOnly(tz);
+  const weekStartDate = getLocalWeekStart(tz);
 
   // Trigger C — request-time fallback. If this user has no task_schedule
   // rows for today yet (cron didn't run, server was down, timezone edge
@@ -149,7 +151,7 @@ export async function getTodayTasks(userId, overrideGender = null) {
   const periodKeys = [...new Set([...periodByTask.values()].map(p => p.start.getTime()))];
   // The completions, the locked (for-sale) tasks and the streak status don't
   // depend on each other either.
-  const [completions, lockedTasks, streak] = await Promise.all([
+  const [completions, lockedTasks, streak, progression] = await Promise.all([
     prisma.task_completions.findMany({
       where: {
         user_id:       bUserId,
@@ -159,6 +161,10 @@ export async function getTodayTasks(userId, overrideGender = null) {
     }),
     getLockedTasks(bUserId, todayDate),
     getStreakRiskStatus(bUserId),
+    prisma.user_progression.findUnique({
+      where:  { user_id: bUserId },
+      select: { day_complete_seen_date: true },
+    }),
   ]);
   const completionMap = new Map(
     completions.map(c => [`${c.task_id}_${dateKey(c.schedule_date)}`, c])
@@ -247,12 +253,27 @@ export async function getTodayTasks(userId, overrideGender = null) {
     // streak.at_risk true = show the "use a life or let it drop?" prompt;
     // see POST /api/tasks/streak/resolve
     streak,
+    // The app already showed today's "Day Complete" screen (on any device,
+    // any login) — it isn't shown again; see markDayCompleteSeen.
+    day_complete_seen:
+      progression?.day_complete_seen_date?.getTime() === todayDate.getTime(),
   };
 }
 
+// POST /api/tasks/day-complete/seen — the app showed today's "Day Complete"
+// screen. Idempotent; it shows once per day (the hunter's) per account.
+export async function markDayCompleteSeen(userId) {
+  const today = getLocalDateOnly(await getUserTimezone(userId));
+  await prisma.user_progression.updateMany({
+    where: { user_id: BigInt(userId) },
+    data:  { day_complete_seen_date: today },
+  });
+  return { date: dateKey(today), day_complete_seen: true };
+}
+
 // ─────────────────────────────────────────────────────────────
-// GET — Mon–Sun status strip for the current IST week, e.g. for a
-// streak-calendar UI. Always keyed off getISTWeekStart()/getISTDateOnly()
+// GET — Mon–Sun status strip for the hunter's current week, e.g. for a
+// streak-calendar UI. Always keyed off their local week/day (userClock.js)
 // live, so it needs no reset job — it's just a different week's Monday
 // once the calendar rolls over.
 // "Done" mirrors the streak's own definition of an active day
@@ -268,10 +289,11 @@ const WEEK_DAY_NAMES = [
 export async function getWeekStatus(userId) {
   const bUserId = BigInt(userId);
 
-  const weekStart = getISTWeekStart();
+  const tz        = await getUserTimezone(bUserId);
+  const weekStart = getLocalWeekStart(tz);
   const weekEnd    = new Date(weekStart);
   weekEnd.setUTCDate(weekEnd.getUTCDate() + 6); // Sunday of this ISO week
-  const today = getISTDateOnly();
+  const today = getLocalDateOnly(tz);
 
   const completions = await prisma.task_completions.findMany({
     where: {
@@ -323,7 +345,7 @@ async function assertAssignedToUser(bUserId, task) {
       user_id_task_id_active_date: {
         user_id:     bUserId,
         task_id:     task.id,
-        active_date: getISTDateOnly(),
+        active_date: getLocalDateOnly(await getUserTimezone(bUserId)),
       },
     },
     select: { id: true },
@@ -634,7 +656,8 @@ export async function submitTaskProof(userId, taskId, proofUrls) {
 // COMPLETED or PARTIAL (a SKIPPED one means the day wasn't fully cleared).
 // Outside the completion transaction: the dedupe key makes it once a day.
 async function notifyIfDayCleared(bUserId, streak) {
-  const today = getISTDateOnly();
+  const tz    = await getUserTimezone(bUserId);
+  const today = getLocalDateOnly(tz);
   const scheduled = await prisma.task_schedule.findMany({
     where:    { user_id: bUserId, active_date: today, tasks: { is_active: true, task_type: { in: DAILY_TYPES } } },
     select:   { task_id: true },
@@ -657,7 +680,7 @@ async function notifyIfDayCleared(bUserId, streak) {
     streak > 0 ? `🔥 Day ${streak} secured` : '🔥 Day secured',
     'All daily quests cleared. See you tomorrow, Hunter.',
     { event: 'DAY_COMPLETE', daily_streak: streak },
-    { dedupeKey: `day_complete:${dateKey(today)}`, expiresAt: istDayEnd(today) }
+    { dedupeKey: `day_complete:${dateKey(today)}`, expiresAt: localDayEnd(today, tz) }
   );
 }
 
@@ -708,14 +731,11 @@ export async function reopenTask(userId, taskId) {
 // GET /api/users/activity — Summary metrics & paginated quest logs
 // ─────────────────────────────────────────────────────────────
 
-function formatDateLabel(completionDate) {
+// "Today" / "Yesterday" / "3d ago" / "12 Nov", on the hunter's calendar.
+function formatDateLabel(completionDate, tz) {
   if (!completionDate) return '';
-  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
-  const nowIST = new Date(Date.now() + IST_OFFSET_MS);
-  const compIST = new Date(completionDate.getTime() + IST_OFFSET_MS);
-
-  const todayMidnight = new Date(Date.UTC(nowIST.getUTCFullYear(), nowIST.getUTCMonth(), nowIST.getUTCDate()));
-  const compMidnight = new Date(Date.UTC(compIST.getUTCFullYear(), compIST.getUTCMonth(), compIST.getUTCDate()));
+  const todayMidnight = getLocalDateOnly(tz);
+  const compMidnight  = localDayOf(new Date(completionDate), tz);
 
   const diffMs = todayMidnight.getTime() - compMidnight.getTime();
   const diffDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
@@ -737,6 +757,7 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
   const page = Math.max(1, parseInt(pageParam) || 1);
   const limit = Math.max(1, Math.min(100, parseInt(limitParam) || 10));
   const skip = (page - 1) * limit;
+  const tz = await getUserTimezone(bUserId);
 
   // Collapses an unprotected gap to a broken streak before reading it
   // below, so current_streak doesn't show a stale pre-gap value.
@@ -808,7 +829,7 @@ export async function getUserActivity(userId, pageParam = 1, limitParam = 10) {
       schedule_date: log.schedule_date ? log.schedule_date.toISOString().slice(0, 10) : null,
       completed_at: log.completed_at || log.created_at,
       day_number: dayNumber,
-      date_label: formatDateLabel(compDate),
+      date_label: formatDateLabel(compDate, tz),
     };
   });
 

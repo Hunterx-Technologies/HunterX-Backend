@@ -682,6 +682,8 @@ model user_progression {
   consecutive_miss_days Int       @default(0)
   last_active_date      DateTime? @db.Date
   streak_lives          Int       @default(1) // starts at 1 for every new user (row created at signup); earned +1 per 7-day daily_streak, capped at 2; spent 1-for-1 to cover missed days
+  /// IST day the app last showed the "Day Complete" screen (once per day per account).
+  day_complete_seen_date DateTime? @db.Date
   updated_at            DateTime? @default(now()) @db.Timestamp(6)
   users                 users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 

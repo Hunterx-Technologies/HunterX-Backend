@@ -22,7 +22,8 @@ import prisma from '../config/prisma.js';
 import { createNotification } from './notificationService.js';
 import { getLevelInfo, buildAvatarThumbUrl } from './leaderboardService.js';
 import { computeGap } from './streakService.js';
-import { getISTDateOnly, normalizeReferralCode } from '../utils/helpers.js';
+import { normalizeReferralCode } from '../utils/helpers.js';
+import { getLocalDateOnly, getUserTimezone, getUserTimezones, getUserToday } from '../utils/userClock.js';
 import { logError } from '../utils/logger.js';
 import { FRIENDS_REFERRAL_CAP as FRIENDS_CAP } from '../config/leaderboardConfig.js';
 
@@ -112,14 +113,15 @@ function relationshipFrom(meId, row, iBlocked) {
   return row.requested_by === meId ? 'requested' : 'incoming';
 }
 
-// Same "broken if the gap is longer than the lives" rule as the leaderboard.
-function currentStreak(p) {
+// Same "broken if the gap is longer than the lives" rule as the leaderboard,
+// on that hunter's own calendar (`tz`).
+function currentStreak(p, tz) {
   if (!p) return 0;
-  const { missedDays, coveredByLives } = computeGap(p, getISTDateOnly());
+  const { missedDays, coveredByLives } = computeGap(p, getLocalDateOnly(tz));
   return missedDays > 0 && !coveredByLives ? 0 : p.daily_streak;
 }
 
-function toCard(u, relationship, row) {
+function toCard(u, relationship, row, tz) {
   const p = u.user_progression;
   const totalXp = p?.total_xp ?? 0;
   const { level, rankName } = getLevelInfo(totalXp);
@@ -130,7 +132,7 @@ function toCard(u, relationship, row) {
     level,
     rankName,
     totalXp,
-    streak:        currentStreak(p),
+    streak:        currentStreak(p, tz),
     longestStreak: p?.longest_streak ?? 0,
     joinedAt:      u.created_at,
     friendsSince:  relationship === 'friends' ? row?.accepted_at ?? null : null,
@@ -157,7 +159,7 @@ export async function getCard(meId, { userId, code } = {}) {
     other = await prisma.users.findUnique({ where: { id: BigInt(userId) }, select: PROFILE_SELECT });
   }
   if (other && other.id === me) {
-    return toCard(other, 'self', null);
+    return toCard(other, 'self', null, await getUserTimezone(other.id));
   }
   if (!isActiveHunter(other)) throw new Error('USER_NOT_FOUND');
 
@@ -168,7 +170,7 @@ export async function getCard(meId, { userId, code } = {}) {
   const hidden = other.user_settings?.leaderboard_visible === false;
   if (code === undefined && hidden && relationship === 'none') throw new Error('USER_NOT_FOUND');
 
-  return toCard(other, relationship, row);
+  return toCard(other, relationship, row, await getUserTimezone(other.id));
 }
 
 // Loads both sides for a write, enforcing who can be asked.
@@ -201,9 +203,10 @@ async function notify(userId, type, title, body, data, dedupeKey) {
   }
 }
 
-function notifyRequest(toId, fromId, fromName) {
-  // One push per sender per receiver per day, so cancel-and-resend can't spam.
-  const day = getISTDateOnly().toISOString().slice(0, 10);
+async function notifyRequest(toId, fromId, fromName) {
+  // One push per sender per receiver per day (the receiver's), so
+  // cancel-and-resend can't spam.
+  const day = (await getUserToday(toId)).toISOString().slice(0, 10);
   return notify(
     toId, 'FRIEND_REQUEST',
     `⚔️ Hunter ${fromName} seeks an alliance`,
@@ -213,10 +216,10 @@ function notifyRequest(toId, fromId, fromName) {
   );
 }
 
-function notifyAccepted(toId, byId, byName, viaLink = false) {
+async function notifyAccepted(toId, byId, byName, viaLink = false) {
   // Per day, so re-friending after a removal still tells them (an all-time
   // key silently dropped it), while a double tap can't push twice.
-  const day = getISTDateOnly().toISOString().slice(0, 10);
+  const day = (await getUserToday(toId)).toISOString().slice(0, 10);
   return notify(
     toId, 'FRIEND_ACCEPTED',
     viaLink ? `⚔️ Hunter ${byName} answered your summons` : `⚔️ Hunter ${byName} joined your party`,
@@ -393,10 +396,11 @@ export async function listBlocked(meId) {
   if (rows.length === 0) return { blocked: [], count: 0 };
   const users = await prisma.users.findMany({ where: { id: { in: rows.map((r) => r.blocked_id) } }, select: PROFILE_SELECT });
   const byId = new Map(users.map((u) => [u.id.toString(), u]));
+  const zones = await getUserTimezones(users.map((u) => u.id));
   const blocked = rows
     .map((r) => ({ row: r, user: byId.get(r.blocked_id.toString()) }))
     .filter(({ user }) => Boolean(user))
-    .map(({ row, user }) => ({ ...toCard(user, 'blocked', null), blockedAt: row.created_at }));
+    .map(({ row, user }) => ({ ...toCard(user, 'blocked', null, zones.get(user.id.toString())), blockedAt: row.created_at }));
   return { blocked, count: blocked.length };
 }
 
@@ -423,10 +427,11 @@ export async function listIncomingRequests(meId) {
   ]);
   const blocked = new Set(blocks.map((b) => (b.blocker_id === me ? b.blocked_id : b.blocker_id).toString()));
   const byId = new Map(users.map((u) => [u.id.toString(), u]));
+  const zones = await getUserTimezones(users.map((u) => u.id));
 
   const requests = rows
     .map((r) => ({ row: r, user: byId.get(r.requested_by.toString()) }))
     .filter(({ user }) => isActiveHunter(user) && !blocked.has(user.id.toString()))
-    .map(({ row, user }) => ({ ...toCard(user, 'incoming', row), requestedAt: row.created_at }));
+    .map(({ row, user }) => ({ ...toCard(user, 'incoming', row, zones.get(user.id.toString())), requestedAt: row.created_at }));
   return { requests, count: requests.length };
 }

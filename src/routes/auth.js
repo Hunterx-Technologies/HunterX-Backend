@@ -3,7 +3,7 @@
 import { Router }         from 'express';
 import { authLimiter, refreshLimiter } from '../middleware/rateLimiter.js';
 import { verifyToken }    from '../middleware/auth.js';
-import { success, error } from '../utils/response.js';
+import { success, error, accountSuspended } from '../utils/response.js';
 import {
   isValidEmail,
   isValidPassword,
@@ -190,7 +190,7 @@ router.post('/login', authLimiter, async (req, res, next) => {
     if (err.message === 'LOGIN_LOCKED')
       return error(res, 'Too many failed attempts. Try again in 15 minutes or reset your password.', 429, 'LOGIN_LOCKED');
     if (err.message === 'ACCOUNT_BANNED')
-      return error(res, 'Your account has been suspended', 403);
+      return accountSuspended(res, err.banReason);
     next(err);
   }
 });
@@ -232,7 +232,7 @@ router.post('/google', authLimiter, async (req, res, next) => {
 
   } catch (err) {
     if (err.message === 'ACCOUNT_BANNED')
-      return error(res, 'Your account has been suspended', 403);
+      return accountSuspended(res, err.banReason);
     if (err.message === 'EMAIL_LINK_UNVERIFIED')
       return error(res, 'An account with this email already exists. Log in with your email and password first, then you can use this sign-in.', 409, 'EMAIL_LINK_UNVERIFIED');
     if (err.message === 'INVALID_GOOGLE_TOKEN')
@@ -282,7 +282,7 @@ router.post('/apple', authLimiter, async (req, res, next) => {
 
   } catch (err) {
     if (err.message === 'ACCOUNT_BANNED')
-      return error(res, 'Your account has been suspended', 403);
+      return accountSuspended(res, err.banReason);
     if (err.message === 'EMAIL_LINK_UNVERIFIED')
       return error(res, 'An account with this email already exists. Log in with your email and password first, then you can use this sign-in.', 409, 'EMAIL_LINK_UNVERIFIED');
     if (err.message === 'INVALID_APPLE_TOKEN')
@@ -317,7 +317,7 @@ router.post('/refresh', refreshLimiter, async (req, res, next) => {
     if (err.name === 'JsonWebTokenError' || err.message === 'TOKEN_REVOKED')
       return error(res, 'Invalid refresh token — please login again', 401);
     if (err.message === 'ACCOUNT_BANNED')
-      return error(res, 'Your account has been suspended', 403);
+      return accountSuspended(res, err.banReason);
     next(err);
   }
 });

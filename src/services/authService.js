@@ -19,7 +19,7 @@ import { createAccountOtp, consumeAccountOtp, OTP_PURPOSES } from './accountOtpS
 import { allowCodeEmail, isLoginLocked, recordLoginFailure, clearLoginFailures } from '../utils/throttle.js';
 import { brandedEmail, escapeHtml } from '../utils/emailTemplates.js';
 import { sendMail } from '../utils/mailer.js';
-import { getISTDateOnly }   from '../utils/helpers.js';
+import { getUserToday }     from '../utils/userClock.js';
 import { exchangeAppleAuthorizationCode } from './appleTokenService.js';
 import {
   generateHunterId,
@@ -35,6 +35,13 @@ import {
   isValidEmail,
   isStrongPassword,
 } from '../utils/helpers.js';
+
+// ACCOUNT_BANNED, carrying the admin's reason for the app's suspended screen.
+function bannedError(user) {
+  const err = new Error('ACCOUNT_BANNED');
+  err.banReason = user?.ban_reason ?? null;
+  return err;
+}
 import { getLevelRows } from './levelsCache.js';
 
 // Expo/React Native apps get Google ID tokens issued for different
@@ -328,7 +335,7 @@ async function processOnboarding(userId, answers, routineTaskIds = []) {
   // the nightly cron. Never let an assignment hiccup fail onboarding —
   // the request-time fallback (trigger C) covers the gap if this fails.
   try {
-    await assignDailyTasks(bUserId, getISTDateOnly());
+    await assignDailyTasks(bUserId, await getUserToday(bUserId));
   } catch (err) {
     logError(`Task assignment on onboarding failed for user ${bUserId}: ${err.message}`);
   }
@@ -736,7 +743,7 @@ export async function loginWithEmail(rawEmail, password) {
     await recordLoginFailure(email);
     throw new Error('INVALID_CREDENTIALS');
   }
-  if (user.is_banned) throw new Error('ACCOUNT_BANNED');
+  if (user.is_banned) throw bannedError(user);
 
   await clearLoginFailures(email);
   const tokens = await issueSession(user);
@@ -785,7 +792,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
     const user = await prisma.users.findUnique({
       where: { id: existingProvider.user_id },
     });
-    if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
+    if (!user || user.is_banned) throw bannedError(user);
     await markEmailVerifiedIfMatches(user, email);
     const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
@@ -795,7 +802,7 @@ export async function loginWithGoogle(idToken, onboarding = [], referralCode = n
   if (email) {
     const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
-      if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
+      if (existingByEmail.is_banned) throw bannedError(existingByEmail);
       // Only into an account whose own email was proven: an address
       // merely typed onto an account must not capture this sign-in.
       if (!existingByEmail.email_verified_at) throw new Error('EMAIL_LINK_UNVERIFIED');
@@ -870,7 +877,7 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
     const user = await prisma.users.findUnique({
       where: { id: existingProvider.user_id },
     });
-    if (!user || user.is_banned) throw new Error('ACCOUNT_BANNED');
+    if (!user || user.is_banned) throw bannedError(user);
     await markEmailVerifiedIfMatches(user, email);
     const tokens = await issueSession(user);
     return { user: sanitizeUser(user), ...tokens, isNew: false };
@@ -880,7 +887,7 @@ export async function loginWithApple(idToken, nonce, onboarding = [], referralCo
   if (email) {
     const existingByEmail = await findUserByEmail(email);
     if (existingByEmail) {
-      if (existingByEmail.is_banned) throw new Error('ACCOUNT_BANNED');
+      if (existingByEmail.is_banned) throw bannedError(existingByEmail);
       if (!existingByEmail.email_verified_at) throw new Error('EMAIL_LINK_UNVERIFIED');
       const linkedProvider = await prisma.auth_providers.create({
         data: {

@@ -7,6 +7,8 @@ import { success, error }        from '../utils/response.js';
 import { isValidEmail }          from '../utils/helpers.js';
 import * as accountDeletion      from '../services/accountDeletionService.js';
 import { lookupReferralCode }    from '../services/referralService.js';
+import { isValidTimeZone } from '../utils/timezone.js';
+import { getLocalDateOnly } from '../utils/userClock.js';
 import { listRoutineTasks }      from '../services/routineTaskService.js';
 
 const router = Router();
@@ -31,7 +33,8 @@ router.get('/referral/:code', referralLookupLimiter, async (req, res, next) => {
 // Picks are sent with sign-up as routine_task_ids.
 router.get('/routine-tasks', async (req, res, next) => {
   try {
-    const tasks = await listRoutineTasks();
+    const tz = req.headers['x-timezone'];
+    const tasks = await listRoutineTasks(null, isValidTimeZone(tz) ? getLocalDateOnly(tz) : undefined);
     return success(res, { tasks }, 'Routine tasks fetched');
   } catch (err) {
     next(err);

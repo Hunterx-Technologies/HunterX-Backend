@@ -41,11 +41,11 @@ const byName = (name) => tasks().find((t) => t.name === name);
 
 after(() => tasks().forEach((t) => t.destroy()));
 
-test('all seven jobs are registered once, on UTC', () => {
+test('all eight jobs are registered once, on UTC', () => {
   const names = tasks().map((t) => t.name).sort();
   assert.deepEqual(names, [
-    'Account housekeeping', 'Broadcast scheduler', 'Leaderboard nightly', 'Nightly task assignment',
-    'Notification scheduler', 'Push dispatch', 'Push receipt check',
+    'Account housekeeping', 'Broadcast scheduler', 'Leaderboard nightly', 'Local midnight',
+    'Nightly housekeeping', 'Notification scheduler', 'Push dispatch', 'Push receipt check',
   ]);
   assert.equal(CRON_TIMEZONE, 'UTC');
 });
@@ -57,9 +57,11 @@ test('every expression is valid', () => {
 });
 
 test('nightly jobs land on their documented IST times even on an IST host', () => {
-  const assign = byName('Nightly task assignment').getNextRun();
-  assert.equal(assign.getUTCHours(), 19); // 00:30 IST
-  assert.equal(assign.getUTCMinutes(), 0);
+  const housekeeping = byName('Nightly housekeeping').getNextRun();
+  assert.equal(housekeeping.getUTCHours(), 19); // 00:30 IST
+  assert.equal(housekeeping.getUTCMinutes(), 0);
+  // Every user's local midnight (whole-hour, :30 and :45 zones) is a UTC quarter-hour.
+  assert.equal(byName('Local midnight').getNextRun().getUTCMinutes() % 15, 0);
   const board = byName('Leaderboard nightly').getNextRun();
   assert.equal(board.getUTCHours(), 21); // 03:00 IST
   assert.equal(board.getUTCMinutes(), 30);

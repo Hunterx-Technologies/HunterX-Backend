@@ -28,9 +28,10 @@ mock.module(new URL('../src/services/taskAssignmentService.js', import.meta.url)
 mock.module(new URL('../src/services/notificationService.js', import.meta.url).href, {
   namedExports: { createNotification: async () => null },
 });
-const helpers = await import('../src/utils/helpers.js');
-mock.module(new URL('../src/utils/helpers.js', import.meta.url).href, {
-  namedExports: { ...helpers, getISTDateOnly: () => today },
+// "Today" for the buyer (and for the sale-end sweep) is whatever the test sets.
+const clock = await import('../src/utils/userClock.js');
+mock.module(new URL('../src/utils/userClock.js', import.meta.url).href, {
+  namedExports: { ...clock, getUserToday: async () => today, getLocalDateOnly: () => today },
 });
 
 const { accessEndFor, markPurchasePaid, deactivateExpiredPaidTasks } =

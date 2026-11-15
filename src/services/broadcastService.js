@@ -8,14 +8,15 @@
 //
 // Audiences:
 //   all       — every onboarded, non-banned USER
-//   inactive  — no active day in the last `inactive_days` IST days (or never)
+//   inactive  — no active day in the last `inactive_days` days of the
+//               hunter's own calendar (or never)
 // Users with notify_all / notify_announcements off are excluded.
 
 import { randomUUID } from 'node:crypto';
 import prisma from '../config/prisma.js';
 import { computeDeliverAfter } from './notificationService.js';
 import { isNotificationEnabled } from './userSettingsService.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getLocalDateOnly } from '../utils/userClock.js';
 import { DEFAULT_TIMEZONE } from '../utils/timezone.js';
 import { localToUtc } from '../utils/broadcastSchedule.js';
 import { pageInfo } from '../utils/pageInfo.js';
@@ -53,7 +54,9 @@ function audienceWhere({ audience, days }) {
   // Accounts waiting to be deleted get no broadcasts (not even in the inbox).
   const where = { onboarding_done: true, is_banned: false, delete_at: null, role: 'USER' };
   if (audience === 'inactive') {
-    const cutoff = getISTDateOnly(-days);
+    // Widest cutoff (UTC+14, the first zone into any day), so the query is a
+    // superset; resolveRecipients then applies each hunter's own cutoff.
+    const cutoff = getLocalDateOnly('Etc/GMT-14', -days);
     where.OR = [
       { user_progression: { is: null } },
       { user_progression: { is: { last_active_date: null } } },
@@ -69,10 +72,20 @@ async function resolveRecipients(input) {
     select: {
       id: true,
       user_settings: { select: { notify_all: true, notify_announcements: true, timezone: true } },
+      user_progression: { select: { last_active_date: true } },
       _count: { select: { user_push_tokens: true } },
     },
   });
-  return users.filter((u) => !u.user_settings || isNotificationEnabled(u.user_settings, 'BROADCAST'));
+  return users.filter((u) => {
+    if (u.user_settings && !isNotificationEnabled(u.user_settings, 'BROADCAST')) return false;
+    if (input.audience !== 'inactive') return true;
+    // last_active_date is on the hunter's calendar: compare with their own
+    // "N days ago".
+    const last = u.user_progression?.last_active_date;
+    if (!last) return true;
+    const cutoff = getLocalDateOnly(u.user_settings?.timezone || DEFAULT_TIMEZONE, -input.days);
+    return last.getTime() < cutoff.getTime();
+  });
 }
 
 // dry_run: true → counts only, nothing written.

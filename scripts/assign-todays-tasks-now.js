@@ -1,7 +1,8 @@
 // scripts/assign-todays-tasks-now.js
 //
 // Backfills task_schedule for TODAY for every active, onboarded user —
-// same core loop as src/cron/midnight.js#runNightlyTaskAssignment, but
+// same core loop as src/cron/midnight.js#runLocalMidnight (each user's own
+// calendar day), but
 // callable standalone (importing midnight.js directly would also
 // register its node-cron schedule in this process).
 //
@@ -18,11 +19,9 @@
 import 'dotenv/config'; // standalone script — src/index.js normally does this
 import prisma from '../src/config/prisma.js';
 import { assignDailyTasks } from '../src/services/taskAssignmentService.js';
-import { getISTDateOnly } from '../src/utils/helpers.js';
+import { getUserToday } from '../src/utils/userClock.js';
 
 async function main() {
-  const today = getISTDateOnly();
-
   const users = await prisma.users.findMany({
     where:  { onboarding_done: true, is_banned: false },
     select: { id: true },
@@ -33,7 +32,7 @@ async function main() {
 
   for (const user of users) {
     try {
-      const { assigned } = await assignDailyTasks(user.id, today);
+      const { assigned } = await assignDailyTasks(user.id, await getUserToday(user.id));
       assignedTotal += assigned;
     } catch (err) {
       failedCount += 1;

@@ -2,12 +2,13 @@
 //
 // Every dashboard endpoint takes either
 //   ?range=7d | 30d | 60d | 90d | 6m | 1y | 3y     (ending today), or
-//   ?from=YYYY-MM-DD&to=YYYY-MM-DD                 (IST calendar days, inclusive)
-// and defaults to the last 7 days. Days are IST, like the rest of the app.
+//   ?from=YYYY-MM-DD&to=YYYY-MM-DD                 (calendar days, inclusive)
+// and defaults to the last 7 days. Days are on the admin's calendar — their
+// browser's zone (utils/adminClock.js).
 
-import { getISTDateOnly, parseDateOnly } from './helpers.js';
+import { parseDateOnly } from './helpers.js';
+import { adminDayStart, getAdminToday } from './adminClock.js';
 
-const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 export const DEFAULT_RANGE = '7d';
@@ -39,18 +40,18 @@ function monthsBefore(to, months) {
 
 /**
  * Resolves the query into a range. All Date values are UTC-midnight dates
- * standing for IST days (as getISTDateOnly returns), except *Utc / endAt,
+ * standing for admin-calendar days, except *Utc / endAt,
  * which are real instants for comparing against UTC timestamp columns.
  *
- *   from, to          first / last IST day (inclusive)
+ *   from, to          first / last day (inclusive)
  *   days              number of days
- *   startUtc, endUtc  [start, end) as instants: IST midnight of from / of to+1
+ *   startUtc, endUtc  [start, end) as instants: the admin's midnight of from / of to+1
  *   endAt             the range's "as of" moment for snapshots: now when the
  *                     range ends today, else the last instant of `to`
  *   prev              the same-length period just before (for % changes)
  */
 export function resolveRange(query = {}) {
-  const today = getISTDateOnly();
+  const today = getAdminToday();
   let from;
   let to;
   let key;
@@ -76,8 +77,8 @@ export function resolveRange(query = {}) {
 
 function build(key, from, to, today) {
   const days = Math.round((to - from) / DAY_MS) + 1;
-  const startUtc = new Date(from.getTime() - IST_OFFSET_MS);
-  const endUtc = new Date(addDays(to, 1).getTime() - IST_OFFSET_MS);
+  const startUtc = adminDayStart(from);
+  const endUtc = adminDayStart(addDays(to, 1));
   const now = new Date();
   const endAt = to.getTime() === today.getTime() ? now : new Date(endUtc.getTime() - 1);
   const range = { key, from, to, days, startUtc, endUtc, endAt, fromKey: dateKey(from), toKey: dateKey(to) };
@@ -91,7 +92,7 @@ function build(key, from, to, today) {
 /**
  * Splits the range into chart buckets: one per day up to ~3 months, one per
  * week up to ~13 months, else one per calendar month. Each bucket has
- * { key: first day 'YYYY-MM-DD', from, to } (IST days, inclusive).
+ * { key: first day 'YYYY-MM-DD', from, to } (admin-calendar days, inclusive).
  */
 export function rangeBuckets(range) {
   const unit = range.days <= 92 ? 'day' : range.days <= 400 ? 'week' : 'month';

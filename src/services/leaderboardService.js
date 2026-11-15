@@ -11,7 +11,7 @@
 import prisma from '../config/prisma.js';
 import redis, { isRedisUp } from '../config/redis.js';
 import { logError, info } from '../utils/logger.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getLocalDateOnly, getUserTimezones } from '../utils/userClock.js';
 import { computeGap } from './streakService.js';
 import { getFriendIds, getBlockedIds } from './friendService.js';
 import {
@@ -236,8 +236,9 @@ function decodeCursor(str) {
 // ─────────────────────────────────────────────────────────────
 
 // Hunters I blocked are left out of my global leaderboard (until I unblock
-// them). Everyone else keeps their real rank, so the numbers can skip
-// (2, 4…) where a blocked hunter sits — the ranks match what others see.
+// them), and the ranks I see close up around them: everyone below a blocked
+// hunter moves up one, so my list reads 1, 2, 3… with no gaps, and my own
+// rank / tier count the same way. Other hunters' leaderboards don't change.
 // Each page reads `blocked.size` extra rows so it still fills to `limit`
 // (at most that many of them can be blocked), and its cursor resumes after
 // the last row shown. The Friends scope needs no filter: a block ends the
@@ -276,8 +277,10 @@ export async function attachStreaks(entries, me, meId) {
       where:  { user_id: { in: ids.map((id) => BigInt(id)) } },
       select: { user_id: true, daily_streak: true, streak_lives: true, last_active_date: true },
     });
-    const today = getISTDateOnly();
+    // Each hunter's streak is judged on their own calendar day.
+    const zones = await getUserTimezones(rows.map((r) => r.user_id));
     const streakById = new Map(rows.map((r) => {
+      const today = getLocalDateOnly(zones.get(r.user_id.toString()));
       const { missedDays, coveredByLives } = computeGap(r, today);
       return [r.user_id.toString(), missedDays > 0 && !coveredByLives ? 0 : r.daily_streak];
     }));
@@ -298,7 +301,32 @@ function meStatusFromSnapshot(meSnapshot) {
 
 // ── Redis path (global) ─────────────────────────────────────
 
-async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked = new Set() }) {
+// Members of the Redis set whose account is gone or no longer eligible —
+// deleted outside the normal purge (scripts, manual DB edits) or while Redis
+// was down, so removeLeaderboardMember never reached Redis. They're removed
+// the moment a page would show them instead of waiting for the 03:00 IST
+// rebuild. Returns how many were removed.
+async function pruneStaleMembers(key, members) {
+  if (members.length === 0) return 0;
+  const rows = await prisma.users.findMany({
+    where:  { id: { in: members.map((m) => BigInt(m)) }, ...eligibilityWhere() },
+    select: { id: true },
+  });
+  const live = new Set(rows.map((r) => r.id.toString()));
+  const stale = members.filter((m) => !live.has(m));
+  if (stale.length === 0) return 0;
+
+  const pipeline = redis.pipeline();
+  for (const m of stale) {
+    pipeline.zrem(key, m);
+    pipeline.del(REDIS_KEYS.userHash(m));
+  }
+  await pipeline.exec();
+  info(`Leaderboard: removed ${stale.length} stale member(s) from ${key}: ${stale.join(', ')}`);
+  return stale.length;
+}
+
+async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked = new Set(), pruned = false }) {
   const key = REDIS_KEYS[scope];
   const meMember = meId.toString();
   const isFirstPage = !cursorStr;
@@ -316,6 +344,10 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, 
   let me = null;
   // One past a full page, plus room for every blocked hunter it may hold.
   const fetchCount = limit + 1 + blocked.size;
+  // Where each blocked hunter sits in the real order (1-based), so the ranks
+  // shown can skip over them. Unranked blocked hunters don't count.
+  const blockedRanks = await realRanksOf(key, blocked);
+  const closeGaps = (realRank) => realRank - blockedRanks.filter((r) => r < realRank).length;
 
   if (isFirstPage) {
     const pipeline = redis.pipeline();
@@ -330,11 +362,11 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, 
     const [, meScoreRaw] = results[1];
     const [, meRankRaw] = results[2];
     const [, totalRankedRaw] = results[3];
-    const totalRanked = Number(totalRankedRaw) || 0;
+    const totalRanked = Math.max(0, (Number(totalRankedRaw) || 0) - blockedRanks.length);
 
     if (meScoreRaw != null) {
       const totalXp = decodeXpFromScore(meScoreRaw);
-      const rank = Number(meRankRaw) + 1;
+      const rank = closeGaps(Number(meRankRaw) + 1);
       const { level, rankName } = getLevelInfo(totalXp);
       const topPercent = totalRanked > 0 ? Math.max(1, Math.ceil((rank / totalRanked) * 100)) : null;
       me = {
@@ -357,16 +389,23 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, 
   const pairs = [];
   for (let i = 0; i < rawPairs.length; i += 2) pairs.push([rawPairs[i], Number(rawPairs[i + 1])]);
 
+  // Never show a deleted or no-longer-eligible hunter: drop them from Redis
+  // and read the page again, so ranks and totals come out right too. Once
+  // per request — the second read can't find the same ones.
+  if (!pruned && await pruneStaleMembers(key, pairs.map(([member]) => member)) > 0) {
+    return getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, blocked, pruned: true });
+  }
+
   // Ranks come from the unfiltered order, before blocked hunters are dropped.
   let firstRank = null;
   if (!isFirstPage && pairs.length > 0) {
     const rankRaw = await redis.zrevrank(key, pairs[0][0]);
     firstRank = rankRaw != null ? Number(rankRaw) + 1 : null;
   }
-  const ranked = pairs.map(([member, score], i) => ({
-    member, score,
-    rank: isFirstPage ? i + 1 : (firstRank != null ? firstRank + i : null),
-  }));
+  const ranked = pairs.map(([member, score], i) => {
+    const realRank = isFirstPage ? i + 1 : (firstRank != null ? firstRank + i : null);
+    return { member, score, rank: realRank != null ? closeGaps(realRank) : null };
+  });
 
   const shown = ranked.filter((r) => !blocked.has(r.member));
   const hasMore = shown.length > limit;
@@ -385,6 +424,19 @@ async function getRedisLeaderboard({ meId, meSnapshot, scope, cursorStr, limit, 
   const emptyState = isFirstPage && entries.length === 0 ? 'no_entries' : null;
 
   return { entries, me, nextCursor, emptyState };
+}
+
+// Real 1-based positions in the sorted set of the given members (those not
+// on it are skipped), ascending.
+async function realRanksOf(key, members) {
+  if (members.size === 0) return [];
+  const pipeline = redis.pipeline();
+  for (const m of members) pipeline.zrevrank(key, m);
+  const results = await pipeline.exec();
+  return results
+    .filter(([err, r]) => !err && r != null)
+    .map(([, r]) => Number(r) + 1)
+    .sort((a, b) => a - b);
 }
 
 async function attachDisplayData(rows) {
@@ -489,11 +541,11 @@ async function getPostgresFallbackLeaderboard({ meId, meSnapshot, scope, cursorS
     },
   });
 
-  // Ranks (and the cursor's offset) count blocked hunters too; they're
-  // just not shown.
+  // Blocked hunters are dropped before numbering, so ranks (and the
+  // cursor's offset) count only the hunters shown — no gaps.
   const shown = rows
-    .map((r, i) => ({ r, rank: offset + i + 1 }))
-    .filter(({ r }) => !blocked.has(r.id.toString()));
+    .filter((r) => !blocked.has(r.id.toString()))
+    .map((r, i) => ({ r, rank: offset + i + 1 }));
   const hasMore = shown.length > limit;
   const pageRows = shown.slice(0, limit);
   const page = pageRows.map(({ r }) => r);

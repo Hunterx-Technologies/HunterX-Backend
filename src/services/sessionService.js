@@ -70,7 +70,11 @@ export async function rotateSession(refreshToken) {
 
   const user = await prisma.users.findUnique({ where: { id: userId } });
   if (!user) throw new Error('USER_NOT_FOUND');
-  if (user.is_banned) throw new Error('ACCOUNT_BANNED');
+  if (user.is_banned) {
+    const err = new Error('ACCOUNT_BANNED');
+    err.banReason = user.ban_reason ?? null;
+    throw err;
+  }
   // Issued before the last password change / reset — revoked. Tokens
   // minted before token_version existed carry no `tv` and count as 0.
   if ((decoded.tv ?? 0) !== user.token_version) throw new Error('TOKEN_REVOKED');

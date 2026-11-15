@@ -147,3 +147,24 @@ test('the code from the email confirms the change and marks the email verified',
   assert.equal(fake.models.auth_providers.rows[0].provider_id, 'mine@example.com');
   assert.equal(sent.at(-1).to, 'attacker@example.com', 'old address is told');
 });
+
+test('a banned hunter cannot sign in by password or Google, and the reason comes along', async () => {
+  seedUser({ email: 'banned@gmail.com', is_banned: true, ban_reason: 'Cheating on quests' });
+  await assert.rejects(auth.loginWithEmail('banned@gmail.com', PASSWORD), (err) => {
+    assert.equal(err.message, 'ACCOUNT_BANNED');
+    assert.equal(err.banReason, 'Cheating on quests');
+    return true;
+  });
+  fake.models.auth_providers.rows.push({ id: 11n, user_id: 1n, provider: 'GOOGLE', provider_id: 'google-banned' });
+  googlePayload = { sub: 'google-banned', email: 'banned@gmail.com', email_verified: true, name: 'Banned' };
+  await assert.rejects(auth.loginWithGoogle('token'), (err) => err.message === 'ACCOUNT_BANNED' && err.banReason === 'Cheating on quests');
+});
+
+test('the suspended response tells the app why', async () => {
+  const { accountSuspended } = await import('../src/utils/response.js');
+  let status, body;
+  const res = { status: (s) => { status = s; return res; }, json: (b) => { body = b; return res; } };
+  accountSuspended(res, 'Cheating on quests');
+  assert.equal(status, 403);
+  assert.deepEqual(body.error, { code: 'ACCOUNT_SUSPENDED', message: 'Your account has been suspended', reason: 'Cheating on quests' });
+});

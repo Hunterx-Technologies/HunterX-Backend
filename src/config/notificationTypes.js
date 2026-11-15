@@ -49,7 +49,8 @@ export const NOTIFICATION_TYPES = {
 
 // The only types still pushed while an account waits to be deleted —
 // everything else (reminders, streaks, broadcasts…) is held back.
-export const PENDING_DELETION_TYPES = new Set(['ACCOUNT_DELETION', 'ACCOUNT_DELETION_REMINDER']);
+// ACCOUNT_UPDATE too: a ban (or unban) must reach the hunter whatever else is held back.
+export const PENDING_DELETION_TYPES = new Set(['ACCOUNT_DELETION', 'ACCOUNT_DELETION_REMINDER', 'ACCOUNT_UPDATE']);
 
 const FALLBACK = { setting: null, channel: 'system', url: '/(tabs)', capped: false, quietHours: true };
 

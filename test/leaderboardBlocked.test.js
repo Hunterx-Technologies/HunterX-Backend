@@ -1,6 +1,6 @@
-// Hunters I blocked are left out of my global leaderboard; everyone else
-// keeps their real rank, pages still fill, and paging doesn't skip or
-// repeat anyone. Exercised on the Postgres path (no Redis in tests).
+// Hunters I blocked are left out of my global leaderboard; the ranks close
+// up around them (1, 2, 3… with no gaps), pages still fill, and paging
+// doesn't skip or repeat anyone. Exercised on the Postgres path (no Redis in tests).
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createFakePrisma } from './support/fakePrisma.js';
@@ -49,13 +49,13 @@ test('no blocks: unchanged', async () => {
   assert.deepEqual(pages.flat().map(([, r]) => r), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 });
 
-test('blocked hunters are hidden, others keep their real rank, pages stay full', async () => {
+test('blocked hunters are hidden, ranks close up with no gaps, pages stay full', async () => {
   block(2, 3, 6);
   const pages = await readAll(3);
   assert.deepEqual(pages, [
-    [['1', 1], ['4', 4], ['5', 5]],
-    [['7', 7], ['8', 8], ['9', 9]],
-    [['10', 10]],
+    [['1', 1], ['4', 2], ['5', 3]],
+    [['7', 4], ['8', 5], ['9', 6]],
+    [['10', 7]],
   ]);
 });
 

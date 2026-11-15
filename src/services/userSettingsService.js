@@ -4,6 +4,7 @@ import prisma from "../config/prisma.js";
 import { syncLeaderboardMember } from "./leaderboardService.js";
 import { getNotificationTypeConfig } from "../config/notificationTypes.js";
 import { isValidTimeZone, isValidTimeOfDay, DEFAULT_TIMEZONE } from "../utils/timezone.js";
+import { forgetUserTimezone } from "../utils/userClock.js";
 
 function formatSettings(settings) {
   if (!settings) return null;
@@ -130,6 +131,8 @@ export async function updateUserSettings(userId, payload) {
     },
     update: updateData,
   });
+
+  if (updateData.timezone !== undefined) forgetUserTimezone(bUserId);
 
   if (updateData.leaderboard_visible !== undefined) {
     await syncLeaderboardMember(bUserId);

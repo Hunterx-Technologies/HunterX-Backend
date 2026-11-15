@@ -5,7 +5,8 @@
 // a task completion (see taskService.js#setTaskCompletion) — only for
 // DAILY_FIXED/DAILY_ADMIN tasks with status COMPLETED or PARTIAL; WEEKLY
 // tasks and SKIPPED never feed it. Completing/partially-completing at
-// least ONE daily task on a given IST calendar day maintains that day; a
+// least ONE daily task on a given calendar day (the hunter's own,
+// see utils/userClock.js) maintains that day; a
 // day only ever counts once, gated by user_progression.last_active_date.
 //
 // ── Streak lives ────────────────────────────────────────────────
@@ -52,7 +53,7 @@
 // whatever was banked has already been spent trying.
 
 import prisma from '../config/prisma.js';
-import { getISTDateOnly } from '../utils/helpers.js';
+import { getUserTimezone, getLocalDateOnly, localDayOf } from '../utils/userClock.js';
 import { grantStreakMilestoneReward, checkAndAwardStreakMilestoneBadge, grantTriggerCard } from './rewardService.js';
 import { createNotification } from './notificationService.js';
 
@@ -87,13 +88,16 @@ export function computeGap(progression, today) {
 // streak badge was just earned, and the user_rewards rows (scratch cards)
 // it granted.
 export async function bumpDailyStreak(tx, userId) {
-  const today = getISTDateOnly();
+  const today = getLocalDateOnly(await getUserTimezone(userId));
   const unlocked = { streak_milestone: null, rewards: [] };
 
   const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
   const { daysSince, missedDays, lives, coveredByLives } = computeGap(progression, today);
 
-  if (daysSince === 0) return unlocked; // already counted today — no-op
+  // Already counted today — no-op. Negative too: the hunter's today is
+  // behind the last active day (flew west, or a zone behind IST right after
+  // days moved to local time), which must never read as a broken streak.
+  if (daysSince !== null && daysSince <= 0) return unlocked;
 
   const continuing    = daysSince === 1 || coveredByLives;
   const currentStreak = progression?.daily_streak ?? 0;
@@ -175,7 +179,7 @@ export async function bumpDailyStreak(tx, userId) {
 // updates are conditional on the state just read, so concurrent reads
 // apply (and record) a gap once. Returns { progression, event }.
 async function applyGap(userId) {
-  const today       = getISTDateOnly();
+  const today       = getLocalDateOnly(await getUserTimezone(userId));
   const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
   if (!progression) return { progression, event: null };
   // Frozen while the account waits to be deleted: quests are refused then,
@@ -231,16 +235,10 @@ async function isPendingDeletion(userId) {
   return Boolean(user?.delete_at);
 }
 
-// The IST calendar day `date` falls on, as a UTC-midnight Date (the
-// getISTDateOnly convention).
-function istDayOf(date) {
-  const ist = new Date(date.getTime() + 5.5 * 60 * 60 * 1000);
-  return new Date(Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()));
-}
 
 /**
  * "Keep my account": the streak was frozen from `pausedAt` (the deletion
- * request) until now, so last_active_date moves forward by the IST days
+ * request) until now, so last_active_date moves forward by the days
  * spent pending — never past yesterday, never backwards. A gap that
  * already existed before the request is kept as it was (not forgiven);
  * with no request time on record it falls back to yesterday. Lives and
@@ -250,10 +248,11 @@ export async function shiftStreakPastPause(tx, userId, pausedAt) {
   const progression = await tx.user_progression.findUnique({ where: { user_id: userId } });
   if (!progression?.last_active_date) return null;
 
-  const today     = getISTDateOnly();
+  const tz        = await getUserTimezone(userId);
+  const today     = getLocalDateOnly(tz);
   const yesterday = new Date(today.getTime() - MS_PER_DAY);
   const last      = progression.last_active_date;
-  const pausedDays = pausedAt ? Math.max(0, daysBetween(istDayOf(new Date(pausedAt)), today)) : Infinity;
+  const pausedDays = pausedAt ? Math.max(0, daysBetween(localDayOf(new Date(pausedAt), tz), today)) : Infinity;
 
   const shifted = pausedDays === Infinity ? yesterday : new Date(last.getTime() + pausedDays * MS_PER_DAY);
   let next = shifted > yesterday ? yesterday : shifted;
@@ -314,7 +313,7 @@ export async function markStreakEventsSeen(userId, ids) {
 // anything today. Reconciles first so an already-unprotected gap reads
 // as a broken (0) streak rather than the stale pre-gap value.
 export async function getStreakRiskStatus(userId) {
-  const today       = getISTDateOnly();
+  const today       = getLocalDateOnly(await getUserTimezone(userId));
   const progression = await reconcileStreak(userId);
   const { missedDays, lives, coveredByLives } = computeGap(progression, today);
   // Pending deletion: frozen (see applyGap), so nothing is at risk.
@@ -348,7 +347,7 @@ export async function getStreakRiskStatus(userId) {
 export async function resolveStreakRisk(userId, action) {
   if (!['USE_LIVES', 'DROP'].includes(action)) throw new Error('INVALID_ACTION');
 
-  const today       = getISTDateOnly();
+  const today       = getLocalDateOnly(await getUserTimezone(userId));
   const progression = await prisma.user_progression.findUnique({ where: { user_id: userId } });
   const { missedDays, coveredByLives } = computeGap(progression, today);
 

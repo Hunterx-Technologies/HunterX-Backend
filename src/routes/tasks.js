@@ -279,6 +279,21 @@ router.post('/streak/events/seen', verifyToken, async (req, res, next) => {
   }
 });
 
+// ── POST /api/tasks/day-complete/seen ─────────────────────
+// The app just showed today's "Day Complete" screen; GET /tasks/today then
+// sends day_complete_seen: true for the rest of the hunter's day, so it isn't
+// shown again (re-clearing the day, re-login, another device).
+// Header: Authorization: Bearer <access_token>
+
+router.post('/day-complete/seen', verifyToken, async (req, res, next) => {
+  try {
+    const data = await taskService.markDayCompleteSeen(req.user.id);
+    return success(res, data, 'Day complete marked seen');
+  } catch (err) {
+    next(err);
+  }
+});
+
 // ── GET /api/tasks/activity ───────────────────────────────
 // Activity metrics + paginated quest logs
 router.get('/activity', verifyToken, async (req, res, next) => {
