@@ -375,6 +375,7 @@ export async function getCouponOverview(query = {}) {
            COUNT(*)::int AS n
     FROM user_rewards
     WHERE ${inRangeSql('assigned_at', r)}
+      AND NOT (trigger_id IS NOT NULL AND coupon_code IS NULL) -- owed, not issued yet
     GROUP BY 1, 2`;
 
   const byTier = new Map(RARITIES.map((t) => [t, { tier: titleCase(t), used: 0, unused: 0, expired: 0 }]));
@@ -418,7 +419,9 @@ function couponCards(now) {
     JOIN users u ON u.id = ur.user_id
     LEFT JOIN reward_pool rp     ON rp.id = ur.pool_id
     LEFT JOIN reward_partners pt ON pt.id = rp.partner_id
-    LEFT JOIN reward_coupons rc  ON rc.id = ur.coupon_id`;
+    LEFT JOIN reward_coupons rc  ON rc.id = ur.coupon_id
+    -- owed cards (earned while out of stock) aren't issued yet
+    WHERE NOT (ur.trigger_id IS NOT NULL AND ur.coupon_code IS NULL)`;
 }
 
 // Events (issued / redeemed / expired) that happened in the range.

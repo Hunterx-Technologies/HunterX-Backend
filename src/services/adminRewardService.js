@@ -18,6 +18,20 @@
 
 import prisma from '../config/prisma.js';
 import { uploadCompressedImage, deleteImages, ownPublicIdFromUrl } from './imageUploadService.js';
+import { fulfillAwaitingCards } from './rewardService.js';
+import { logError } from '../utils/logger.js';
+
+// New or changed stock goes to hunters who earned this reward while it was
+// out of stock, before the admin's response (so its "waiting on stock"
+// count is current). A failure here never fails the admin's save — the
+// 15-minute sweep (cron/rewardRestock.js) retries.
+async function giveStockToWaitingHunters(triggerId) {
+  try {
+    await fulfillAwaitingCards({ triggerId });
+  } catch (err) {
+    logError(`Filling owed reward cards failed for trigger ${triggerId}: ${err.message || err}`);
+  }
+}
 
 const COUPON_IMAGE_FOLDER = 'hunterx/rewards';
 // The app's largest use is the reward details hero, ~400pt wide on 3x screens.
@@ -305,6 +319,7 @@ export async function createCoupon(triggerId, body = {}, image = null, kind = nu
       throw err;
     }
   }
+  await giveStockToWaitingHunters(bTriggerId);
   return serializeWithSiblings(coupon);
 }
 
@@ -342,6 +357,7 @@ export async function updateCoupon(couponId, body = {}, image = null) {
     if (imageId) await deleteImages([imageId]);
   }
 
+  await giveStockToWaitingHunters(existing.trigger_id);
   return serializeWithSiblings(await prisma.reward_coupons.findUnique({ where: { id: bCouponId } }));
 }
 
@@ -393,6 +409,7 @@ export async function updateTrigger(triggerId, body = {}, kind = null) {
     if (err.code === 'P2002') throw new Error('TRIGGER_EXISTS'); // another admin took that value meanwhile
     throw err;
   }
+  if (data.is_active === true) await giveStockToWaitingHunters(trigger.id);
   return (await listTriggers(trigger.kind)).find((t) => t.id === String(trigger.id));
 }
 

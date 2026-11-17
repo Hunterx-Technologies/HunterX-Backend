@@ -25,6 +25,7 @@ import './cron/pushDispatcher.js';     // starts push outbox delivery + receipt 
 import './cron/notificationScheduler.js'; // starts local-time scheduled notifications
 import './cron/broadcastScheduler.js'; // starts admin-scheduled / recurring broadcasts
 import './cron/accountDeletion.js';   // starts the hourly scheduled-deletion purge
+import './cron/rewardRestock.js';     // gives restocked coupons to hunters who were owed a card
 
 const app  = express();
 const PORT = process.env.PORT || 5000;

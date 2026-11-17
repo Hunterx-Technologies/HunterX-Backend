@@ -17,8 +17,13 @@
 // row grants a scratch card. The prize is picked right then, by weight, among the
 // active, in-window, in-stock coupons (pickCoupon) and snapshotted onto
 // the card; stock is claimed with a conditional UPDATE so it can never
-// be over-awarded. If nothing is in stock the card is still granted
-// without a prize and picks again when scratched. The prize never leaves
+// be over-awarded. If nothing is in stock the hunter is owed a card: it's
+// recorded (no prize, "awaiting stock") but they're told nothing — no
+// push, no popup, nothing in the wallet — so nobody is promised a reward
+// that isn't there. When stock comes back (an admin adds or edits a
+// coupon, switches the reward back on, or a coupon's start date arrives),
+// fulfillAwaitingCards hands it out oldest-first and only then sends the
+// push; the app shows the card from that moment. The prize never leaves
 // the server until POST /rewards/:id/scratch (scratchReward) — pushes,
 // the completion response and the unseen list carry the card only.
 
@@ -258,12 +263,48 @@ export function prizeSnapshot(coupon, now = new Date()) {
   };
 }
 
+// A card owed to a hunter who earned it while nothing was in stock. Hidden
+// from the hunter until fulfillAwaitingCards gives it a coupon. (Cards
+// from the old reward_pool have no trigger_id and are never "awaiting".)
+export const AWAITING_STOCK = { trigger_id: { not: null }, coupon_code: null, status: 'ACTIVE' };
+const NOT_AWAITING_STOCK = { NOT: { trigger_id: { not: null }, coupon_code: null } };
+
 const REWARD_PUSH_COPY = {
   STREAK:   (t) => ['🎁 Scratch card unlocked', `Your ${t.value}-day streak earned a scratch card. Scratch it to see what you won.`],
   LEVEL_UP: (t) => ['🎁 Scratch card unlocked', `Reaching Level ${t.value} earned you a scratch card. Scratch it to see what you won.`],
   BIRTHDAY: ()  => ['🎂 Happy Birthday, Hunter!', 'Wishing you a legendary year ahead. Your birthday gift is waiting: tap to claim your reward.'],
   TASK:     (t, { taskTitle } = {}) => ['🎁 Special reward unlocked', `Completing ${taskTitle ? `"${taskTitle}"` : 'that quest'} earned you a special scratch card. Scratch it to see what you won.`],
 };
+
+// Same, for a card that was owed and has just got its coupon (it can be
+// days later, so no "Happy Birthday" out of the blue).
+const LATE_REWARD_PUSH_COPY = {
+  STREAK:   (t) => ['🎁 Scratch card unlocked', `Your ${t.value}-day streak reward is here. Scratch it to see what you won.`],
+  LEVEL_UP: (t) => ['🎁 Scratch card unlocked', `Your Level ${t.value} reward is here. Scratch it to see what you won.`],
+  BIRTHDAY: ()  => ['🎂 Your birthday gift is here', 'Your birthday scratch card is ready. Tap to claim your reward.'],
+  TASK:     (t, { taskTitle } = {}) => ['🎁 Special reward unlocked', `Your reward for ${taskTitle ? `"${taskTitle}"` : 'that quest'} is here. Scratch it to see what you won.`],
+};
+
+// The REWARD_READY push (and in-app notification) for a card that has its
+// coupon. Inside the caller's transaction.
+async function notifyCardReady(tx, userId, reward, trigger, { taskTitle = null, late = false } = {}) {
+  const kind = trigger.kind;
+  const [title, body] = (late ? LATE_REWARD_PUSH_COPY : REWARD_PUSH_COPY)[kind](trigger, { taskTitle });
+  await createNotification(
+    tx, userId, 'REWARD_READY', title, body,
+    {
+      event:          'REWARD_READY',
+      reward_id:      String(reward.id),
+      user_reward_id: String(reward.id),
+      rarity:         reward.rarity,
+      trigger_kind:   kind,
+      ...(kind === 'STREAK' ? { streak_days: trigger.value } : {}),
+      ...(kind === 'LEVEL_UP' ? { level: trigger.value } : {}),
+      ...(kind === 'TASK' ? { task_id: String(reward.period) } : {}),
+      url:            `/rewards?focus=${reward.id}`,
+    }
+  );
+}
 
 function legacyTriggerType(kind, value) {
   if (kind === 'LEVEL_UP') return 'LEVEL_UP';
@@ -277,7 +318,8 @@ function legacyTriggerType(kind, value) {
 // anything, and only while the trigger is active. Once per (user, trigger, period) — period is 0 for streak and
 // level triggers (once ever) and the year for the birthday trigger; the
 // partial unique index backs that up. Returns the card, or null.
-// opts.taskTitle: for push copy on special (TASK) rewards.
+// opts.taskTitle: for push copy on special (TASK) rewards. Returns null too
+// when nothing was in stock (the card is then owed, not shown).
 export async function grantTriggerCard(tx, userId, kind, value, { period = 0, now = new Date(), taskTitle = null } = {}) {
   const trigger = await tx.reward_triggers.findUnique({ where: { kind_value: { kind, value } } });
   if (!trigger || !trigger.is_active) return null;
@@ -306,21 +348,12 @@ export async function grantTriggerCard(tx, userId, kind, value, { period = 0, no
     include: REWARD_INCLUDE,
   });
 
-  const [title, body] = REWARD_PUSH_COPY[kind](trigger, { taskTitle });
-  await createNotification(
-    tx, userId, 'REWARD_READY', title, body,
-    {
-      event:          'REWARD_READY',
-      reward_id:      String(reward.id),
-      user_reward_id: String(reward.id),
-      rarity:         reward.rarity,
-      trigger_kind:   kind,
-      ...(kind === 'STREAK' ? { streak_days: value } : {}),
-      ...(kind === 'LEVEL_UP' ? { level: value } : {}),
-      ...(kind === 'TASK' ? { task_id: String(period) } : {}),
-      url:            `/rewards?focus=${reward.id}`,
-    }
-  );
+  // Out of stock: the card is owed (see fulfillAwaitingCards) but the
+  // hunter hears nothing yet — no push, and null keeps it out of the
+  // completion response, so no popup either.
+  if (!coupon) return null;
+
+  await notifyCardReady(tx, userId, reward, trigger, { taskTitle });
   return reward;
 }
 
@@ -449,10 +482,12 @@ function parseId(id) {
 
 const LIST_LIMIT = 20;
 
+// Cards still waiting for stock are in no tab: the hunter doesn't know
+// about them yet.
 function tabWhere(tab, now) {
   if (tab === 'USED') return { status: 'CLAIMED' };
   if (tab === 'EXPIRED') return { OR: [{ status: 'EXPIRED' }, { status: 'ACTIVE', expires_at: { lte: now } }] };
-  return { status: 'ACTIVE', OR: [{ expires_at: null }, { expires_at: { gt: now } }] };
+  return { status: 'ACTIVE', OR: [{ expires_at: null }, { expires_at: { gt: now } }], ...NOT_AWAITING_STOCK };
 }
 
 export const REWARD_TABS = ['ACTIVE', 'USED', 'EXPIRED'];
@@ -498,6 +533,7 @@ export async function listUnseenRewards(userId) {
     where: {
       user_id: BigInt(userId), status: 'ACTIVE', seen_at: null, scratched_at: null,
       OR: [{ expires_at: null }, { expires_at: { gt: now } }],
+      ...NOT_AWAITING_STOCK,
     },
     include: REWARD_INCLUDE,
     orderBy: { id: 'asc' },
@@ -529,6 +565,62 @@ export async function markRewardSeen(userId, id) {
 // holds. Only a card granted while every coupon was out of stock picks
 // here; if still nothing is left it stays unscratched (the throw rolls
 // back) so the user can try again after a restock.
+// Gives coupons to cards owed while a reward was out of stock, first come
+// first served (the order the hunters earned them), and only then tells
+// each hunter (push + the app's popup, since the card is now unseen). Stops
+// for a reward as soon as its stock runs out again. Rewards switched off
+// hand out nothing. Called after an admin adds or edits a coupon or
+// switches a reward on, and every 15 minutes (a coupon's start date
+// arriving, or a run that failed). Returns how many cards were filled.
+export async function fulfillAwaitingCards({ triggerId = null } = {}) {
+  const triggers = await prisma.reward_triggers.findMany({
+    where:  {
+      is_active: true,
+      ...(triggerId != null ? { id: BigInt(triggerId) } : {}),
+      user_rewards: { some: AWAITING_STOCK },
+    },
+    select: { id: true, kind: true, value: true },
+  });
+
+  let filled = 0;
+  for (const trigger of triggers) {
+    const owed = await prisma.user_rewards.findMany({
+      where:   { trigger_id: trigger.id, ...AWAITING_STOCK },
+      orderBy: [{ assigned_at: 'asc' }, { id: 'asc' }],
+      select:  { id: true },
+    });
+    for (const { id } of owed) {
+      const outcome = await prisma.$transaction(async (tx) => {
+        // A scratch or another run may be filling this card right now.
+        const locked = await tx.$queryRaw`
+          SELECT id FROM user_rewards
+          WHERE id = ${id} AND coupon_code IS NULL AND status = 'ACTIVE'
+          FOR UPDATE SKIP LOCKED`;
+        if (locked.length === 0) return 'skipped';
+
+        const now    = new Date();
+        const coupon = await pickCoupon(tx, trigger.id, now);
+        if (!coupon) return 'out_of_stock';
+
+        // From the hunter's side the card arrives now: unseen, so the app
+        // pops it up, and its validity counts from today.
+        const reward = await tx.user_rewards.update({
+          where: { id },
+          data:  { ...prizeSnapshot(coupon, now), assigned_at: now, seen_at: null },
+        });
+        const taskTitle = trigger.kind === 'TASK'
+          ? (await tx.tasks.findUnique({ where: { id: BigInt(reward.period) }, select: { title: true } }))?.title ?? null
+          : null;
+        await notifyCardReady(tx, reward.user_id, reward, trigger, { taskTitle, late: true });
+        return 'filled';
+      });
+      if (outcome === 'out_of_stock') break;
+      if (outcome === 'filled') filled += 1;
+    }
+  }
+  return filled;
+}
+
 export async function scratchReward(userId, id) {
   const rewardId = parseId(id);
   return prisma.$transaction(async (tx) => {
