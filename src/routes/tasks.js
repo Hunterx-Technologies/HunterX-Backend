@@ -284,10 +284,14 @@ router.post('/streak/events/seen', verifyToken, async (req, res, next) => {
 // sends day_complete_seen: true for the rest of the hunter's day, so it isn't
 // shown again (re-clearing the day, re-login, another device).
 // Header: Authorization: Bearer <access_token>
+// Body (optional): { date: 'YYYY-MM-DD' } — the day the app's task list was for.
 
 router.post('/day-complete/seen', verifyToken, async (req, res, next) => {
   try {
-    const data = await taskService.markDayCompleteSeen(req.user.id);
+    const forDate = typeof req.body?.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.body.date)
+      ? req.body.date
+      : undefined;
+    const data = await taskService.markDayCompleteSeen(req.user.id, forDate);
     return success(res, data, 'Day complete marked seen');
   } catch (err) {
     next(err);

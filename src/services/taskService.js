@@ -262,8 +262,14 @@ export async function getTodayTasks(userId, overrideGender = null) {
 
 // POST /api/tasks/day-complete/seen — the app showed today's "Day Complete"
 // screen. Idempotent; it shows once per day (the hunter's) per account.
-export async function markDayCompleteSeen(userId) {
+// `forDate` (YYYY-MM-DD, optional) is the day the app's task list was for:
+// when the hunter's midnight has passed since, today stays unmarked so the
+// new day still gets its own Day Complete.
+export async function markDayCompleteSeen(userId, forDate) {
   const today = getLocalDateOnly(await getUserTimezone(userId));
+  if (forDate && forDate !== dateKey(today)) {
+    return { date: dateKey(today), day_complete_seen: false };
+  }
   await prisma.user_progression.updateMany({
     where: { user_id: BigInt(userId) },
     data:  { day_complete_seen_date: today },
