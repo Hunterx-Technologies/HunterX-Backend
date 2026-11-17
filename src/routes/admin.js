@@ -558,7 +558,8 @@ router.post('/admins', verifyToken, verifyAdmin, async (req, res, next) => {
 // Coupon body: { title, coupon_code, discount_type: PERCENT|FLAT, discount_value,
 //   currency? (FLAT), weight? (1–100, default 1), total_quantity? (null = unlimited),
 //   valid_from?, valid_until?, valid_days_after_award?, description?,
-//   product_name?, product_category?, is_active? }
+//   product_name?, product_category?, redeem_url? (partner website; "gymgasm.com"
+//   is saved as https://gymgasm.com), is_active? }
 // Coupon create/update also accept multipart/form-data with the same
 // fields plus a `product_image` file (≤2MB; compressed to WebP, max
 // 1200px) and, on update, remove_product_image=true to clear it.

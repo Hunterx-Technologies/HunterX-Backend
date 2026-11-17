@@ -64,6 +64,25 @@ function optionalInt(value, field, min, max) {
   return n;
 }
 
+// The partner's website. "gymgasm.com" is taken as https://gymgasm.com;
+// only http(s) links are accepted, since the app opens it in the browser.
+function optionalUrl(value, field) {
+  const text = optionalText(value, field, 500);
+  if (!text) return null;
+  const withScheme = /^[a-z][a-z0-9+.-]*:/i.test(text) ? text : `https://${text}`;
+  let url;
+  try {
+    url = new URL(withScheme);
+  } catch {
+    throw invalid(`${field} must be a website link, e.g. https://gymgasm.com`);
+  }
+  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || !url.hostname.includes('.')) {
+    throw invalid(`${field} must be a website link, e.g. https://gymgasm.com`);
+  }
+  if (url.href.length > 500) throw invalid(`${field} must be at most 500 characters`);
+  return url.href;
+}
+
 function optionalDate(value, field) {
   if (value === undefined || value === null || value === '') return null;
   const d = new Date(value);
@@ -120,6 +139,7 @@ function parseCoupon(input, existing = null) {
     valid_days_after_award: optionalInt(input.valid_days_after_award, 'valid_days_after_award', 1, MAX_DAYS),
     product_name:           optionalText(input.product_name, 'product_name', 120),
     product_category:       optionalText(input.product_category, 'product_category', 120),
+    redeem_url:             optionalUrl(input.redeem_url, 'redeem_url'),
     is_active:              input.is_active ?? true,
   };
 }
@@ -152,6 +172,7 @@ function serializeCoupon(c, eligibleWeight, now) {
     product_name:           c.product_name,
     product_category:       c.product_category,
     product_image_url:      c.product_image_url,
+    redeem_url:             c.redeem_url,
     is_active:              c.is_active,
     // false = can't be drawn right now (inactive, outside its window, or out of stock)
     eligible,

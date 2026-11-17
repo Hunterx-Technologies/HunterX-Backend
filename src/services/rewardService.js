@@ -417,7 +417,7 @@ export async function ensureBirthdayCard(userId) {
 
 export const REWARD_INCLUDE = {
   reward_triggers: { select: { kind: true, value: true } },
-  reward_coupons:    { select: { title: true, description: true, product_name: true, product_category: true, product_image_url: true } },
+  reward_coupons:    { select: { title: true, description: true, product_name: true, product_category: true, product_image_url: true, redeem_url: true } },
   reward_pool:       { select: { description: true, reward_partners: { select: { name: true } } } },
 };
 
@@ -469,6 +469,9 @@ export function toApiReward(r, now = new Date()) {
     product_name:      coupon?.product_name ?? coupon?.title ?? r.reward_pool?.reward_partners?.name ?? undefined,
     product_category:  coupon?.product_category ?? undefined,
     product_image_url: coupon?.product_image_url ?? undefined,
+    // The partner's site, read from the coupon (not snapshotted), so fixing
+    // a broken link reaches cards already won.
+    redeem_url:        coupon?.redeem_url ?? undefined,
     valid_until:       r.expires_at,
     scratched_at:      r.scratched_at,
     used_at:           r.claimed_at ?? undefined,
