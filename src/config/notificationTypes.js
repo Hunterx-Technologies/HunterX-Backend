@@ -15,7 +15,8 @@ export const DAILY_PUSH_CAP    = 3;  // capped types, rolling 24h
 
 export const NOTIFICATION_TYPES = {
   DAILY_MOTIVATION:   { setting: 'notify_daily_motivation',    channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: false }, // sent 06:00 local, before quiet hours end
-  TASK_REMINDER:      { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: true,  quietHours: true },
+  // Not capped: the two daily reminders (07:00, 20:00) must both get through.
+  TASK_REMINDER:      { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: false, quietHours: true },
   NEW_QUEST:          { setting: 'notify_task_reminders',      channel: 'reminders', url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_AT_RISK:     { setting: 'notify_streak_preservation', channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true },
   STREAK_MILESTONE:   { setting: 'notify_streak_milestones',   channel: 'streaks',   url: '/(tabs)',         capped: false, quietHours: true }, // home shows the badge popup

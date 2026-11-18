@@ -68,11 +68,19 @@ async function countOpenTasks(userId, { types, from, to, periodDate }) {
 }
 
 // ── 2.1 Daily quest reminder ───────────────────────────────
+// Twice a day in the hunter's own timezone: 07:00, and 20:00 (four hours
+// before the day ends). Only while some of today's daily quests are still
+// open, so a hunter who's done gets neither.
 
-const taskReminder = {
-  name: 'task_reminder',
+const DAILY_REMINDER_SLOTS = [
+  { name: 'morning', time: '07:00' },
+  { name: 'evening', time: '20:00' },
+];
+
+const taskReminders = DAILY_REMINDER_SLOTS.map(({ name, time }) => ({
+  name: `task_reminder_${name}`,
   type: 'TASK_REMINDER',
-  slot: (settings) => settings.reminder_time || '19:00',
+  slot: () => time,
   run: async ({ userId, local }) => {
     const today = localToday(local);
     const open  = await countOpenTasks(userId, { types: DAILY_TYPES, from: today, to: today, periodDate: today });
@@ -82,11 +90,11 @@ const taskReminder = {
       prisma, userId, 'TASK_REMINDER',
       'Quests await, Hunter',
       `${plural(open, 'daily quest')} still open today. The System is watching.`,
-      { event: 'TASK_REMINDER', open_tasks: open },
-      { dedupeKey: `task_reminder:${dateKey(today)}`, expiresAt: localDayEnd(today, local.timezone) }
+      { event: 'TASK_REMINDER', open_tasks: open, slot: name },
+      { dedupeKey: `task_reminder:${name}:${dateKey(today)}`, expiresAt: localDayEnd(today, local.timezone) }
     );
   },
-};
+}));
 
 // ── 2.2 Streak at risk ─────────────────────────────────────
 // 07:00 local, the morning the streak needs today's quest: for users who
@@ -736,7 +744,7 @@ const onboardingNudge = {
 };
 
 export const SCHEDULED_NOTIFICATION_JOBS = [
-  taskReminder,
+  ...taskReminders,
   streakAtRisk,
   streakStatus,
   weeklyDeadline,
